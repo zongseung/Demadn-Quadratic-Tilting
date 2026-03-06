@@ -50,13 +50,18 @@
 > **주의**: 베이스라인은 SARIMAX-LSTM이 **아니다**.
 > 통계적 선형 모형(SARIMAX) 대신, 명시적 추세·계절성 분해 + 신경망 잔차 보정 구조를 사용한다.
 
-**Step A1. 추세 추출 (log-linear OLS)**
+**Step A1. 추세 추출 (HP-filter)**
+
+Hodrick-Prescott filter를 학습 구간(~2022)에만 적용하여 장기 추세 T̂_t를 추출한다.
+검증·테스트 구간은 학습 추세 말단의 기울기로 선형 외삽한다.
 
 ```
-log(D_t) = c + β·t + ε_t   →   T̂_t = exp(ĉ + β̂·t)
+λ = 1.28×10⁸  (시간단위 데이터 기준, Ravn & Uhlig 2002)
+(cycle_t, T̂_t) = HPfilter(D_t, λ)
 ```
 
-학습 구간(~2022)만으로 추세 모형을 적합하고, 전체 구간에 외삽.
+λ 근거: 분기 기준 λ_q=1600을 시간단위로 변환 → λ_h = 1600×(8766/4)⁴ ≈ 1.28×10¹¹,
+실용 범위(1×10⁷~1×10⁹)에서 1.28×10⁸ 사용.
 
 **Step A2. 다중 주기 Fourier 계절성**
 
@@ -186,16 +191,28 @@ uv sync
 
 ### Device 설정
 
+PyTorch(LSTM)와 PyMC(MCMC)는 지원 device가 다르므로 분리해서 설정한다.
+
+| 컴포넌트 | NVIDIA CUDA | Apple MPS | CPU |
+|---|---|---|---|
+| Seq2Seq LSTM (PyTorch) | ✅ | ✅ | ✅ |
+| HQT NUTS (PyMC) | ❌ | ❌ | ✅ |
+| HQT numpyro (JAX) | ✅ | ❌ | ✅ |
+
 ```python
-# NVIDIA GPU → Apple MPS → CPU 자동 감지
-def get_device():
+# PyTorch용: NVIDIA → MPS → CPU
+def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
-DEVICE = get_device()
+TORCH_DEVICE = get_device()
+
+# PyMC MCMC용: NVIDIA → numpyro(JAX 가속), 그 외 → nuts(CPU)
+# Apple MPS는 PyTensor/JAX 모두 미지원
+MCMC_SAMPLER = "numpyro" if torch.cuda.is_available() else "nuts"
 ```
 
 ### HQT 파이프라인 실행
@@ -206,7 +223,7 @@ results = run_hqt_pipeline_LKJ(
     y_col="power demand(MW)",
     pred_col="hybrid",
     holiday_name_col="holiday_name",
-    sampler="numpyro",          # "nuts" | "numpyro" | "advi"
+    sampler=MCMC_SAMPLER,       # NVIDIA→"numpyro", Apple/CPU→"nuts"
     chains=4, draws=3000, tune=2000,
     target_accept=0.99,
     tilt_mode="hybrid",         # "event" | "type" | "hybrid"
@@ -221,8 +238,11 @@ results = run_hqt_pipeline_LKJ(
 
 | 항목 | 선택 | 이유 |
 |---|---|---|
+| 추세 추출 | HP-filter (λ=1.28×10⁸) | 논문 Algorithm 1 Step A1 권장; log-OLS 대비 데이터 기반 smooth 추세 |
 | 베이스라인 | Trend-Fourier-Seq2Seq LSTM | 명시적 분해로 해석 가능성 확보; SARIMAX 선형 가정 없이 비선형 잔차 학습 |
 | 틸트 형태 | 이차(quadratic) | 수요 감소-회복의 오목(concave) 곡선 포착 |
 | 계층 prior | LKJ Cholesky | β 계수 간 공분산 구조 유연하게 모형화, 수치 안정적 |
 | Non-centered reparam | β_i = μ_h + L_h ε_i | 적은 이벤트 수에서 NUTS mixing 개선 |
 | 새 이벤트 β_new | μ_{h,s} + L_{h,s} @ ε_s | 사후 Cholesky를 직접 사용 → 논문 수식과 정확히 일치 |
+| LSTM device | TORCH_DEVICE (cuda/mps/cpu) | 환경 자동 감지 |
+| MCMC device | MCMC_SAMPLER (numpyro/nuts) | PyMC는 MPS 미지원 → NVIDIA만 JAX 가속, 그 외 CPU |
