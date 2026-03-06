@@ -1,7 +1,6 @@
 # Event-Aware Load Forecasting via Hybrid Modeling and Hierarchical Bayesian Tilting
 
 > **논문**: *Event-Aware Load Forecasting via Hybrid Modeling and Hierarchical Bayesian Tilting*
-> **저자**: Jong-Seung Lee, Hyung-Tae Ha (Gachon University)
 
 ---
 
