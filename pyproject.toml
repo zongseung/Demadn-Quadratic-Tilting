@@ -1,7 +1,7 @@
 [project]
-name = "demadn-quadratic-tilting"
+name = "demand-quadratic-tilting"
 version = "0.1.0"
-description = "Add your description here"
+description = "Korean holiday demand correction via Hierarchical Quadratic Tilting (HQT)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -19,4 +19,11 @@ dependencies = [
     "scipy>=1.15.3",
     "statsmodels>=0.14.5",
     "torch>=2.8.0",
+    "workalendar>=17.0.0",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.4"]
+
+[tool.setuptools.packages.find]
+include = ["demand_quadratic_tilting*"]
