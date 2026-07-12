@@ -1,2 +1,8 @@
 *.pth
 *.pdf
+*.py[cod]
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+/artifacts/

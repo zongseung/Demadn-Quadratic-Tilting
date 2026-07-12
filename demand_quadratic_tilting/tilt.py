@@ -12,8 +12,12 @@ from scipy.stats import norm
 from .model import HQTResult
 
 
-def _sigmoid_gate(e_tilt: np.ndarray, sigma_resid: float,
-                  threshold_k: float = 0.5, gate_scale_k: float = 0.3) -> np.ndarray:
+def _sigmoid_gate(
+    e_tilt: np.ndarray,
+    sigma_resid: float,
+    threshold_k: float = 0.5,
+    gate_scale_k: float = 0.3,
+) -> np.ndarray:
     """적응형 게이팅: 작은 틸트는 억제, 큰 틸트는 유지.
     w = sigmoid((|e_tilt| - threshold) / scale)
     threshold = threshold_k * sigma_resid
@@ -57,15 +61,17 @@ def tilt_from_posterior(
     dates = list(dates)
     B_draws = hqt.draws_beta
     MU_draws = hqt.draws_mu
-    S = B_draws.shape[0]
 
-    sigma_r_sq_mean = float((hqt.draws_sigma_r ** 2).mean())
+    sigma_r_sq_mean = float((hqt.draws_sigma_r**2).mean())
     zcrit = norm.ppf(0.5 + ci / 2.0)
-    half_width_const = float(zcrit * sigma_resid * np.sqrt(1.0 + sigma_r_sq_mean))
+    # 옵션 A: σ_r²가 표준화 명절 잔차의 총분산(식 hqt-obs)이므로 baseline "1"을
+    # 따로 더하지 않는다. "+1"은 likelihood가 이미 흡수한 기저분산의 이중계산.
+    half_width_const = float(zcrit * sigma_resid * np.sqrt(sigma_r_sq_mean))
 
     eid_to_pos = {e: i for i, e in enumerate(hqt.event_ids)}
     type_to_pos = {t: i for i, t in enumerate(hqt.type_names)}
     rng = np.random.default_rng(rng_seed)
+    new_event_beta_cache: dict[str, np.ndarray] = {}
 
     zhat_vals: List[float] = []
     hw_vals: List[float] = []
@@ -94,26 +100,34 @@ def tilt_from_posterior(
             z_draws = B_i[:, 0] + B_i[:, 1] * tau_s + B_i[:, 2] * tau_s**2
         else:  # new event
             h = type_to_pos[hqt.type_of_date[d]]
-            betas_new = _sample_new_event_beta(rng, MU_draws[:, h, :], hqt.draws_L[h])
-            z_draws = betas_new[:, 0] + betas_new[:, 1] * tau_s + betas_new[:, 2] * tau_s**2
+            if eid not in new_event_beta_cache:
+                new_event_beta_cache[eid] = _sample_new_event_beta(
+                    rng, MU_draws[:, h, :], hqt.draws_L[h]
+                )
+            betas_new = new_event_beta_cache[eid]
+            z_draws = (
+                betas_new[:, 0] + betas_new[:, 1] * tau_s + betas_new[:, 2] * tau_s**2
+            )
 
         z_mean = float(np.mean(z_draws))
         std_z = float(np.std(z_draws, ddof=1))
         zhat_vals.append(z_mean)
 
-        hw = float(zcrit * np.sqrt(sigma_resid**2 * (1.0 + sigma_r_sq_mean + std_z**2)))
+        hw = float(zcrit * np.sqrt(sigma_resid**2 * (sigma_r_sq_mean + std_z**2)))
         hw_vals.append(hw)
 
     e_tilt_vals = np.array([sigma_resid * z for z in zhat_vals])
     if gate:
         e_tilt_vals = _sigmoid_gate(e_tilt_vals, sigma_resid, threshold_k, gate_scale_k)
 
-    tilt_df = pl.DataFrame({
-        "datetime": dates,
-        "z_hat": zhat_vals,
-        "e_tilt": e_tilt_vals.tolist(),
-        "half_width_t": hw_vals,
-    })
+    tilt_df = pl.DataFrame(
+        {
+            "datetime": dates,
+            "z_hat": zhat_vals,
+            "e_tilt": e_tilt_vals.tolist(),
+            "half_width_t": hw_vals,
+        }
+    )
     return tilt_df, half_width_const
 
 
@@ -124,18 +138,23 @@ def apply_tilt(
     datetime_col: str = "datetime",
 ) -> pl.DataFrame:
     """baseline 예측에 틸트를 적용하여 tilted_pred 컬럼 추가."""
-    joined = df.join(
-        tilt_df.select(["datetime", "e_tilt", "half_width_t"]),
-        left_on=datetime_col,
-        right_on="datetime",
-        how="left",
-    ).with_columns(
-        pl.col("e_tilt").fill_null(0.0),
-        pl.col("half_width_t").fill_null(0.0),
-    ).with_columns(
-        (pl.col(baseline_col) + pl.col("e_tilt")).alias("tilted_pred"),
-    ).with_columns(
-        (pl.col("tilted_pred") - pl.col("half_width_t")).alias("lower_t"),
-        (pl.col("tilted_pred") + pl.col("half_width_t")).alias("upper_t"),
+    joined = (
+        df.join(
+            tilt_df.select(["datetime", "e_tilt", "half_width_t"]),
+            left_on=datetime_col,
+            right_on="datetime",
+            how="left",
+        )
+        .with_columns(
+            pl.col("e_tilt").fill_null(0.0),
+            pl.col("half_width_t").fill_null(0.0),
+        )
+        .with_columns(
+            (pl.col(baseline_col) + pl.col("e_tilt")).alias("tilted_pred"),
+        )
+        .with_columns(
+            (pl.col("tilted_pred") - pl.col("half_width_t")).alias("lower_t"),
+            (pl.col("tilted_pred") + pl.col("half_width_t")).alias("upper_t"),
+        )
     )
     return joined

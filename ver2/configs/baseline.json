@@ -1,0 +1,51 @@
+{
+  "version": "ver2",
+  "data_path": "power_demand_final.csv",
+  "datetime_col": "일시",
+  "target_col": "power demand(MW)",
+  "weather_cols": ["ta", "hm"],
+  "known_covariate_cols": ["spring", "summer", "autoum", "winter"],
+  "history_hours": 168,
+  "horizon_hours": 24,
+  "stride_hours": 24,
+  "forecast_origin_hour": 0,
+  "train_end": "2022-12-31 23:00:00",
+  "validation_end": "2023-12-31 23:00:00",
+  "test_end": "2024-10-31 23:00:00",
+  "random_seed": 2025,
+  "models": [
+    "xgboost",
+    "lightgbm",
+    "random_forest",
+    "svr",
+    "seq2seq_lstm",
+    "seq2seq_gru"
+  ],
+  "random_forest": {
+    "n_estimators": 500,
+    "max_depth": 24,
+    "min_samples_leaf": 2,
+    "max_features": 0.5,
+    "native_multi_output": true
+  },
+  "seq2seq_shared": {
+    "hidden_size": 64,
+    "num_layers": 2,
+    "dropout": 0.1,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "batch_size": 64,
+    "teacher_forcing_ratio": 0.5,
+    "decoder_mode": "autoregressive"
+  },
+  "seq2seq_gru": {
+    "max_epochs": 60,
+    "patience": 10,
+    "training_device": "mps"
+  },
+  "seq2seq_lstm": {
+    "max_epochs": 80,
+    "patience": 15,
+    "training_device": "cpu"
+  }
+}

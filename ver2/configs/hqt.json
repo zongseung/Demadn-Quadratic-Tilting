@@ -1,0 +1,31 @@
+{
+  "version": "ver2",
+  "predictions_path": "artifacts/baseline_168_24/predictions.csv",
+  "fit_splits": ["train", "validation"],
+  "evaluation_splits": ["test"],
+  "models": [
+    "xgboost",
+    "lightgbm",
+    "random_forest",
+    "svr",
+    "seq2seq_lstm",
+    "seq2seq_gru"
+  ],
+  "sampler": "nuts",
+  "chains": 4,
+  "draws": 1000,
+  "tune": 1000,
+  "target_accept": 0.99,
+  "svr_override": {
+    "draws": 2000,
+    "tune": 2000,
+    "target_accept": 0.995
+  },
+  "random_seed": 2025,
+  "tilt_mode": "hybrid",
+  "ci": 0.95,
+  "gate": false,
+  "pre_pad_days": 1,
+  "post_pad_days": 1,
+  "tau_scale_hours": 24.0
+}

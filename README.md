@@ -1,12 +1,12 @@
-# Event-Aware Load Forecasting via Hybrid Modeling and Hierarchical Bayesian Tilting
+# Event-Aware Load Forecasting via Multi-Model Baselines and Hierarchical Bayesian Tilting
 
-> **논문**: *Event-Aware Load Forecasting via Hybrid Modeling and Hierarchical Bayesian Tilting*
+> **논문 방향**: *Model-Agnostic Event-Aware Load Forecasting via Hierarchical Quadratic Tilting*
 
 ---
 
 ## 1. 프로젝트의 중요성
 
-전력 계통 운영에서 **일 최대 부하(peak load) 예측**은 경제급전·예비력 확보·수요반응 설계의 핵심 입력값이다. 최근 딥러닝 기반 혼합 모형이 일반 일자의 예측 정확도를 크게 높였음에도, **추석·설날과 같은 다일 연속 명절 구간에서는 여전히 심각한 체계적 과대예측(over-prediction)** 이 발생한다.
+전력 계통 운영에서 **일 최대 부하(peak load) 예측**은 경제급전·예비력 확보·수요반응 설계의 핵심 입력값이다. ML·DL 모형이 일반 일자의 예측 정확도를 높였음에도, **추석·설날과 같은 다일 연속 명절 구간에서는 여전히 체계적 과대예측(over-prediction)** 이 발생할 수 있다.
 
 | 문제 | 영향 |
 |---|---|
@@ -18,7 +18,7 @@
 
 - **Data sparsity**: 명절은 연 1회, 유효 윈도우는 3~6일에 불과해 학습 표본이 극도로 적다.
 - **Nonlinear, time-varying pattern**: 수요 감소-회복이 날짜 인덱스에 따라 비선형·비대칭적으로 진행된다.
-- **Miscalibrated uncertainty**: 기존 예측구간이 명절 구간을 84% 수준에서만 커버(목표 95%)한다.
+- **Miscalibrated uncertainty**: 일반 구간에서 얻은 예측구간이 명절 구간에서 동일한 보정 수준을 유지하지 못한다.
 
 ---
 
@@ -27,9 +27,11 @@
 본 프로젝트는 **두 단계 이벤트 인지(event-aware) 예측 프레임워크**를 제안한다.
 
 ```
-[Stage 1]  Trend-Fourier-Seq2Seq LSTM  →  baseline forecast  ŷ_t^base
-[Stage 2]  Hierarchical Quadratic Tilt  →  holiday correction  e_t^tilt
-                                        →  adjusted forecast   ŷ_t^tilt
+[Stage 1]  XGBoost / LightGBM / Random Forest / SVR / Seq2Seq-LSTM / Seq2Seq-GRU
+           → model-specific baseline forecast  ŷ_t,m^base
+[Stage 2]  Hierarchical Quadratic Tilt
+           → common holiday correction e_t,m^tilt
+           → adjusted forecast          ŷ_t,m^tilt
 ```
 
 ### 핵심 아이디어: Hierarchical Quadratic Tilting (HQT)
@@ -39,56 +41,33 @@
 - **같은 명절 유형**(추석·설날)의 과거 5년치를 pooling → 희소 데이터 문제 완화
 - **이차 곡선** → 수요 감소-회복의 비선형·비대칭 패턴을 포착
 - **Posterior predictive sampling** → 미래 신규 명절에도 외삽 가능
-- 명절 예측구간 커버리지: 84% → **94.2%** (목표 95% 거의 달성)
+- 서로 다른 ML·DL 베이스라인에서 동일한 보정 절차를 적용해 model-agnostic 효과를 검증
 
 ---
 
 ## 3. 접근 방법
 
-### 3.1 베이스라인: Trend-Fourier-Seq2Seq LSTM
+### 3.1 베이스라인: 동일 정보집합의 ML·DL 모형
 
-> **주의**: 베이스라인은 SARIMAX-LSTM이 **아니다**.
-> 통계적 선형 모형(SARIMAX) 대신, 명시적 추세·계절성 분해 + 신경망 잔차 보정 구조를 사용한다.
+HP filter와 Fourier 분해를 제거하고 다음 여섯 모형을 독립적인 베이스라인으로
+사용한다.
 
-**Step A1. 추세 추출 (HP-filter)**
+- XGBoost, LightGBM, RBF-SVR: horizon별 24개 direct regressor
+- Random Forest: 하나의 native multi-output regressor
+- Seq2Seq-LSTM, Seq2Seq-GRU: encoder-decoder 기반 24시간 autoregressive forecast
 
-Hodrick-Prescott filter를 학습 구간(~2022)에만 적용하여 장기 추세 T̂_t를 추출한다.
-검증·테스트 구간은 학습 추세 말단의 기울기로 선형 외삽한다.
+모든 모형은 동일한 정보를 사용한다.
 
-```
-λ = 1.28×10⁸  (시간단위 데이터 기준, Ravn & Uhlig 2002)
-(cycle_t, T̂_t) = HPfilter(D_t, λ)
-```
+- encoder 입력: 과거 168시간의 전력수요·기온·습도·계절 더미
+- decoder/direct 입력: 예측 시점에 알려진 향후 24시간 계절 더미
+- 목표: 다음 24시간 전력수요
+- 예측 원점: 매일 00시, stride 24시간
+- 분할: 2019–2022 train / 2023 validation / 2024 test
 
-λ 근거: 분기 기준 λ_q=1600을 시간단위로 변환 → λ_h = 1600×(8766/4)⁴ ≈ 1.28×10¹¹,
-실용 범위(1×10⁷~1×10⁹)에서 1.28×10⁸ 사용.
-
-**Step A2. 다중 주기 Fourier 계절성**
-
-```
-S_t^(F) = Σ_k [ a_k sin(2πkt/s) + b_k cos(2πkt/s) ]
-```
-
-일간(s=24h), 주간(s=168h), 연간(s=8766h) 세 가지 주기를 탐색.
-검증 MSE 최소화 기준으로 각 주기의 조화수(K) 자동 선택.
-
-**Step A3. 잔차 시리즈**
-
-```
-r_t^(0) = D_t - T̂_t - Ŝ_t^(F)
-```
-
-**Step A4. Seq2Seq LSTM (encoder-decoder)**
-
-- 입력: 과거 7일(168h) 잔차 + 외생 공변량(기온, 습도, 계절 더미, 명절 더미)
-- 출력: 다음 1일(24h) 잔차 예측 r̂_{t+1}^(S2S)
-- Teacher forcing + Masked MSE loss (패딩 구간 제외)
-
-**Step A5. 하이브리드 베이스라인 예측**
-
-```
-ŷ_t^base = T̂_t + Ŝ_t^(F) + r̂_t^(S2S)
-```
+기온·습도는 과거 관측값만 사용하며 scaler는 train에만 적합한다. validation과
+test의 첫 윈도는 직전 구간의 과거 168시간을 사용할 수 있지만 목표 구간이
+분할 경계를 넘지는 않는다. 상세 구현과 실행법은
+[`ver2/README.md`](ver2/README.md)에 정리되어 있다.
 
 ---
 
@@ -130,7 +109,9 @@ Non-centered parameterization으로 수치 안정성 확보:
 β_i = μ_{h(i)} + L_{h(i)} ε_i,    ε_i ~ N(0, I)
 ```
 
-사후 추론: Hamiltonian Monte Carlo (NUTS), 4 chains × 3,000 draws.
+사후 추론은 Hamiltonian Monte Carlo (NUTS)를 사용한다. 기본 설정은
+4 chains × 1,000 posterior draws이며, mixing이 느린 SVR은
+4 chains × 2,000 posterior draws로 재적합했다.
 
 **Step E. 사후 예측 틸트 적용**
 
@@ -151,19 +132,62 @@ Non-centered parameterization으로 수치 안정성 확보:
 
 적응형 예측구간:
 ```
-PI_t = ŷ_t^tilt ± z_{α/2} · σ · sqrt( 1 + E[σ_r²] + Var(z_{i,t}) )
+PI_t = ŷ_t^tilt ± z_{α/2} · σ · sqrt( E[σ_r²] + Var(z_{i,t}) )
 ```
 
 ---
 
-## 실험 결과 요약
+## 베이스라인 실험 결과
 
-| Metric | Baseline | Tilted | 개선 |
-|---|---|---|---|
-| MAE (holiday, MW) | 178.6 | 97.3 | **-45.6%** |
-| RMSE (holiday, MW) | 243.1 | 132.5 | **-45.5%** |
-| Trough bias (MW) | +24.5 | -2.1 | 거의 제거 |
-| 95% PICP (holiday) | 84.0% | 94.2% | +10.2%p |
+2024년 1월 1일~10월 31일 7,320시간 hold-out의 HQT 적용 전 결과다.
+
+| 모델 | MAE (MW) | RMSE (MW) | WAPE (%) |
+|---|---:|---:|---:|
+| LightGBM | 2,254.3 | 3,575.3 | 3.488 |
+| XGBoost | 2,256.2 | 3,571.7 | 3.491 |
+| SVR | 2,329.0 | 3,585.1 | 3.604 |
+| Seq2Seq-LSTM | 2,418.3 | 3,751.5 | 3.742 |
+| Random Forest | 2,476.0 | 3,801.1 | 3.831 |
+| Seq2Seq-GRU | 2,689.5 | 3,958.6 | 4.162 |
+
+같은 test에서 설날·추석 공식 7일(168시간)만 분리하면 모든 모형이 큰 양의
+bias를 보여 HQT의 보정 대상을 명확히 확인할 수 있다. 아래 값 역시 HQT 적용
+전 진단 결과다.
+
+| 모델 | 명절 MAE (MW) | 명절 RMSE (MW) | 명절 bias (MW) |
+|---|---:|---:|---:|
+| Seq2Seq-LSTM | 4,846.8 | 6,750.0 | +4,139.8 |
+| Seq2Seq-GRU | 6,065.7 | 8,161.9 | +5,839.0 |
+| SVR | 6,319.5 | 8,684.9 | +5,954.9 |
+| XGBoost | 7,095.5 | 9,337.1 | +7,029.1 |
+| LightGBM | 7,508.3 | 9,986.5 | +7,434.1 |
+| Random Forest | 7,820.7 | 10,236.9 | +7,630.3 |
+
+### HQT 적용 결과
+
+HQT는 2019–2023년의 설날·추석 이벤트로 적합하고 2024년 이벤트를 새로운
+이벤트로 예측했다. 공식 설날·추석 7일(168시간)의 결과는 다음과 같다.
+
+현재 HQT 적합 잔차 중 2019–2022년 베이스라인 예측은 in-sample이고 2023년은
+hold-out validation이다. 논문 최종 추정에서는 2019–2022년도 rolling-origin
+OOF 예측으로 교체하는 것이 권장된다.
+
+| 모델 | Baseline MAE (MW) | Tilted MAE (MW) | MAE 개선 | Tilted bias (MW) |
+|---|---:|---:|---:|---:|
+| Random Forest | 7,820.7 | 6,029.2 | 22.9% | +4,239.7 |
+| SVR | 6,319.5 | 4,941.0 | 21.8% | +2,591.4 |
+| Seq2Seq-GRU | 6,065.7 | 4,839.4 | 20.2% | +2,932.9 |
+| LightGBM | 7,508.3 | 6,398.9 | 14.8% | +5,777.5 |
+| XGBoost | 7,095.5 | 6,300.1 | 11.2% | +5,945.0 |
+| Seq2Seq-LSTM | 4,846.8 | 4,401.8 | 9.2% | +2,899.3 |
+
+모든 모형에서 공식 명절 집계 MAE와 RMSE가 감소했다. 다만 보정 후에도 양의
+bias가 남고, 이벤트 유형별로는 효과가 이질적이다. 예를 들어 GRU의 추석
+윈도우 MAE는 23.9% 개선됐지만 설날 윈도우는 22.0% 악화됐다. 따라서 HQT의
+효과를 단일 평균만으로 해석하지 않고 명절 유형별 결과도 함께 보고한다.
+
+NUTS 진단은 모든 모형에서 divergence 0, 최대 R-hat 1.00을 기록했다. 다섯
+모형은 4,000 posterior draws, mixing이 느렸던 SVR은 8,000 draws를 사용했다.
 
 ---
 
@@ -171,11 +195,18 @@ PI_t = ŷ_t^tilt ± z_{α/2} · σ · sqrt( 1 + E[σ_r²] + Var(z_{i,t}) )
 
 ```
 Demadn-Quadratic-Tilting/
-├── src/
-│   ├── trend-fourier-Seq2Seq_LSTM.ipynb   # 베이스라인: Trend-Fourier-Seq2Seq LSTM
-│   └── #2_trend_seasonality_DL.ipynb      # HQT 통합 파이프라인
-├── seq2seq_tilting.ipynb                  # HQT 구현체
-├── Hierachical_Quadratic_Tilting.pdf      # 논문 원문
+├── ver2/                                  # 이번 실험의 설정·결과·재현 README
+│   ├── configs/
+│   └── results/
+├── demand_quadratic_tilting/
+│   ├── forecasting/                       # ML·DL 베이스라인 파이프라인
+│   ├── model.py                           # HQT posterior fitting
+│   ├── tilt.py                            # quadratic tilt 적용
+│   └── pipeline.py                        # HQT end-to-end pipeline
+├── scripts/train_baselines.py             # 168→24 베이스라인 학습 CLI
+├── scripts/apply_hqt_to_baselines.py       # 모든 베이스라인에 동일 HQT 적용
+├── tests/                                 # 누출·shape·재현성 테스트
+├── docs/baseline_forecasting.md
 ├── pyproject.toml
 └── README.md
 ```
@@ -191,46 +222,31 @@ uv sync
 
 ### Device 설정
 
-PyTorch(LSTM)와 PyMC(MCMC)는 지원 device가 다르므로 분리해서 설정한다.
+PyTorch recurrent model과 PyMC(MCMC)는 지원 device가 다르므로 분리한다.
 
 | 컴포넌트 | NVIDIA CUDA | Apple MPS | CPU |
 |---|---|---|---|
-| Seq2Seq LSTM (PyTorch) | ✅ | ✅ | ✅ |
+| Seq2Seq LSTM (PyTorch) | ✅ | CPU fallback¹ | ✅ |
+| Seq2Seq GRU (PyTorch) | ✅ | ✅ | ✅ |
 | HQT NUTS (PyMC) | ❌ | ❌ | ✅ |
 | HQT numpyro (JAX) | ✅ | ❌ | ✅ |
 
-```python
-# PyTorch용: NVIDIA → MPS → CPU
-def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-TORCH_DEVICE = get_device()
-
-# PyMC MCMC용: NVIDIA → numpyro(JAX 가속), 그 외 → nuts(CPU)
-# Apple MPS는 PyTensor/JAX 모두 미지원
-MCMC_SAMPLER = "numpyro" if torch.cuda.is_available() else "nuts"
-```
+¹ 현재 환경의 PyTorch 2.8 MPS LSTM은 저장된 `state_dict`가 새 프로세스에서
+학습 직후 예측을 재현하지 못해 CPU를 사용한다. MPS GRU는 재현성 검증을
+통과했다.
 
 ### HQT 파이프라인 실행
 
-```python
-results = run_hqt_pipeline_LKJ(
-    train_df=train1, val_df=val1, test_df=test1,
-    y_col="power demand(MW)",
-    pred_col="hybrid",
-    holiday_name_col="holiday_name",
-    sampler=MCMC_SAMPLER,       # NVIDIA→"numpyro", Apple/CPU→"nuts"
-    chains=4, draws=3000, tune=2000,
-    target_accept=0.99,
-    tilt_mode="hybrid",         # "event" | "type" | "hybrid"
-    pre_pad_days=1,
-    post_pad_days=1,
-)
+```bash
+uv run python scripts/apply_hqt_to_baselines.py \
+  --output-dir artifacts/hqt_baselines \
+  --chains 4 --draws 1000 --tune 1000 \
+  --target-accept 0.99 --resume
 ```
+
+커밋에 포함되는 고정 설정과 핵심 결과 CSV는 `ver2/configs/`와
+`ver2/results/`에서 확인할 수 있다. 모델 체크포인트·전체 시간별 예측·posterior는
+용량 때문에 `artifacts/`에 생성하되 Git에는 포함하지 않는다.
 
 ---
 
@@ -238,11 +254,11 @@ results = run_hqt_pipeline_LKJ(
 
 | 항목 | 선택 | 이유 |
 |---|---|---|
-| 추세 추출 | HP-filter (λ=1.28×10⁸) | 논문 Algorithm 1 Step A1 권장; log-OLS 대비 데이터 기반 smooth 추세 |
-| 베이스라인 | Trend-Fourier-Seq2Seq LSTM | 명시적 분해로 해석 가능성 확보; SARIMAX 선형 가정 없이 비선형 잔차 학습 |
+| 입력 윈도 | 168시간 → 24시간 | 직전 1주로 다음 하루를 예측하는 공통 정보집합 |
+| 베이스라인 | XGBoost, LightGBM, Random Forest, SVR, Seq2Seq-LSTM/GRU | 특정 복합 모형이 아닌 서로 다른 모형군에서 tilting 효과 검증 |
 | 틸트 형태 | 이차(quadratic) | 수요 감소-회복의 오목(concave) 곡선 포착 |
 | 계층 prior | LKJ Cholesky | β 계수 간 공분산 구조 유연하게 모형화, 수치 안정적 |
 | Non-centered reparam | β_i = μ_h + L_h ε_i | 적은 이벤트 수에서 NUTS mixing 개선 |
 | 새 이벤트 β_new | μ_{h,s} + L_{h,s} @ ε_s | 사후 Cholesky를 직접 사용 → 논문 수식과 정확히 일치 |
-| LSTM device | TORCH_DEVICE (cuda/mps/cpu) | 환경 자동 감지 |
+| Apple LSTM device | CPU fallback | 저장 후 새 프로세스 재현성 보장 |
 | MCMC device | MCMC_SAMPLER (numpyro/nuts) | PyMC는 MPS 미지원 → NVIDIA만 JAX 가속, 그 외 CPU |
