@@ -189,6 +189,18 @@ bias가 남고, 이벤트 유형별로는 효과가 이질적이다. 예를 들�
 NUTS 진단은 모든 모형에서 divergence 0, 최대 R-hat 1.00을 기록했다. 다섯
 모형은 4,000 posterior draws, mixing이 느렸던 SVR은 8,000 draws를 사용했다.
 
+![2024 major-holiday HQT improvement](ver2/figures/hqt_holiday_improvement.png)
+
+설날·추석의 모델별 시간 경로를 포함한 전체 결과 그림은
+[`ver2/README.md`](ver2/README.md#결과-그림)에서 확인할 수 있다.
+
+기존 HP filter–Fourier–Seq2Seq-LSTM 베이스라인에 계층 이차 틸트만 적용한
+노트북 재실행 결과는
+[`ver2/hybrid_hqt/README.md`](ver2/hybrid_hqt/README.md)에 분리했다.
+대체공휴일 별도 점프 절편은 사용하지 않는다. 이 재실행은 기존 노트북의
+full-sample HP filter를 그대로 사용하므로 leakage-safe 6-모델 결과와 직접
+비교하지 않는다.
+
 ---
 
 ## 프로젝트 구조
@@ -205,6 +217,9 @@ Demadn-Quadratic-Tilting/
 │   └── pipeline.py                        # HQT end-to-end pipeline
 ├── scripts/train_baselines.py             # 168→24 베이스라인 학습 CLI
 ├── scripts/apply_hqt_to_baselines.py       # 모든 베이스라인에 동일 HQT 적용
+├── scripts/plot_ver2_results.py            # ver2 결과 그림 재생성
+├── scripts/build_hybrid_hqt_notebook.py     # hybrid canonical notebook 생성
+├── scripts/run_hybrid_hqt_notebook.py       # 기존 hybrid notebook 재실행
 ├── tests/                                 # 누출·shape·재현성 테스트
 ├── docs/baseline_forecasting.md
 ├── pyproject.toml
@@ -226,14 +241,13 @@ PyTorch recurrent model과 PyMC(MCMC)는 지원 device가 다르므로 분리한
 
 | 컴포넌트 | NVIDIA CUDA | Apple MPS | CPU |
 |---|---|---|---|
-| Seq2Seq LSTM (PyTorch) | ✅ | CPU fallback¹ | ✅ |
+| Seq2Seq LSTM (PyTorch) | ✅ | ✅ | ✅ |
 | Seq2Seq GRU (PyTorch) | ✅ | ✅ | ✅ |
 | HQT NUTS (PyMC) | ❌ | ❌ | ✅ |
 | HQT numpyro (JAX) | ✅ | ❌ | ✅ |
 
-¹ 현재 환경의 PyTorch 2.8 MPS LSTM은 저장된 `state_dict`가 새 프로세스에서
-학습 직후 예측을 재현하지 못해 CPU를 사용한다. MPS GRU는 재현성 검증을
-통과했다.
+하이브리드 LSTM 체크포인트는 MPS 추론으로 baseline 지표를 재현했다. PyMC
+NUTS는 MPS를 사용하지 않으므로 HQT 사후추론은 CPU에서 실행한다.
 
 ### HQT 파이프라인 실행
 
@@ -260,5 +274,5 @@ uv run python scripts/apply_hqt_to_baselines.py \
 | 계층 prior | LKJ Cholesky | β 계수 간 공분산 구조 유연하게 모형화, 수치 안정적 |
 | Non-centered reparam | β_i = μ_h + L_h ε_i | 적은 이벤트 수에서 NUTS mixing 개선 |
 | 새 이벤트 β_new | μ_{h,s} + L_{h,s} @ ε_s | 사후 Cholesky를 직접 사용 → 논문 수식과 정확히 일치 |
-| Apple LSTM device | CPU fallback | 저장 후 새 프로세스 재현성 보장 |
+| Hybrid LSTM inference | Apple MPS 자동 선택 | 저장 체크포인트 baseline 재현 확인 |
 | MCMC device | MCMC_SAMPLER (numpyro/nuts) | PyMC는 MPS 미지원 → NVIDIA만 JAX 가속, 그 외 CPU |

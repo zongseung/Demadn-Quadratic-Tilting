@@ -1,4 +1,5 @@
 *.pth
+!ver2/hybrid_hqt/model_assets/best_model_20260518_011512.pth
 *.pdf
 *.py[cod]
 .DS_Store

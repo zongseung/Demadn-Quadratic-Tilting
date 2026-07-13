@@ -41,6 +41,17 @@ ver2/
 ├── configs/
 │   ├── baseline.json
 │   └── hqt.json
+├── figures/
+│   ├── baseline_test_performance.png
+│   ├── hqt_holiday_improvement.png
+│   ├── seollal_2024_forecasts.png
+│   └── chuseok_2024_forecasts.png
+├── hybrid_hqt/                            # 기존 HP–Fourier–LSTM 노트북 재실행
+│   ├── README.md
+│   ├── hqt_verification_source.ipynb
+│   ├── hqt_verification_executed.ipynb
+│   ├── figures/
+│   └── results/
 └── results/
     ├── baseline_test.csv
     ├── hqt_official_major_holiday.csv
@@ -55,6 +66,7 @@ ver2/
 - `demand_quadratic_tilting/tilt.py`: 새 이벤트 posterior tilt 적용
 - `scripts/train_baselines.py`: 베이스라인 실행 진입점
 - `scripts/apply_hqt_to_baselines.py`: HQT 실행 진입점
+- `scripts/plot_ver2_results.py`: 이 README의 결과 그림 재생성
 - `tests/`: 데이터 누출, shape, 저장 재현성, 새 이벤트 이차 경로 테스트
 
 ## 실행
@@ -103,6 +115,12 @@ uv run python scripts/apply_hqt_to_baselines.py \
 
 전체 파이프라인 연결만 확인할 때는 각 실행 명령에 `--quick`을 사용한다.
 
+결과 그림을 다시 생성한다.
+
+```bash
+uv run python scripts/plot_ver2_results.py
+```
+
 검증 명령은 다음과 같다.
 
 ```bash
@@ -142,6 +160,36 @@ uv run ruff format --check demand_quadratic_tilting/forecasting \
 
 모든 posterior는 divergence 0, 최대 R-hat 1.00을 기록했다. 세부 수치는
 `results/posterior_diagnostics.csv`에 고정했다.
+
+## 결과 그림
+
+### 전체 test 베이스라인 성능
+
+![2024 baseline performance](figures/baseline_test_performance.png)
+
+### 공식 설날·추석 HQT 개선
+
+![HQT holiday improvement](figures/hqt_holiday_improvement.png)
+
+### 2024년 설날 모델별 예측
+
+아래 두 이벤트 그림의 패널 MAE는 HQT가 적용된 앞뒤 1일 패딩 윈도 기준이다
+(설날 144시간, 추석 120시간). 회색 영역은 공식 명절 시간이며 파란 영역은
+모델별 HQT 95% 예측구간이다.
+
+![2024 Seollal forecasts](figures/seollal_2024_forecasts.png)
+
+### 2024년 추석 모델별 예측
+
+![2024 Chuseok forecasts](figures/chuseok_2024_forecasts.png)
+
+## 기존 Hybrid notebook 재실행
+
+HP filter–Fourier–Seq2Seq-LSTM 베이스라인에 계층 이차 틸트만 적용한 별도
+노트북 재실행은 [`hybrid_hqt/README.md`](hybrid_hqt/README.md)에 정리했다.
+대체공휴일 별도 점프 절편은 사용하지 않는다. 이 결과는 기존 하이브리드
+전처리를 재현한 것이며 full-sample HP filter 때문에 위 leakage-safe 6-모델
+결과와 직접 비교하지 않는다.
 
 ## 해석 제한
 

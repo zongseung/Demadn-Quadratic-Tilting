@@ -1,0 +1,102 @@
+{
+  "config": {
+    "method": "hierarchical_quadratic_tilting",
+    "separate_alternative_holiday_jump": false,
+    "chains": 4,
+    "draws": 5000,
+    "tune": 3000,
+    "target_accept": 0.99,
+    "random_seed": 2025,
+    "hp_lambda": 128000000.0,
+    "history_hours": 168,
+    "horizon_hours": 24,
+    "inference_device": "mps"
+  },
+  "data": {
+    "train_hours": 34896,
+    "validation_hours": 8592,
+    "test_hours": 7152,
+    "test_start": "2024-01-08 00:00:00",
+    "test_end": "2024-10-31 23:00:00",
+    "hp_filter_full_sample": true,
+    "fourier_best_k": [
+      3,
+      8,
+      1
+    ],
+    "fourier_validation_mse": 16535087.946841542
+  },
+  "sigma_resid_mw": 2075.745605722115,
+  "fit_event_ids": [
+    "2019_Chuseok",
+    "2019_Seollal",
+    "2020_Chuseok",
+    "2020_Seollal",
+    "2021_Chuseok",
+    "2021_Seollal",
+    "2022_Chuseok",
+    "2022_Seollal"
+  ],
+  "diagnostics": {
+    "sampler": "nuts",
+    "chains": 4,
+    "draws_per_chain": 5000,
+    "posterior_draws": 20000,
+    "divergences": 0,
+    "rhat_max": 1.0,
+    "ess_bulk_min": 6262.0,
+    "ess_tail_min": 7863.0,
+    "bfmi_min": 0.8740938688003657,
+    "converged": true
+  },
+  "metrics": {
+    "overall_baseline": {
+      "n": 7152,
+      "mae_mw": 1992.6828692476693,
+      "rmse_mw": 3080.0132874691194,
+      "wape_pct": 3.0862973605925856,
+      "smape_pct": 3.108247046437511,
+      "bias_mw": 161.6336700995885
+    },
+    "overall_tilted": {
+      "n": 7152,
+      "mae_mw": 1973.0894102018126,
+      "rmse_mw": 3012.359169474269,
+      "wape_pct": 3.055950714936452,
+      "smape_pct": 3.0843420816317675,
+      "bias_mw": 99.55266164216846
+    },
+    "event_window_baseline": {
+      "n": 240,
+      "mae_mw": 5800.111451824512,
+      "rmse_mw": 8171.104120535044,
+      "wape_pct": 9.860457015168683,
+      "smape_pct": 9.33950306012436,
+      "bias_mw": 3299.7957377356756
+    },
+    "event_window_tilted": {
+      "n": 240,
+      "mae_mw": 5216.226372257983,
+      "rmse_mw": 7381.3382806588725,
+      "wape_pct": 8.867825446502353,
+      "smape_pct": 8.627135108913178,
+      "bias_mw": 1449.781685704559
+    },
+    "official_holiday_baseline": {
+      "n": 168,
+      "mae_mw": 6260.331591701756,
+      "rmse_mw": 8817.982175025032,
+      "wape_pct": 11.35829698725267,
+      "smape_pct": 10.509921057218298,
+      "bias_mw": 4971.193324237565
+    },
+    "official_holiday_tilted": {
+      "n": 168,
+      "mae_mw": 5969.597113471065,
+      "rmse_mw": 8283.227792888065,
+      "wape_pct": 10.830809185719064,
+      "smape_pct": 10.219275881345899,
+      "bias_mw": 2737.121973559402
+    }
+  }
+}
