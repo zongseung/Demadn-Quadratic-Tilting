@@ -115,6 +115,10 @@ def _is_datetime(dtype: pl.DataType) -> bool:
     return dtype.base_type() == pl.Datetime and dtype.time_zone is None
 
 
+def _is_string_dtype(dtype: pl.DataType) -> bool:
+    return dtype.base_type() in {pl.String, pl.Categorical, pl.Enum}
+
+
 def _context_from_frame(
     frame: pl.DataFrame, *, allow_final_split: bool = False
 ) -> tuple[EventResidualContext, str]:
@@ -146,12 +150,18 @@ def _context_from_frame(
         raise ARCalibrationError("hour must match the timestamp hour")
     if frame["seed"].dtype not in _INTEGER_DTYPES:
         raise ARCalibrationError("seed must be an integer")
+    if not _is_string_dtype(frame["model"].dtype):
+        raise ARCalibrationError("model must be a string")
+    if not _is_string_dtype(frame["feature_set"].dtype):
+        raise ARCalibrationError("feature_set must be a string")
     identifiers = ("model", "feature_set", "seed")
     if any(frame[column].n_unique() != 1 for column in identifiers):
         raise ARCalibrationError("event residual context must have one model/feature/seed")
     if any(not str(frame[column].item(0)).strip() for column in ("model", "feature_set")):
         raise ARCalibrationError("event residual context identifiers must not be blank")
-    if frame["split_id"].dtype not in {pl.String, pl.Categorical, pl.Enum}:
+    if str(frame["feature_set"].item(0)) not in {"B0", "B1"}:
+        raise ARCalibrationError("feature_set must be B0 or B1")
+    if not _is_string_dtype(frame["split_id"].dtype):
         raise ARCalibrationError("split_id must be a string")
     split_ids: list[str] = []
     for occurrence_id in frame["occurrence_id"].unique().to_list():

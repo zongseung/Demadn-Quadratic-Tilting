@@ -89,6 +89,31 @@ def test_context_allows_distinct_oof_splits_but_rejects_unknown_or_mixed_event_s
         validate_event_residual_context(frame.with_columns(pl.lit(17.5).alias("seed")))
 
 
+@pytest.mark.parametrize(
+    ("column", "value", "match"),
+    [
+        ("model", 7, "model must be a string"),
+        ("feature_set", 7, "feature_set must be a string"),
+        ("feature_set", "B2", "feature_set must be B0 or B1"),
+    ],
+)
+def test_context_rejects_nonstring_or_unknown_model_feature_identifiers(column, value, match):
+    with pytest.raises(ARCalibrationError, match=match):
+        validate_event_residual_context(
+            _residual_frame(events=1).with_columns(pl.lit(value).alias(column))
+        )
+
+
+def test_context_accepts_categorical_model_and_feature_set_identifiers():
+    frame = _residual_frame(events=1).with_columns(
+        pl.col("model").cast(pl.Categorical), pl.col("feature_set").cast(pl.Categorical)
+    )
+
+    context = validate_event_residual_context(frame)
+
+    assert (context.model, context.feature_set) == ("baseline", "B1")
+
+
 def test_detrending_removes_each_event_quadratic_and_hour_harmonics_independently():
     frame = _residual_frame(events=2)
     enriched = frame.with_columns(

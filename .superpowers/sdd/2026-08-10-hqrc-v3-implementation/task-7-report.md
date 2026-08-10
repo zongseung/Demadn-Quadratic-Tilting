@@ -36,3 +36,9 @@ The pre-existing untracked `hqrc_v3/uv.lock` was not modified or staged.
 - GREEN: the same focused command passed with `23 passed`; the complete suite passed with `152 passed`; Ruff and `git diff --check` were clean.
 - Added per-destination advisory locking for readers and writers, with the immutable overwrite decision re-checked under the exclusive lock and temporary-file cleanup on publication failure.
 - Approval and loading now require all three current provenance hashes. Artifacts record sorted split IDs, validate strict calibration provenance and moment-rule recomputation, and serialize lag-specific Bartlett ACF bounds separately from the PACF reference width.
+
+## Fix round 2
+
+- RED: the focused Task 7 plus CLI command produced 3 expected failures: numeric `model`, numeric `feature_set`, and unknown string feature set `B2` were accepted by the previous context validator.
+- GREEN: the focused command passed with `27 passed`; the full suite passed with `156 passed`; Ruff and `git diff --check` were clean.
+- Context validation now requires string-like `model` and `feature_set` dtypes (including categorical/enum), nonblank single values, and `feature_set` exactly `B0` or `B1`; seed remains an integer-only contract.
