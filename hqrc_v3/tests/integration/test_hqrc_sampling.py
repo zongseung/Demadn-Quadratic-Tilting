@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
+
 import arviz as az
 import numpy as np
 import pytest
 from hqrc_v3.bayes.model import HQRCData
-from hqrc_v3.bayes.samplers import sample_hqrc, validate_inference_data
+from hqrc_v3.bayes.samplers import SamplingError, sample_hqrc, validate_inference_data
 from hqrc_v3.diagnostics.ar import (
     EventResidualContext,
     approve_calibration,
@@ -52,11 +54,24 @@ def test_tiny_hqrc_sampling_returns_finite_posterior(tmp_path):
     assert np.isfinite(idata.posterior["phi"]).all()
     assert "log_likelihood" in idata.groups()
     assert np.isfinite(az.loo(idata, var_name="event").elpd_loo)
-    assert idata.attrs["hqrc_sampler"]["target_accept"] == 0.9
-    assert idata.attrs["hqrc_calibration"]["artifact_digest"] == calibration.artifact_digest
+    assert json.loads(idata.attrs["hqrc_sampler_json"])["target_accept"] == 0.9
+    assert (
+        json.loads(idata.attrs["hqrc_calibration_json"])["artifact_digest"]
+        == calibration.artifact_digest
+    )
+    netcdf_path = tmp_path / "posterior.nc"
+    az.to_netcdf(idata, netcdf_path)
+    round_trip = az.from_netcdf(netcdf_path)
+    assert json.loads(round_trip.attrs["hqrc_model_json"])["variant"] == "H3"
     assert validate_inference_data(idata, paper_profile=False).divergences >= 0
 
 
 def test_paper_profile_rejects_smoke_sampler_limits_before_model_build():
     with pytest.raises(ValueError, match="4 chains"):
         sample_hqrc(None, None, draws=30, tune=30, chains=2, paper_profile=True)
+
+
+def test_paper_diagnostics_fail_closed_without_divergence_statistics():
+    idata = az.from_dict(posterior={"phi": np.zeros((4, 8))})
+    with pytest.raises(SamplingError, match="diverging"):
+        validate_inference_data(idata, paper_profile=True)

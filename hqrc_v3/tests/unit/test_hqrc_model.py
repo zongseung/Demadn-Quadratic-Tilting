@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 from hqrc_v3.bayes.model import HQRCData, HQRCModelOptions, build_hqrc_model
@@ -10,6 +12,7 @@ from hqrc_v3.diagnostics.ar import (
     load_approved_calibration,
     write_ar_diagnostics,
 )
+from hqrc_v3.provenance import ArtifactMismatch
 
 
 @pytest.fixture
@@ -87,6 +90,17 @@ def test_model_rejects_untrusted_direct_calibration(tiny_hqrc_data):
         build_hqrc_model(tiny_hqrc_data, direct)
 
 
+def test_model_revalidates_approved_artifact_against_immutable_contents(
+    tiny_hqrc_data, approved_calibration
+):
+    forged = replace(
+        approved_calibration,
+        calibration=calibrate_beta_prior(np.array([0.25, 0.35]), event_ids=("a", "b")),
+    )
+    with pytest.raises(ArtifactMismatch, match="does not match"):
+        build_hqrc_model(tiny_hqrc_data, forged)
+
+
 def test_diagonal_no_restriction_sensitivity_omits_correlation_and_delta(
     tiny_hqrc_data, approved_calibration
 ):
@@ -151,8 +165,8 @@ def test_data_rejects_noncontiguous_occurrence_segments():
             observations=np.ones(3),
             occurrence_index=np.array([0, 1, 0]),
             holiday_type_index=np.array([0, 1, 0]),
-            tau_days=np.zeros(3),
-            hour=np.arange(3),
+            tau_days=np.array([0.0, 1.0 / 24.0, 0.0]),
+            hour=np.array([0, 1, 0]),
             restriction=np.zeros(3, dtype=int),
             occurrence_ids=("a", "b"),
         )
@@ -176,6 +190,32 @@ def test_data_rejects_nonhourly_or_shuffled_within_occurrence(tau_days, hour, me
             restriction=np.zeros(2, dtype=int),
             occurrence_ids=("a",),
         )
+
+
+def test_data_rejects_tau_hour_mismatch_even_when_steps_are_hourly():
+    with pytest.raises(ValueError, match="align"):
+        HQRCData(
+            observations=np.ones(2),
+            occurrence_index=np.zeros(2, dtype=int),
+            holiday_type_index=np.zeros(2, dtype=int),
+            tau_days=np.array([0.5, 13.0 / 24.0]),
+            hour=np.array([0, 1]),
+            restriction=np.zeros(2, dtype=int),
+            occurrence_ids=("a",),
+        )
+
+
+def test_data_accepts_float32_hourly_tau_with_matching_hour():
+    data = HQRCData(
+        observations=np.ones(3),
+        occurrence_index=np.zeros(3, dtype=int),
+        holiday_type_index=np.zeros(3, dtype=int),
+        tau_days=np.array([-1.0, -23.0 / 24.0, -22.0 / 24.0], dtype=np.float32),
+        hour=np.array([0, 1, 2]),
+        restriction=np.zeros(3, dtype=int),
+        occurrence_ids=("a",),
+    )
+    assert data.hour.tolist() == [0, 1, 2]
 
 
 def test_h4_uses_integer_day_position_and_intrinsic_random_walk(

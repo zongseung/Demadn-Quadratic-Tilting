@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import math
 import time
 from dataclasses import asdict, dataclass
@@ -13,7 +14,7 @@ import numpy as np
 import xarray as xr
 
 from hqrc_v3.bayes.model import HQRCData, HQRCModelOptions, Pooling, Variant, build_hqrc_model
-from hqrc_v3.diagnostics.ar import ApprovedARCalibration
+from hqrc_v3.diagnostics.ar import ApprovedARCalibration, require_approved_calibration
 
 
 class SamplingError(RuntimeError):
@@ -41,13 +42,22 @@ def validate_inference_data(idata: az.InferenceData, *, paper_profile: bool) -> 
     if not isinstance(idata, az.InferenceData) or not hasattr(idata, "posterior"):
         raise SamplingError("sampler did not return ArviZ InferenceData with posterior draws")
     summary = az.summary(idata, kind="diagnostics")
+    if not hasattr(idata, "sample_stats") or "diverging" not in idata.sample_stats:
+        if paper_profile:
+            raise SamplingError("paper_profile requires sample_stats.diverging diagnostics")
+        divergences = 0
+    else:
+        raw_diverging = np.asarray(idata.sample_stats["diverging"])
+        if raw_diverging.dtype.kind not in {"b", "i", "u"} or not np.isfinite(
+            raw_diverging.astype(float)
+        ).all():
+            raise SamplingError("sample_stats.diverging must be finite boolean/integer diagnostics")
+        divergences = int(raw_diverging.sum())
     diagnostics = SamplingDiagnostics(
         max_rhat=_summary_value(summary, "r_hat", np.nanmax, math.inf),
         min_bulk_ess=_summary_value(summary, "ess_bulk", np.nanmin, 0.0),
         min_tail_ess=_summary_value(summary, "ess_tail", np.nanmin, 0.0),
-        divergences=int(np.asarray(idata.sample_stats["diverging"], dtype=int).sum())
-        if hasattr(idata, "sample_stats") and "diverging" in idata.sample_stats
-        else 0,
+        divergences=divergences,
     )
     if paper_profile and (
         diagnostics.max_rhat > 1.01
@@ -84,7 +94,8 @@ def sample_hqrc(
         raise TypeError("seed must be an integer")
     if paper_profile and (chains != 4 or draws < 1_000 or tune < 1_000):
         raise ValueError("paper_profile requires exactly 4 chains and at least 1000 tune/draws")
-    model = build_hqrc_model(data, calibration, variant, pooling, options)
+    trusted_calibration = require_approved_calibration(calibration)
+    model = build_hqrc_model(data, trusted_calibration, variant, pooling, options)
     started = time.perf_counter()
     target_accept = 0.99 if paper_profile else 0.9
     if backend == "pymc":
@@ -127,29 +138,29 @@ def sample_hqrc(
             "hqrc_elapsed_seconds": time.perf_counter() - started,
             "hqrc_pymc_version": importlib.metadata.version("pymc"),
             "hqrc_arviz_version": importlib.metadata.version("arviz"),
-            "hqrc_diagnostics": asdict(diagnostics),
-            "hqrc_sampler": {
+            "hqrc_diagnostics_json": json.dumps(asdict(diagnostics), sort_keys=True),
+            "hqrc_sampler_json": json.dumps({
                 "draws": draws,
                 "tune": tune,
                 "chains": chains,
                 "seed": seed,
                 "target_accept": target_accept,
                 "paper_profile": paper_profile,
-            },
-            "hqrc_model": {
+            }, sort_keys=True),
+            "hqrc_model_json": json.dumps({
                 "variant": variant,
                 "pooling": pooling,
                 "options": asdict(options or HQRCModelOptions()),
-            },
-            "hqrc_calibration": {
-                "artifact_path": str(calibration.artifact_path),
-                "artifact_digest": calibration.artifact_digest,
-                "residual_sha256": calibration.residual_sha256,
-                "config_sha256": calibration.config_sha256,
-                "event_sha256": calibration.event_sha256,
-                "a": calibration.a,
-                "b": calibration.b,
-            },
+            }, sort_keys=True),
+            "hqrc_calibration_json": json.dumps({
+                "artifact_path": str(trusted_calibration.artifact_path),
+                "artifact_digest": trusted_calibration.artifact_digest,
+                "residual_sha256": trusted_calibration.residual_sha256,
+                "config_sha256": trusted_calibration.config_sha256,
+                "event_sha256": trusted_calibration.event_sha256,
+                "a": trusted_calibration.a,
+                "b": trusted_calibration.b,
+            }, sort_keys=True),
         }
     )
     if backend == "nutpie":

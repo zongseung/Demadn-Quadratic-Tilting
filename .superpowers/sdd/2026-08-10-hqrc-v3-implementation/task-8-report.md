@@ -77,3 +77,25 @@ The pre-existing untracked `hqrc_v3/uv.lock` was not modified or staged.
   smoke passed with `1 passed`; full suite passed with `188 passed`.  Ruff and
   `git diff --check` passed.  Tiny-sampler ArviZ/LOO warnings are expected for
   a two-event, 30-draw smoke run and do not affect the non-paper gate.
+
+## Fix round 2
+
+- RED: an `ApprovedARCalibration` could be forged with `dataclasses.replace`,
+  nested sampler attrs were not NetCDF-safe, paper diagnostics accepted absent
+  divergence statistics, and tau/hour alignment only checked relative steps.
+- Every build and sample boundary now reloads and verifies the trusted artifact
+  with all three stored hashes, digest, and exact calibration value comparison.
+  Replaced calibration/provenance values fail before model construction.
+- Provenance metadata is canonical JSON in scalar `idata.attrs` fields.  The
+  sampler smoke writes and reloads a real NetCDF artifact and parses those
+  fields successfully.
+- Paper-profile inference fails closed when `sample_stats.diverging` is absent
+  or invalid.  Non-paper behavior explicitly treats an absent divergence field
+  as zero while still rejecting malformed values.
+- Tau days must represent an integer absolute hour (tolerance `1e-4` hour) and
+  agree modulo 24 with the supplied hour.  One-hour differences use a
+  float32-safe tolerance; float32 hourly rows are accepted while half-day/hour
+  mismatches are rejected.
+- GREEN: focused model/artifact tests passed with `37 passed`; sampler smoke
+  including NetCDF round trip passed; full suite passed with `192 passed`.
+  Ruff and `git diff --check` passed.

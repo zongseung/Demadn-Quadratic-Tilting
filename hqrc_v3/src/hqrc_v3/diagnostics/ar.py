@@ -129,11 +129,26 @@ class ApprovedARCalibration:
 
 
 def require_approved_calibration(value: object) -> ApprovedARCalibration:
-    """Reject hand-built/diagnostic-only calibrations at the model boundary."""
+    """Revalidate the immutable approved artifact at every HQRC model boundary."""
 
     if not isinstance(value, ApprovedARCalibration) or value._token is not _APPROVAL_TOKEN:
         raise TypeError("HQRC fitting requires an approved AR calibration artifact")
-    return value
+    reloaded = load_approved_calibration(
+        value.artifact_path,
+        current_residual_sha256=value.residual_sha256,
+        current_config_sha256=value.config_sha256,
+        current_event_sha256=value.event_sha256,
+    )
+    if (
+        reloaded.calibration != value.calibration
+        or reloaded.artifact_digest != value.artifact_digest
+        or reloaded.artifact_path != value.artifact_path
+        or reloaded.residual_sha256 != value.residual_sha256
+        or reloaded.config_sha256 != value.config_sha256
+        or reloaded.event_sha256 != value.event_sha256
+    ):
+        raise ArtifactMismatch("approved calibration wrapper does not match its immutable artifact")
+    return reloaded
 
 
 def _timestamp_column(frame: pl.DataFrame) -> str:

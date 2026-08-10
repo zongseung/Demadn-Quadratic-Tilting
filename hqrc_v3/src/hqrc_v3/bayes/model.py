@@ -79,6 +79,12 @@ class HQRCData:
             raise ValueError("hour must be from 0 through 23")
         if not np.isin(restriction, (0, 1)).all():
             raise ValueError("restriction must be binary")
+        tau_hours = arrays["tau_days"].astype(float, copy=False) * 24.0
+        rounded_tau_hours = np.rint(tau_hours).astype(np.int64)
+        if not np.allclose(tau_hours, rounded_tau_hours, rtol=0.0, atol=1e-4):
+            raise ValueError("tau_days must align to integer hourly positions")
+        if not np.array_equal(np.mod(rounded_tau_hours, 24), hour):
+            raise ValueError("tau_days absolute hourly position must align with hour")
 
         seen: set[int] = set()
         starts: list[int] = []
@@ -98,7 +104,7 @@ class HQRCData:
                 raise ValueError("each occurrence must have one holiday type and restriction flag")
             block_tau = arrays["tau_days"][block].astype(float, copy=False)
             if block_tau.size > 1 and not np.allclose(
-                np.diff(block_tau), 1.0 / 24.0, rtol=0.0, atol=1e-10
+                np.diff(block_tau), 1.0 / 24.0, rtol=0.0, atol=1e-5
             ):
                 raise ValueError("occurrence tau_days must be strictly ordered in one-hour steps")
             block_hour = hour[block]
@@ -173,7 +179,7 @@ def stationary_ar1_logp_numpy(segments: Sequence[np.ndarray], phi: float, sigma:
     return total
 
 
-def _validate_calibration(calibration: ApprovedARCalibration) -> None:
+def _validate_calibration(calibration: ApprovedARCalibration) -> ApprovedARCalibration:
     trusted = require_approved_calibration(calibration)
     values = trusted.calibration
     if (
@@ -183,6 +189,7 @@ def _validate_calibration(calibration: ApprovedARCalibration) -> None:
         or values.b <= 1
     ):
         raise ValueError("ARCalibration Beta parameters must be finite and greater than one")
+    return trusted
 
 
 def _intrinsic_random_walk(
@@ -333,7 +340,7 @@ def build_hqrc_model(
 
     if not isinstance(data, HQRCData):
         raise TypeError("data must be HQRCData")
-    _validate_calibration(calibration)
+    calibration = _validate_calibration(calibration)
     if variant not in {"H1", "H2", "H3", "H4"}:
         raise ValueError("variant must be H1, H2, H3, or H4")
     if pooling not in {"complete", "partial", "none"}:
