@@ -9,7 +9,7 @@ from typing import Literal
 
 import numpy as np
 
-from hqrc_v3.diagnostics.ar import ARCalibration
+from hqrc_v3.diagnostics.ar import ApprovedARCalibration, require_approved_calibration
 
 Variant = Literal["H1", "H2", "H3", "H4"]
 Pooling = Literal["complete", "partial", "none"]
@@ -96,6 +96,17 @@ class HQRCData:
             block = slice(start, row)
             if np.unique(holiday_type[block]).size != 1 or np.unique(restriction[block]).size != 1:
                 raise ValueError("each occurrence must have one holiday type and restriction flag")
+            block_tau = arrays["tau_days"][block].astype(float, copy=False)
+            if block_tau.size > 1 and not np.allclose(
+                np.diff(block_tau), 1.0 / 24.0, rtol=0.0, atol=1e-10
+            ):
+                raise ValueError("occurrence tau_days must be strictly ordered in one-hour steps")
+            block_hour = hour[block]
+            if block_hour.size > 1 and not np.array_equal(
+                (block_hour[1:] - block_hour[:-1]) % 24,
+                np.ones(block_hour.size - 1, dtype=np.int64),
+            ):
+                raise ValueError("occurrence hour values must advance one hour modulo 24")
             starts.append(start)
             ends.append(row)
             occurrence_types[current] = holiday_type[start]
@@ -162,28 +173,41 @@ def stationary_ar1_logp_numpy(segments: Sequence[np.ndarray], phi: float, sigma:
     return total
 
 
-def _validate_calibration(calibration: ARCalibration) -> None:
-    if not isinstance(calibration, ARCalibration):
-        raise TypeError("calibration must be an approved ARCalibration")
+def _validate_calibration(calibration: ApprovedARCalibration) -> None:
+    trusted = require_approved_calibration(calibration)
+    values = trusted.calibration
     if (
-        not math.isfinite(calibration.a)
-        or not math.isfinite(calibration.b)
-        or calibration.a <= 1
-        or calibration.b <= 1
+        not math.isfinite(values.a)
+        or not math.isfinite(values.b)
+        or values.a <= 1
+        or values.b <= 1
     ):
         raise ValueError("ARCalibration Beta parameters must be finite and greater than one")
 
 
-def _cyclic_hour_profile(pm, pt, *, name: str):
-    raw = pm.Normal(f"{name}_raw", mu=0.0, sigma=1.0, shape=(2, 24))
-    profile = pm.Deterministic(name, raw - pt.mean(raw, axis=1, keepdims=True))
-    sigma = pm.HalfNormal("sigma_gamma", sigma=0.5, shape=2)
-    differences = pt.concatenate(
-        (profile[:, 1:] - profile[:, :-1], profile[:, :1] - profile[:, -1:]), axis=1
+def _intrinsic_random_walk(
+    pm, pt, *, name: str, positions: int, scale_name: str, scale: float, circular: bool = False
+):
+    """Build an identified sum-zero RW1 from innovations, never iid level effects."""
+
+    sigma = pm.HalfNormal(scale_name, sigma=scale, shape=2)
+    if positions == 1:
+        return pm.Deterministic(name, pt.zeros((2, 1)))
+    innovation = pm.Normal(
+        f"{name}_innovation", mu=0.0, sigma=sigma[:, None], shape=(2, positions - 1)
     )
-    pm.Potential(
-        "gamma_circular_random_walk",
-        pm.logp(pm.Normal.dist(mu=0.0, sigma=sigma[:, None]), differences).sum(),
+    if circular:
+        pm.Potential(
+            f"{name}_circular_random_walk",
+            pm.logp(pm.Normal.dist(mu=0.0, sigma=sigma), -pt.sum(innovation, axis=1)).sum(),
+        )
+    path = pt.concatenate((pt.zeros((2, 1)), pt.cumsum(innovation, axis=1)), axis=1)
+    return pm.Deterministic(name, path - pt.mean(path, axis=1, keepdims=True))
+
+
+def _cyclic_hour_profile(pm, pt, *, name: str):
+    profile = _intrinsic_random_walk(
+        pm, pt, name=name, positions=24, scale_name="sigma_gamma", scale=0.5, circular=True
     )
     return profile
 
@@ -238,10 +262,14 @@ def _occurrence_coefficients(
 
 
 def _ar_likelihood(
-    pm, pt, residual, data: HQRCData, calibration: ARCalibration, innovation: Innovation
+    pm,
+    pt,
+    residual,
+    data: HQRCData,
+    calibration: ApprovedARCalibration,
+    innovation: Innovation,
 ):
     sigma = pm.HalfNormal("sigma_r", sigma=1.0)
-    terms = []
     if innovation == "normal_ar2":
         pacf = pm.Uniform("ar2_pacf", lower=-0.95, upper=0.95, shape=2)
         phi2 = pacf[1]
@@ -252,19 +280,24 @@ def _ar_likelihood(
         )
         gamma1 = phi1 * gamma0 / (1.0 - phi2)
         covariance = pt.stack(((gamma0, gamma1), (gamma1, gamma0)))
+        event_terms = []
         for segment in data.segments:
             values = residual[segment]
             if segment.stop - segment.start == 1:
-                terms.append(pm.logp(pm.Normal.dist(mu=0.0, sigma=pt.sqrt(gamma0)), values[0]))
+                event_terms.append(
+                    pm.logp(pm.Normal.dist(mu=0.0, sigma=pt.sqrt(gamma0)), values[0])
+                )
             else:
-                terms.append(pm.logp(pm.MvNormal.dist(mu=pt.zeros(2), cov=covariance), values[:2]))
-                terms.append(
+                initial = pm.logp(pm.MvNormal.dist(mu=pt.zeros(2), cov=covariance), values[:2])
+                innovation_term = (
                     pm.logp(
                         pm.Normal.dist(mu=phi1 * values[1:-1] + phi2 * values[:-2], sigma=sigma),
                         values[2:],
                     ).sum()
                 )
-        pm.Potential("event_reset_ar2", pt.stack(terms).sum())
+                event_terms.append(initial + innovation_term)
+        pointwise = pm.Deterministic("event_log_likelihood", pt.stack(event_terms))
+        pm.Potential("event_reset_ar2", pointwise.sum())
         return
 
     u_phi = pm.Beta("u_phi", alpha=calibration.a, beta=calibration.b)
@@ -278,16 +311,20 @@ def _ar_likelihood(
     else:
         def distribution(mu, scale):
             return pm.Normal.dist(mu=mu, sigma=scale)
+    event_terms = []
     for segment in data.segments:
         values = residual[segment]
-        terms.append(pm.logp(distribution(0.0, stationary_scale), values[0]))
-        terms.append(pm.logp(distribution(phi * values[:-1], sigma), values[1:]).sum())
-    pm.Potential("event_reset_ar1", pt.stack(terms).sum())
+        event_terms.append(
+            pm.logp(distribution(0.0, stationary_scale), values[0])
+            + pm.logp(distribution(phi * values[:-1], sigma), values[1:]).sum()
+        )
+    pointwise = pm.Deterministic("event_log_likelihood", pt.stack(event_terms))
+    pm.Potential("event_reset_ar1", pointwise.sum())
 
 
 def build_hqrc_model(
     data: HQRCData,
-    calibration: ARCalibration,
+    calibration: ApprovedARCalibration,
     variant: Variant = "H3",
     pooling: Pooling = "partial",
     options: HQRCModelOptions | None = None,
@@ -326,16 +363,15 @@ def build_hqrc_model(
             )
             mean = pt.sum(beta[occurrence] * design, axis=1)
         else:
-            unique_days = np.unique(data.tau_days)
-            day_lookup = np.searchsorted(unique_days, data.tau_days)
-            day_raw = pm.Normal("day_effect_raw", mu=0.0, sigma=1.0, shape=(2, len(unique_days)))
-            day_effect = pm.Deterministic(
-                "day_effect", day_raw - pt.mean(day_raw, axis=1, keepdims=True)
-            )
-            day_differences = day_effect[:, 1:] - day_effect[:, :-1]
-            pm.Potential(
-                "day_random_walk",
-                pm.logp(pm.Normal.dist(mu=0.0, sigma=1.0), day_differences).sum(),
+            unique_days = np.unique(np.floor(data.tau_days).astype(np.int64))
+            day_lookup = np.searchsorted(unique_days, np.floor(data.tau_days).astype(np.int64))
+            day_effect = _intrinsic_random_walk(
+                pm,
+                pt,
+                name="day_effect",
+                positions=len(unique_days),
+                scale_name="sigma_day",
+                scale=1.0,
             )
             mean = beta[occurrence, 0] + day_effect[data.holiday_type_index, day_lookup]
         if variant in {"H3", "H4"}:

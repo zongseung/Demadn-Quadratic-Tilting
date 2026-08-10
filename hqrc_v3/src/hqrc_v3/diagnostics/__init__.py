@@ -1,6 +1,7 @@
 """Diagnostics contracts for residual-based HQRC calibration."""
 
 from hqrc_v3.diagnostics.ar import (
+    ApprovedARCalibration,
     ARCalibration,
     ARCalibrationError,
     EventARDiagnostic,
@@ -12,6 +13,7 @@ from hqrc_v3.diagnostics.ar import (
     estimate_event_phi,
     estimate_event_phis,
     load_approved_calibration,
+    require_approved_calibration,
     validate_event_residual_context,
     write_ar_diagnostics,
 )
@@ -19,6 +21,7 @@ from hqrc_v3.diagnostics.ar import (
 __all__ = [
     "ARCalibration",
     "ARCalibrationError",
+    "ApprovedARCalibration",
     "EventARDiagnostic",
     "EventResidualContext",
     "approve_calibration",
@@ -28,6 +31,7 @@ __all__ = [
     "estimate_event_phi",
     "estimate_event_phis",
     "load_approved_calibration",
+    "require_approved_calibration",
     "validate_event_residual_context",
     "write_ar_diagnostics",
 ]

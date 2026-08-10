@@ -64,7 +64,10 @@ def test_json_round_trip_approval_and_unapproved_loader_rejection(tmp_path, cali
         current_config_sha256="config",
         current_event_sha256="events",
     )
-    assert loaded == calibration
+    assert loaded.calibration == calibration
+    assert loaded.residual_sha256 == "residual"
+    assert loaded.config_sha256 == "config"
+    assert loaded.event_sha256 == "events"
     payload = json.loads(approved.read_text(encoding="utf-8"))
     assert payload["approved"] is True
     assert (

@@ -3,12 +3,41 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from hqrc_v3.bayes.model import HQRCData, HQRCModelOptions, build_hqrc_model
-from hqrc_v3.diagnostics.ar import calibrate_beta_prior
+from hqrc_v3.diagnostics.ar import (
+    EventResidualContext,
+    approve_calibration,
+    calibrate_beta_prior,
+    load_approved_calibration,
+    write_ar_diagnostics,
+)
 
 
 @pytest.fixture
-def approved_calibration():
-    return calibrate_beta_prior(np.array([0.25, 0.35, 0.45]), event_ids=("a", "b", "c"))
+def approved_calibration(tmp_path):
+    calibration = calibrate_beta_prior(np.array([0.25, 0.35, 0.45]), event_ids=("a", "b", "c"))
+    hashes = {"residual": "residual-hash", "config": "config-hash", "event": "event-hash"}
+    proposal = write_ar_diagnostics(
+        tmp_path / "proposal.json",
+        (),
+        calibration,
+        residual_sha256=hashes["residual"],
+        config_sha256=hashes["config"],
+        event_sha256=hashes["event"],
+        context=EventResidualContext("model", "B0", 5, ("oof-2020",)),
+    )
+    approved = approve_calibration(
+        proposal,
+        tmp_path / "approved.json",
+        current_residual_sha256=hashes["residual"],
+        current_config_sha256=hashes["config"],
+        current_event_sha256=hashes["event"],
+    )
+    return load_approved_calibration(
+        approved,
+        current_residual_sha256=hashes["residual"],
+        current_config_sha256=hashes["config"],
+        current_event_sha256=hashes["event"],
+    )
 
 
 @pytest.fixture
@@ -24,7 +53,7 @@ def tiny_hqrc_data():
             observations.append(0.1 * occurrence + 0.05 * step)
             occurrence_index.append(occurrence)
             holiday_type_index.append(holiday_type)
-            tau_days.append(float(step - 1))
+            tau_days.append(-1.0 + step / 24.0)
             hour.append(step)
             restriction.append(occurrence % 2)
     return HQRCData(
@@ -50,6 +79,12 @@ def test_h3_contains_required_random_variables(tiny_hqrc_data, approved_calibrat
         model.named_vars
     )
     assert "u_phi" in model.named_vars
+
+
+def test_model_rejects_untrusted_direct_calibration(tiny_hqrc_data):
+    direct = calibrate_beta_prior(np.array([0.25, 0.35]), event_ids=("a", "b"))
+    with pytest.raises(TypeError, match="approved"):
+        build_hqrc_model(tiny_hqrc_data, direct)
 
 
 def test_diagonal_no_restriction_sensitivity_omits_correlation_and_delta(
@@ -90,6 +125,18 @@ def test_predeclared_ar_sensitivities_build(tiny_hqrc_data, approved_calibration
     assert expected in model.named_vars
 
 
+@pytest.mark.parametrize("innovation", ["normal_ar1", "student_t_ar1", "normal_ar2"])
+def test_every_innovation_exposes_occurrence_log_likelihood(
+    tiny_hqrc_data, approved_calibration, innovation
+):
+    model = build_hqrc_model(
+        tiny_hqrc_data,
+        approved_calibration,
+        options=HQRCModelOptions(innovation=innovation),
+    )
+    assert model.named_vars["event_log_likelihood"].type.shape == (4,)
+
+
 @pytest.mark.parametrize(
     "options", [HQRCModelOptions(lkj_eta=0), HQRCModelOptions(between_scale_prior=0)]
 )
@@ -109,3 +156,34 @@ def test_data_rejects_noncontiguous_occurrence_segments():
             restriction=np.zeros(3, dtype=int),
             occurrence_ids=("a", "b"),
         )
+
+
+@pytest.mark.parametrize(
+    ("tau_days", "hour", "message"),
+    [
+        (np.array([0.0, 2.0 / 24.0]), np.array([0, 2]), "one-hour"),
+        (np.array([0.0, 1.0 / 24.0]), np.array([0, 2]), "hour"),
+    ],
+)
+def test_data_rejects_nonhourly_or_shuffled_within_occurrence(tau_days, hour, message):
+    with pytest.raises(ValueError, match=message):
+        HQRCData(
+            observations=np.ones(2),
+            occurrence_index=np.zeros(2, dtype=int),
+            holiday_type_index=np.zeros(2, dtype=int),
+            tau_days=tau_days,
+            hour=hour,
+            restriction=np.zeros(2, dtype=int),
+            occurrence_ids=("a",),
+        )
+
+
+def test_h4_uses_integer_day_position_and_intrinsic_random_walk(
+    tiny_hqrc_data, approved_calibration
+):
+    model = build_hqrc_model(tiny_hqrc_data, approved_calibration, variant="H4")
+    assert model.named_vars["day_effect"].type.shape == (2, 1)
+    assert "day_effect_raw" not in model.named_vars
+    assert "sigma_day" in model.named_vars
+    assert "gamma_raw" not in model.named_vars
+    assert "gamma_innovation" in model.named_vars

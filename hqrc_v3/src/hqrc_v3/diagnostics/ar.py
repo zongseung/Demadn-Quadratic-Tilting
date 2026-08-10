@@ -9,7 +9,7 @@ import os
 import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -102,6 +102,38 @@ class ARCalibration:
     event_ids: tuple[str, ...]
     phi_estimates: tuple[float, ...]
     formula_version: str = _FORMULA_VERSION
+
+
+_APPROVAL_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class ApprovedARCalibration:
+    """A calibration trusted only after digest and current-input hash validation."""
+
+    calibration: ARCalibration
+    artifact_path: Path
+    residual_sha256: str
+    config_sha256: str
+    event_sha256: str
+    artifact_digest: str
+    _token: object = field(repr=False, compare=False)
+
+    @property
+    def a(self) -> float:
+        return self.calibration.a
+
+    @property
+    def b(self) -> float:
+        return self.calibration.b
+
+
+def require_approved_calibration(value: object) -> ApprovedARCalibration:
+    """Reject hand-built/diagnostic-only calibrations at the model boundary."""
+
+    if not isinstance(value, ApprovedARCalibration) or value._token is not _APPROVAL_TOKEN:
+        raise TypeError("HQRC fitting requires an approved AR calibration artifact")
+    return value
 
 
 def _timestamp_column(frame: pl.DataFrame) -> str:
@@ -770,7 +802,7 @@ def load_approved_calibration(
     current_residual_sha256: str,
     current_config_sha256: str,
     current_event_sha256: str,
-) -> ARCalibration:
+) -> ApprovedARCalibration:
     """Load only an approved, digest-valid calibration compatible with current inputs."""
 
     payload = _read_artifact(path)
@@ -786,4 +818,13 @@ def load_approved_calibration(
         current_config_sha256=current_config_sha256,
         current_event_sha256=current_event_sha256,
     )
-    return _calibration_from_mapping(payload.get("calibration"))
+    calibration = _calibration_from_mapping(payload.get("calibration"))
+    return ApprovedARCalibration(
+        calibration=calibration,
+        artifact_path=path,
+        residual_sha256=current_residual_sha256,
+        config_sha256=current_config_sha256,
+        event_sha256=current_event_sha256,
+        artifact_digest=str(payload["artifact_digest"]),
+        _token=_APPROVAL_TOKEN,
+    )

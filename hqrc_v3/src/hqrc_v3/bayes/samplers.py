@@ -10,9 +10,10 @@ from typing import Literal
 
 import arviz as az
 import numpy as np
+import xarray as xr
 
 from hqrc_v3.bayes.model import HQRCData, HQRCModelOptions, Pooling, Variant, build_hqrc_model
-from hqrc_v3.diagnostics.ar import ARCalibration
+from hqrc_v3.diagnostics.ar import ApprovedARCalibration
 
 
 class SamplingError(RuntimeError):
@@ -60,7 +61,7 @@ def validate_inference_data(idata: az.InferenceData, *, paper_profile: bool) -> 
 
 def sample_hqrc(
     data: HQRCData,
-    calibration: ARCalibration,
+    calibration: ApprovedARCalibration,
     *,
     variant: Variant = "H3",
     pooling: Pooling = "partial",
@@ -81,8 +82,11 @@ def sample_hqrc(
         raise ValueError("draws, tune, and chains must be positive integers")
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise TypeError("seed must be an integer")
+    if paper_profile and (chains != 4 or draws < 1_000 or tune < 1_000):
+        raise ValueError("paper_profile requires exactly 4 chains and at least 1000 tune/draws")
     model = build_hqrc_model(data, calibration, variant, pooling, options)
     started = time.perf_counter()
+    target_accept = 0.99 if paper_profile else 0.9
     if backend == "pymc":
         import pymc as pm
 
@@ -95,16 +99,27 @@ def sample_hqrc(
                 random_seed=seed,
                 progressbar=False,
                 compute_convergence_checks=False,
-                target_accept=0.9,
+                target_accept=target_accept,
             )
     elif backend == "nutpie":
         try:
             import nutpie
         except ImportError as error:
             raise SamplingError("nutpie backend requested but nutpie is not installed") from error
-        idata = nutpie.sample_pymc(model, draws=draws, tune=tune, chains=chains, seed=seed)
+        idata = nutpie.sample_pymc(
+            model, draws=draws, tune=tune, chains=chains, seed=seed, target_accept=target_accept
+        )
     else:
         raise ValueError("backend must be 'pymc' or 'nutpie'")
+    if "event_log_likelihood" not in idata.posterior:
+        raise SamplingError("HQRC posterior is missing occurrence-level log likelihood")
+    idata.add_groups(
+        {
+            "log_likelihood": xr.Dataset(
+                {"event": idata.posterior["event_log_likelihood"].rename("event")}
+            )
+        }
+    )
     diagnostics = validate_inference_data(idata, paper_profile=paper_profile)
     idata.attrs.update(
         {
@@ -113,6 +128,28 @@ def sample_hqrc(
             "hqrc_pymc_version": importlib.metadata.version("pymc"),
             "hqrc_arviz_version": importlib.metadata.version("arviz"),
             "hqrc_diagnostics": asdict(diagnostics),
+            "hqrc_sampler": {
+                "draws": draws,
+                "tune": tune,
+                "chains": chains,
+                "seed": seed,
+                "target_accept": target_accept,
+                "paper_profile": paper_profile,
+            },
+            "hqrc_model": {
+                "variant": variant,
+                "pooling": pooling,
+                "options": asdict(options or HQRCModelOptions()),
+            },
+            "hqrc_calibration": {
+                "artifact_path": str(calibration.artifact_path),
+                "artifact_digest": calibration.artifact_digest,
+                "residual_sha256": calibration.residual_sha256,
+                "config_sha256": calibration.config_sha256,
+                "event_sha256": calibration.event_sha256,
+                "a": calibration.a,
+                "b": calibration.b,
+            },
         }
     )
     if backend == "nutpie":
