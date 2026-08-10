@@ -5,12 +5,22 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
 
+import numpy as np
+import polars as pl
+
 from hqrc_v3.config import ConfigError
 from hqrc_v3.contracts import DataContractError
-from hqrc_v3.diagnostics.ar import approve_calibration
+from hqrc_v3.data import audit_hourly_data, read_hourly_data
+from hqrc_v3.diagnostics.ar import (
+    approve_calibration,
+    calibrate_beta_prior,
+    diagnose_event_residuals,
+    write_ar_diagnostics,
+)
 
 StageHandler = Callable[[argparse.Namespace], object]
 _EXPECTED_START = "2019-01-01T00:00:00"
@@ -32,7 +42,14 @@ def _unavailable_handler(stage: str) -> StageHandler:
 
 
 def audit_data_handler(arguments: argparse.Namespace) -> object:
-    return _unavailable_handler("audit-data")(arguments)
+    expected = {}
+    if arguments.fixed_expected_bounds:
+        expected = {
+            "expected_start": datetime.fromisoformat(_EXPECTED_START),
+            "expected_end": datetime.fromisoformat(_EXPECTED_END),
+            "expected_rows": _EXPECTED_ROWS,
+        }
+    return audit_hourly_data(read_hourly_data(Path(arguments.data)), **expected)
 
 
 def tune_baselines_handler(arguments: argparse.Namespace) -> object:
@@ -48,7 +65,26 @@ def fit_final_baselines_handler(arguments: argparse.Namespace) -> object:
 
 
 def diagnose_ar_handler(arguments: argparse.Namespace) -> object:
-    return _unavailable_handler("diagnose-ar")(arguments)
+    residuals = pl.read_parquet(arguments.residuals)
+    diagnostics = diagnose_event_residuals(residuals)
+    calibration = calibrate_beta_prior(
+        np.asarray([item.phi for item in diagnostics]),
+        event_ids=tuple(item.occurrence_id for item in diagnostics),
+    )
+    return write_ar_diagnostics(
+        Path(arguments.output),
+        diagnostics,
+        calibration,
+        residual_sha256=arguments.residual_sha256,
+        config_sha256=arguments.config_sha256,
+        event_sha256=arguments.event_sha256,
+        context={
+            "model": str(residuals["model"].item(0)),
+            "feature_set": str(residuals["feature_set"].item(0)),
+            "seed": int(residuals["seed"].item(0)),
+            "split_ids": tuple(sorted(residuals["split_id"].unique().to_list())),
+        },
+    )
 
 
 def approve_ar_calibration_handler(arguments: argparse.Namespace) -> object:
