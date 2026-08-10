@@ -16,7 +16,7 @@
 
 ## 2. 설계 결정 요약
 
-### 2.1 정적 분할과 expanding window는 대체 관계가 아니다
+### 2.1 최종 홀드아웃과 expanding OOF의 역할
 
 최종 평가는 다음 정적 구조를 사용한다.
 
@@ -34,30 +34,27 @@
 | 2023 | 2019--2022 |
 | 2024 | 2019--2023 |
 
-2020--2023 OOF 잔차와 여덟 개 휴일 발생은 2024년 HQRC 학습 및 AR 사전분포 보정에 사용한다. 2024 OOF 잔차는 최종 테스트와 10개 발생 LOEO 분석에만 사용한다.
+2020--2023 OOF 잔차와 여덟 개 휴일 발생은 2024년 HQRC 학습 및 AR 사전분포 보정에 사용한다. 각 fold 모델은 OOF 잔차를 생성한 뒤 최종 예측에는 사용하지 않는다. 선택된 설정으로 2019--2023 전체를 다시 학습한 final baseline만 2024를 예측한다. 2024 예측 잔차는 최종 테스트와 10개 발생 LOEO 구조 분석에만 사용한다.
 
-`2019--2022 / 2023 / 2024` 정적 분할 하나만 사용하면 2023년의 두 휴일만 정직한 HQRC 학습 표본으로 남는다. 이는 휴일 유형별 표본 희소성을 더 악화시키므로 HQRC 잔차 생성 방법으로는 사용하지 않는다. 대신 이 정적 분할은 하이퍼파라미터 선택과 최종 일반화 평가를 담당한다.
+`2019--2022 / 2023 / 2024`는 모델 설정 선택과 최종 일반화 평가를 담당한다. Expanding OOF는 이 바깥 분할을 대체하는 별도 평가법이 아니라, pre-2024 구간에서 HQRC의 학습 target인 정직한 baseline residual을 만드는 내부 절차다.
 
-### 2.2 expanding과 sliding 비교
+### 2.2 계산 전략
 
-과거 구조 변화가 expanding의 이점을 상쇄하는지 확인하기 위해 2년 sliding-origin을 민감도 분석으로 실행한다.
+하이퍼파라미터 탐색은 2019--2022 학습과 2023 검증에서 한 번만 수행하며, 기존 연구에서 확정된 versioned 설정을 사용할 경우 생략할 수 있다. 선택된 설정은 모든 OOF fold와 final baseline에서 고정한다. 연도별로 반복하는 것은 hyperparameter tuning이 아니라 fitted model parameter의 재추정이다.
 
-| 공통 평가 연도 | expanding 학습 연도 | 2년 sliding 학습 연도 |
+각 `(baseline, feature_set, seed, fold)` 예측은 한 번 생성한 뒤 immutable Parquet artifact로 캐시한다. 이후 AR 진단, H0--H5, pooling ablation과 확률평가는 baseline을 다시 학습하지 않고 같은 OOF 잔차를 재사용한다. 독립 fold는 자원 과다할당을 막는 worker 제한 아래 병렬 실행한다.
+
+최종적으로 필요한 baseline fit은 다음 다섯 개 연도 단계다.
+
+| 목적 | 학습 연도 | 예측 연도 |
 |---|---|---|
-| 2021 | 2019--2020 | 2019--2020 |
-| 2022 | 2019--2021 | 2020--2021 |
-| 2023 | 2019--2022 | 2021--2022 |
+| OOF residual | 2019 | 2020 |
+| OOF residual | 2019--2020 | 2021 |
+| OOF residual | 2019--2021 | 2022 |
+| OOF residual | 2019--2022 | 2023 |
+| final forecast | 2019--2023 | 2024 |
 
-비교는 2021--2023이라는 동일 평가 구간에서 수행한다. 비교 지표는 다음과 같다.
-
-- 비휴일 전체 RMSE와 SMAPE
-- 여섯 개 휴일 발생별 RMSE
-- 모델·특징 집합별 paired RMSE 차이
-- 계산 시간과 메모리
-
-2024년 결과를 보고 window 방식을 선택하지 않는다. 논문의 사전 지정 주 분석은 희소 휴일 자료를 모두 보존하는 expanding이다. sliding 결과는 강건성 표로 보고하며, pre-2024 공통 구간에서 sliding이 일관되게 우수하더라도 분석 라벨을 바꾸지 않고 별도 민감도 결과로 유지한다.
-
-2020 fold는 2019년 한 해만 학습하므로 특히 신경망 baseline의 오차 구조가 이후 fold와 다를 수 있다. 이를 확인하기 위해 HQRC calibration에서 2020 발생을 포함한 8-event 결과와, 최소 2년 warm-up을 요구하여 2021--2023만 사용하는 6-event 결과를 함께 산출한다. 주 분석은 표본을 보존하는 8-event expanding이지만, 두 결과의 correction shape 또는 2024 성능 방향이 다르면 2020 fold의 영향으로 명시한다.
+Sliding window와 2020 제외 전용 실험은 필수 설계에 포함하지 않는다. 특정 occurrence의 영향은 이미 계획된 event-level LOEO에서 대칭적으로 진단한다.
 
 ### 2.3 AR(1)은 유지하되 잔차가 사전분포를 결정한다
 
@@ -88,7 +85,7 @@ nutpie가 진단 품질을 유지하면서 기준 PyMC보다 wall time 또는 �
 - 원본 시간별 자료의 스키마 검사와 일 단위 24시간 예측 샘플 생성
 - B0/B1 특징 집합 생성 및 누수 검사
 - 다섯 베이스라인: XGBoost, LightGBM, SVR, Seq2Seq-LSTM, Transformer
-- 정적 분할, expanding-origin, 2년 sliding-origin
+- 정적 train/validation/test와 expanding-origin OOF
 - fold별 OOF 잔차 및 비휴일 잔차 척도 생성
 - 이벤트 레지스트리와 휴일 창 생성
 - ACF/PACF 기반 AR(1) 진단 및 prior 보정
@@ -178,7 +175,7 @@ hqrc_v3/
 - 미래 목표: 당일 00:00--23:00의 24시간
 - 미래 공변량: forecast origin에서 알려진 값만 허용
 
-샘플의 전체 24시간 target이 한 partition 안에 있을 때만 해당 partition에 포함한다. 경계에서 평가 입력이 과거 학습 partition에 걸치는 것은 forecast origin에서 이미 관측된 정보이므로 허용하지만, 학습 target이 cutoff 이후로 넘어가면 학습 샘플에서 제외한다. 이 계약이면 미래 평가 target이 학습 feature나 target에 들어가지 않으므로 기본 `gap_days=0`을 사용한다. 논문 초안의 purge/embargo 8일은 희소 표본을 불필요하게 버릴 수 있어 `gap_days=8` 재현 민감도로만 제공한다. 보고서는 실행 config의 실제 gap과 표본 감소량을 자동 기재하며, 원고의 방법 설명과 불일치하면 실패한다.
+샘플의 전체 24시간 target이 한 partition 안에 있을 때만 해당 partition에 포함한다. 경계에서 평가 입력이 과거 학습 partition에 걸치는 것은 forecast origin에서 이미 관측된 정보이므로 허용하지만, 학습 target이 cutoff 이후로 넘어가면 학습 샘플에서 제외한다. 이 계약이면 미래 평가 target이 학습 feature나 target에 들어가지 않으므로 purge/embargo를 적용하지 않고 `gap_days=0`으로 고정한다.
 
 ### 5.3 특징 집합
 
@@ -244,7 +241,7 @@ predict(fitted, forecast_batch) -> PredictionFrame
 
 Tree/SVR은 horizon별 estimator 24개를 사용한다. Seq2Seq-LSTM과 Transformer는 24시간을 공동 출력한다. 신경망은 다섯 seed의 예측 평균을 한 baseline residual stream으로 사용하고 seed별 성능과 분산을 별도로 보존한다.
 
-하이퍼파라미터는 2019--2022/2023에서 한 번 선택하고 고정한다. rolling fold마다 다시 탐색하지 않는다. 각 rolling fold에서는 고정된 설정으로 해당 fold train만 다시 학습한다.
+하이퍼파라미터는 2019--2022/2023에서 한 번 선택하고 고정한다. 기존 baseline 연구에서 확정된 versioned 설정을 사용하면 탐색을 생략한다. OOF fold마다 다시 탐색하지 않으며, 고정된 설정으로 해당 fold train만 다시 학습한다. final baseline은 동일 설정으로 2019--2023 전체를 다시 학습해 2024를 예측한다.
 
 fold `k`의 비휴일 OOF 척도는 다음과 같다.
 
@@ -447,11 +444,11 @@ manifest는 git commit, dirty 여부, config hash, data file hash, event registr
 사용자에게 노출되는 실행 순서는 다음과 같다.
 
 1. `hqrc audit-data`: 스키마, 시간축, 이벤트 레지스트리 검사
-2. `hqrc tune-baselines`: 2019--2022/2023에서 설정 선택
-3. `hqrc generate-oof --window expanding`: 2020--2024 OOF 생성
-4. `hqrc compare-windows`: 2021--2023 expanding/sliding 비교
-5. `hqrc diagnose-ar --through 2023`: ACF/PACF와 prior 제안 생성
-6. `hqrc approve-ar-calibration <artifact>`: 진단 hash 동결
+2. `hqrc tune-baselines`: 필요할 때만 2019--2022/2023에서 설정을 한 번 선택
+3. `hqrc generate-oof --through 2023`: expanding OOF residual 생성 및 캐시
+4. `hqrc diagnose-ar --through 2023`: ACF/PACF와 prior 제안 생성
+5. `hqrc approve-ar-calibration <artifact>`: 진단 hash 동결
+6. `hqrc fit-final-baselines`: 2019--2023 재학습 및 2024 baseline 예측
 7. `hqrc fit-corrections --evaluation causal-2024`: 2024 주 분석
 8. `hqrc fit-corrections --evaluation loeo`: 10-event 구조 분석
 9. `hqrc run-ablations`: H0--H5와 pooling/sensitivity
@@ -465,7 +462,7 @@ manifest는 git commit, dirty 여부, config hash, data file hash, event registr
 구현은 test-driven development로 진행한다. 최소 테스트는 다음을 포함한다.
 
 - split cutoff 이후 target이 train에 들어가지 않음
-- expanding/sliding의 연도 계약이 정확함
+- expanding OOF와 final refit의 연도 계약이 정확함
 - B0에 holiday-derived feature가 없음
 - B1 signed distance와 sequence position의 경계값
 - event window의 날짜와 24시간 완전성
@@ -492,7 +489,7 @@ manifest는 git commit, dirty 여부, config hash, data file hash, event registr
 - AR calibration artifact가 현재 residual hash와 다름
 - posterior에서 divergence, R-hat, ESS 기준을 통과하지 못했는데 완료로 표시하려는 경우
 - 결과 행 수가 예측 대상 timestamp 수와 다름
-- 2024 결과가 hyperparameter/window 선택 입력으로 들어간 경우
+- 2024 결과가 hyperparameter 또는 모델 구조 선택 입력으로 들어간 경우
 
 기본 posterior 합격 기준은 4 chains, chain당 1,000 warmup과 1,000 retained draw, R-hat <= 1.01, bulk/tail ESS >= 400, divergence 0이다. 빠른 smoke profile은 더 작은 draw를 사용하지만 논문 결과로 표시할 수 없다.
 
@@ -502,7 +499,7 @@ manifest는 git commit, dirty 여부, config hash, data file hash, event registr
 
 1. 새 `hqrc_v3/` 밖의 기존 연구 코드와 artifact를 변경하지 않는다.
 2. unit/integration test가 통과하고 slow test는 명시적 명령으로 실행 가능하다.
-3. 정적 holdout, expanding OOF, sliding sensitivity가 서로 다른 schema가 아니라 동일 prediction contract를 사용한다.
+3. expanding OOF와 final 2024 forecast가 동일 prediction contract를 사용한다.
 4. AR prior 수치가 진단 artifact에서 유래하고 held-out/future event를 사용하지 않는다.
 5. H3 모델이 quadratic, circular hour effect, partial pooling, pandemic covariate, stationary-reset AR(1)을 모두 포함한다.
 6. corrected predictive draw가 baseline uncertainty를 이중 계상하지 않는다.
@@ -516,7 +513,7 @@ manifest는 git commit, dirty 여부, config hash, data file hash, event registr
 1. 프로젝트 골격, config, provenance, 데이터 계약
 2. event/feature/split 엔진과 누수 테스트
 3. baseline protocol 및 정적/OOF 생성
-4. expanding/sliding 비교 보고서
+4. expanding OOF 생성과 immutable prediction cache
 5. AR 진단, prior calibration, 승인 artifact
 6. HQRC H3 core와 predictive distribution
 7. H0--H5, pooling, sensitivity
