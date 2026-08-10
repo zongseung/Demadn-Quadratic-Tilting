@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import multiprocessing
 import os
 from contextlib import contextmanager
@@ -95,12 +96,40 @@ def _concurrent_write(
         result_queue.put(("written", hashes["config"]))
 
 
-def _force_publication_race(tmp_path, cache_type, *, second_must_observe_absence: bool):
+def _probe_key_lock(lock_path: str, result_queue) -> None:
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            result_queue.put("blocked")
+        else:
+            result_queue.put("acquired")
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _join_or_terminate(process) -> None:
+    process.join(timeout=10)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=2)
+
+
+def _force_publication_race(
+    tmp_path,
+    cache_type,
+    *,
+    expected_probe_state: str,
+    second_must_observe_absence: bool,
+):
     context = multiprocessing.get_context("spawn")
     first_absent = context.Event()
     second_absent = context.Event()
     release_first = context.Event()
     result_queue = context.Queue()
+    probe_queue = context.Queue()
     first_hashes = {"config": "a", "data": "d"}
     second_hashes = {"config": "b", "data": "d"}
     first = context.Process(
@@ -129,16 +158,26 @@ def _force_publication_race(tmp_path, cache_type, *, second_must_observe_absence
             result_queue,
         ),
     )
-    first.start()
-    assert first_absent.wait(timeout=5)
-    second.start()
-    if second_must_observe_absence:
-        assert second_absent.wait(timeout=5)
-    else:
-        assert not second_absent.wait(timeout=0.2)
-    release_first.set()
-    for process in (first, second):
-        process.join(timeout=10)
+    probe = context.Process(
+        target=_probe_key_lock, args=(str(tmp_path / ".concurrent.lock"), probe_queue)
+    )
+    started = []
+    try:
+        first.start()
+        started.append(first)
+        assert first_absent.wait(timeout=5)
+        probe.start()
+        started.append(probe)
+        assert probe_queue.get(timeout=5) == expected_probe_state
+        second.start()
+        started.append(second)
+        if second_must_observe_absence:
+            assert second_absent.wait(timeout=5)
+    finally:
+        release_first.set()
+        for process in started:
+            _join_or_terminate(process)
+    for process in started:
         assert process.exitcode == 0
     outcomes = {result_queue.get(timeout=2), result_queue.get(timeout=2)}
     return outcomes, first_hashes, second_hashes
@@ -200,7 +239,10 @@ def test_cache_uses_prediction_validation_for_writes(tmp_path):
 
 def test_concurrent_writes_with_different_hashes_leave_one_immutable_winner(tmp_path):
     outcomes, first_hashes, second_hashes = _force_publication_race(
-        tmp_path, _GatedPredictionCache, second_must_observe_absence=False
+        tmp_path,
+        _GatedPredictionCache,
+        expected_probe_state="blocked",
+        second_must_observe_absence=False,
     )
 
     assert {status for status, _ in outcomes} == {"written", "mismatch"}
@@ -211,7 +253,10 @@ def test_concurrent_writes_with_different_hashes_leave_one_immutable_winner(tmp_
 
 def test_controlled_gate_exposes_the_former_check_then_act_race(tmp_path):
     outcomes, _, _ = _force_publication_race(
-        tmp_path, _UnserializedGatedPredictionCache, second_must_observe_absence=True
+        tmp_path,
+        _UnserializedGatedPredictionCache,
+        expected_probe_state="acquired",
+        second_must_observe_absence=True,
     )
 
     assert outcomes == {("written", "a"), ("written", "b")}
