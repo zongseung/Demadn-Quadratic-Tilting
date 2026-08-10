@@ -1,6 +1,7 @@
 """Fixed-configuration forecasting baselines."""
 
 from hqrc_v3.baselines.classical import (
+    CandidateScore,
     FixedBaselineSelection,
     HorizonRegressor,
     make_classical_baseline,
@@ -11,6 +12,7 @@ from hqrc_v3.baselines.protocol import BaselineFactory, FittedBaseline
 
 __all__ = [
     "BaselineFactory",
+    "CandidateScore",
     "FittedBaseline",
     "FixedBaselineSelection",
     "HorizonRegressor",
