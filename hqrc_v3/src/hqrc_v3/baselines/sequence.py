@@ -23,7 +23,7 @@ from hqrc_v3.contracts import (
     validate_forecast_feature_columns,
 )
 
-_MODEL_NAMES = ("lstm", "transformer")
+_MODEL_NAMES = ("lstm", "seq2seq_lstm", "transformer")
 _HISTORY_HOURS = 168
 _HORIZONS = 24
 
@@ -214,6 +214,11 @@ class TorchBaselineFactory:
             _require_matching_schema(train, validation)
         return _fit_one(self.name, train, validation, self.config, normalized_seed)
 
+    def build_model(self, *, history_features: int, future_features: int) -> nn.Module:
+        """Expose the configured joint-24 architecture for contract inspection."""
+
+        return _build_model(self.name, history_features, future_features, self.config)
+
 
 @dataclass(frozen=True)
 class SeedEnsembleBaseline:
@@ -324,7 +329,7 @@ def _build_model(
         "layers": config.layers,
         "dropout": config.dropout,
     }
-    if name == "lstm":
+    if name in {"lstm", "seq2seq_lstm"}:
         return Seq2SeqLSTM(**common)
     return TimeSeriesTransformer(**common, heads=config.heads)
 

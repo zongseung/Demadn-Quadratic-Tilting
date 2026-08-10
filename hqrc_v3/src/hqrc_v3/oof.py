@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from numbers import Integral
 from typing import Literal
 
+import numpy as np
 import polars as pl
 
 from hqrc_v3.baselines.classical import predictions_to_frame
@@ -26,6 +27,48 @@ from hqrc_v3.splits import AnnualFold, expanding_oof_folds, final_fold, select_f
 
 FeatureSet = Literal["B0", "B1"]
 _FEATURE_SETS = frozenset(("B0", "B1"))
+
+
+def chronological_validation_tail(
+    outer_train: ForecastMatrix,
+    *,
+    days: int,
+) -> tuple[ForecastMatrix, ForecastMatrix]:
+    """Split the final consecutive complete days from an outer training range.
+
+    The caller first applies an immutable annual fold, so this function cannot
+    admit evaluation-year rows.  It only partitions that already selected
+    training matrix for fixed-configuration early stopping.
+    """
+
+    if not isinstance(outer_train, ForecastMatrix):
+        raise TypeError("outer_train must be a ForecastMatrix")
+    if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
+        raise ValueError("validation days must be a positive integer")
+    count = outer_train.origins.shape[0]
+    if count <= days:
+        raise ValueError(f"training matrix must contain more than {days} complete days")
+    if outer_train.target_times.shape != (count, 24):
+        raise ValueError("training samples must contain 24 complete target hours")
+    origins = np.asarray(outer_train.origins)
+    targets = np.asarray(outer_train.target_times)
+    if (
+        not np.issubdtype(origins.dtype, np.datetime64)
+        or not np.issubdtype(targets.dtype, np.datetime64)
+        or np.isnat(origins).any()
+        or np.isnat(targets).any()
+    ):
+        raise ValueError("training sample timestamps must be complete datetimes")
+    expected_targets = origins[:, None] + np.arange(24).astype("timedelta64[h]")
+    if not np.array_equal(targets.astype("datetime64[ns]"), expected_targets):
+        raise ValueError("training samples must contain complete midnight-origin days")
+    if not np.all(np.diff(origins.astype("datetime64[D]")) == np.timedelta64(1, "D")):
+        raise ValueError("training samples must be consecutive daily samples")
+    boundary = count - days
+    return (
+        outer_train.take(np.arange(boundary, dtype=np.int64)),
+        outer_train.take(np.arange(boundary, count, dtype=np.int64)),
+    )
 
 
 def _require_feature_set(feature_set: object) -> FeatureSet:

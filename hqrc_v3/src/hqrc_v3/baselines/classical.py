@@ -6,6 +6,7 @@ import json
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 import numpy as np
@@ -177,17 +178,48 @@ class ClassicalBaseline:
     """Factory for a fixed-parameter, independent-horizon classical baseline."""
 
     name: str
-    params: dict[str, Any]
+    params: Mapping[str, Any]
+    early_stopping_rounds: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.name not in _MODEL_NAMES:
+            raise ValueError(f"unknown classical baseline {self.name!r}")
+        params = _validate_params(self.name, self.params)
+        object.__setattr__(self, "params", MappingProxyType(params))
+        if self.early_stopping_rounds is not None:
+            if (
+                isinstance(self.early_stopping_rounds, bool)
+                or not isinstance(self.early_stopping_rounds, int)
+                or self.early_stopping_rounds <= 0
+            ):
+                raise ValueError("early_stopping_rounds must be a positive integer")
+            if self.name != "lightgbm":
+                raise ValueError("adapter-managed early stopping is only supported for lightgbm")
 
     def fit(
         self, train: ForecastMatrix, validation: ForecastMatrix | None, seed: int
     ) -> HorizonRegressor:
-        del validation  # These fixed adapters never inspect an evaluation partition while fitting.
         normalized_seed = _require_integer_seed(seed)
         target = _validate_finite(train.target, description="training target")
         estimator_class = _estimator_class(self.name)
         estimators: list[Any] = []
         flattened_history = _flatten_history(train)
+        validation_history: np.ndarray | None = None
+        validation_target: np.ndarray | None = None
+        if validation is not None and self.name in {"xgboost", "lightgbm"}:
+            validation_history = _flatten_history(validation)
+            validation_target = _validate_finite(
+                validation.target, description="validation target"
+            )
+            if (
+                validation.history.shape[1:] != train.history.shape[1:]
+                or validation.future.shape[2] != train.future.shape[2]
+                or validation.history_columns != train.history_columns
+                or validation.future_columns != train.future_columns
+            ):
+                raise DataContractError(
+                    "validation matrix feature columns/order must match the training matrix"
+                )
         for horizon in range(24):
             features = _validate_finite(
                 _features_for_horizon(flattened_history, train, horizon),
@@ -206,7 +238,27 @@ class ClassicalBaseline:
             if self.name == "lightgbm":
                 estimator_params["verbosity"] = -1
             estimator = estimator_class(**estimator_params)
-            estimator.fit(_estimator_input(self.name, features), target[:, horizon])
+            fit_kwargs: dict[str, Any] = {}
+            if validation_history is not None and validation_target is not None:
+                validation_features = _validate_finite(
+                    _features_for_horizon(validation_history, validation, horizon),
+                    description="validation features",
+                )
+                fit_kwargs["eval_set"] = [
+                    (
+                        _estimator_input(self.name, validation_features),
+                        validation_target[:, horizon],
+                    )
+                ]
+                if self.name == "xgboost":
+                    fit_kwargs["verbose"] = False
+                elif self.name == "lightgbm" and self.early_stopping_rounds is not None:
+                    fit_kwargs["callbacks"] = [
+                        _lightgbm_early_stopping(self.early_stopping_rounds)
+                    ]
+            estimator.fit(
+                _estimator_input(self.name, features), target[:, horizon], **fit_kwargs
+            )
             estimators.append(estimator)
         return HorizonRegressor(
             model_name=self.name,
@@ -218,13 +270,32 @@ class ClassicalBaseline:
         )
 
 
-def make_classical_baseline(name: str, params: Mapping[str, Any]) -> ClassicalBaseline:
+def make_classical_baseline(
+    name: str,
+    params: Mapping[str, Any],
+    *,
+    early_stopping_rounds: int | None = None,
+) -> ClassicalBaseline:
     """Create a fixed-config adapter without any search or tuning behaviour."""
 
     if not isinstance(name, str):
         raise TypeError("classical baseline name must be a string")
     normalized_name = name.lower()
-    return ClassicalBaseline(name=normalized_name, params=_validate_params(normalized_name, params))
+    return ClassicalBaseline(
+        name=normalized_name,
+        params=_validate_params(normalized_name, params),
+        early_stopping_rounds=early_stopping_rounds,
+    )
+
+
+def _lightgbm_early_stopping(rounds: int) -> Any:
+    """Build LightGBM's callback lazily so SVR/XGBoost do not import LightGBM."""
+
+    try:
+        from lightgbm import early_stopping
+    except ImportError as error:  # pragma: no cover - depends on installation
+        raise ImportError("lightgbm baseline requires `lightgbm` to be installed") from error
+    return early_stopping(rounds, verbose=False)
 
 
 @dataclass(frozen=True)
