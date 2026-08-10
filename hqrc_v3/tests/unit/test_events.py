@@ -14,7 +14,12 @@ def test_registry_has_exactly_five_occurrences_per_type():
         "seollal": 5,
         "chuseok": 5,
     }
-    assert next(event for event in events if event.occurrence_id == "seollal-2022").restriction == 1
+    assert {event.occurrence_id for event in events if event.restriction == 1} == {
+        "chuseok-2020",
+        "seollal-2021",
+        "chuseok-2021",
+        "seollal-2022",
+    }
 
 
 def test_feature_calendar_includes_2019_but_correction_registry_does_not():
@@ -25,3 +30,9 @@ def test_feature_calendar_includes_2019_but_correction_registry_does_not():
     assert min(event.central_date.year for event in calendar) == 2019
     assert len(events) == 10
     assert len(calendar) == 12
+    assert {event.occurrence_id for event in calendar if event.restriction == 1} == {
+        "chuseok-2020",
+        "seollal-2021",
+        "chuseok-2021",
+        "seollal-2022",
+    }
