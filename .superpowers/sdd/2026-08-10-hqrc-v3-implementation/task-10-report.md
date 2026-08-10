@@ -61,6 +61,46 @@ Remaining Task 10 work is the measured Arrow/Polars and serial/parallel data
 microbenchmark tranche plus production CLI wiring; those are intentionally not part of
 this commit.
 
+## Polars data-benchmark tranche
+
+- Added a canonical, digest-bound request for an existing numeric Parquet artifact.
+  The contract binds the current file SHA-256, unique selected columns, at least three
+  repetitions, at least two parallel workers, the seed, and the fixed workload
+  identity. Parent and child independently revalidate the request and current bytes.
+- Added a minimal fresh-process worker. The parent sets `POLARS_MAX_THREADS` before
+  launch; the worker imports Polars only after checking that environment, records
+  `pl.thread_pool_size()`, and the parent verifies the exact spawned PID, timeout,
+  exit status, canonical result, request/result digests, dimensions, timings, RSS,
+  versions, and checksums.
+- The worker reads and rechunks finite, null-free `Float64` Series and measures
+  `to_numpy(allow_copy=False)` separately from explicit `np.array(..., copy=True)`.
+  It requires every zero-copy view to be non-owning and read-only, every explicit copy
+  to be owning and writeable, records deterministic allocated bytes, and rejects any
+  path where Polars would need to copy or the byte checksums differ.
+- Serial (`POLARS_MAX_THREADS=1`) and parallel (`N`) workers execute the identical
+  deterministic lazy Polars numeric-summary workload. The published artifact records
+  full wall-time distributions and medians, peak RSS, actual thread counts, dimensions,
+  checksums, speed ratios, and Python/NumPy/Polars versions; no speedup threshold is
+  imposed.
+- The final canonical benchmark revalidates the supplied sampler benchmark's file
+  SHA-256, schema, canonical bytes, embedded digest, and measured PyMC wall time. It
+  derives explicit-copy and total data-processing shares solely from measured medians.
+  The predeclared custom-Rust candidate gate requires both data-processing share
+  `>= 20%` and explicit-copy share `>= 50%`. It states that Polars is already Rust and
+  that no custom Rust implementation was made, regardless of candidacy.
+- RED: the focused test initially failed collection with
+  `ModuleNotFoundError: hqrc_v3.evaluation.data_benchmark`.
+- GREEN: the focused integration suite passed (`16 passed`); the complete non-slow
+  suite passed (`252 passed, 4 deselected`); the dedicated audited 51,144-row real-source
+  serial/parallel smoke passed (`1 passed`); and repository-wide Ruff plus
+  `git diff --check` were clean. Tests cover invalid arguments/hash/schema, noncanonical
+  and tampered artifacts, forced-copy/null rejection, checksum mismatch, wrong PID,
+  timeout, nonzero exit, malformed JSON, and recomputed-but-false derived shares.
+
+Remaining Task 10 work is production CLI wiring and the separate correction/ablation/
+fit-handler and manuscript execution paths. Those boundaries remain intentionally
+unwired in this tranche.
+
 ## Delivered
 
 - Added fail-closed report validation with manifest hash checks, approved-AR and

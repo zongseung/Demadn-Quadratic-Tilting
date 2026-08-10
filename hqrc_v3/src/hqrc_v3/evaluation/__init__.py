@@ -1,5 +1,14 @@
 """Event-level metrics and inference utilities."""
 
+from hqrc_v3.evaluation.data_benchmark import (
+    DataBenchmarkError,
+    benchmark_polars_data,
+    load_data_benchmark,
+    load_data_benchmark_request,
+    load_data_benchmark_worker_result,
+    run_data_benchmark_worker,
+    write_data_benchmark_request,
+)
 from hqrc_v3.evaluation.inference import (
     EventBootstrapResult,
     HACDMResult,
@@ -27,6 +36,7 @@ from hqrc_v3.evaluation.reports import (
 )
 
 __all__ = [
+    "DataBenchmarkError",
     "EventBootstrapResult",
     "HACDMResult",
     "InferenceContractError",
@@ -35,15 +45,21 @@ __all__ = [
     "SamplerBenchmark",
     "WilcoxonEventResult",
     "bootstrap_event_median",
+    "benchmark_polars_data",
     "build_report",
     "empirical_crps",
     "event_metric_frame",
     "hac_dm_test",
     "holm_adjust",
+    "load_data_benchmark",
+    "load_data_benchmark_request",
+    "load_data_benchmark_worker_result",
     "point_metric_frame",
     "probabilistic_metric_frame",
     "run_synthetic_pipeline",
+    "run_data_benchmark_worker",
     "sampler_eligible_default",
     "wilcoxon_event_test",
     "write_benchmark",
+    "write_data_benchmark_request",
 ]
