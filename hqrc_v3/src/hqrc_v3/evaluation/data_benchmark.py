@@ -176,7 +176,7 @@ def load_data_benchmark_request(path: Path) -> dict[str, Any]:
     if not isinstance(digest, str) or digest != _digest(payload):
         raise DataBenchmarkError("data benchmark request digest differs")
     payload["request_digest"] = digest
-    if payload["schema_version"] != _VERSION:
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != _VERSION:
         raise DataBenchmarkError("data benchmark request version differs")
     entry = payload["input"]
     if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
@@ -277,7 +277,7 @@ def load_data_benchmark_worker_result(
     if not isinstance(result_digest, str) or result_digest != _digest(payload):
         raise DataBenchmarkError("data benchmark worker result digest differs")
     payload["result_digest"] = result_digest
-    if payload["schema_version"] != _VERSION:
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != _VERSION:
         raise DataBenchmarkError("data benchmark worker result version differs")
     if payload["request_digest"] != request["request_digest"]:
         raise DataBenchmarkError("data benchmark worker request digest differs")
@@ -618,7 +618,7 @@ def load_data_benchmark(path: Path) -> dict[str, Any]:
     if not isinstance(digest, str) or digest != _digest(payload):
         raise DataBenchmarkError("data benchmark digest differs")
     payload["benchmark_digest"] = digest
-    if payload["schema_version"] != _VERSION:
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != _VERSION:
         raise DataBenchmarkError("data benchmark version differs")
     request = payload["request"]
     if not isinstance(request, dict) or set(request) != {

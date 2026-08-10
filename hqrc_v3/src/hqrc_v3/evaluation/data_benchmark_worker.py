@@ -65,7 +65,7 @@ def _load_request(path: Path) -> dict[str, Any]:
     if not isinstance(request_digest, str) or request_digest != _digest(payload):
         raise DataBenchmarkError("data benchmark request digest differs")
     payload["request_digest"] = request_digest
-    if payload["schema_version"] != 1:
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
         raise DataBenchmarkError("data benchmark request version differs")
     entry = payload["input"]
     if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:

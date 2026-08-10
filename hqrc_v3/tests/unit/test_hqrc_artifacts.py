@@ -1,6 +1,7 @@
 import hashlib
 import json
 import threading
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -142,6 +143,7 @@ def test_returned_generation_tuple_stays_valid_after_current_pointer_advances(tm
 @pytest.mark.parametrize(
     ("boundary", "expected_generation"),
     [
+        ("generation-namespace-opened", "a"),
         ("before-generation-npz-publish", "a"),
         ("generation-npz-published", "a"),
         ("generation-metadata-published", "a"),
@@ -217,6 +219,106 @@ def test_logical_generation_lookup_fails_closed_when_current_pointer_is_missing(
 
     with pytest.raises(HQRCArtifactError, match="pointer is missing"):
         load_hqrc_data(destination)
+
+
+def test_writer_rejects_post_open_namespace_swap_without_external_writes(
+    tmp_path, monkeypatch
+):
+    destination = tmp_path / "hqrc.npz"
+    first_npz, first_metadata = write_hqrc_data(
+        destination, _data(), settings={"generation": "a"}
+    )
+    pointer_path = _current_pointer(destination)
+    pointer_before = pointer_path.read_bytes()
+    namespace = destination.with_name(".hqrc.generations")
+    detached = destination.with_name(".hqrc.generations.detached")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sentinel.txt").write_bytes(b"outside")
+    outside_before = {
+        path.name: path.read_bytes() for path in outside.iterdir() if path.is_file()
+    }
+    generation_before = {
+        path.name: path.read_bytes() for path in namespace.iterdir() if path.is_file()
+    }
+    parent_before = sorted(path.name for path in tmp_path.iterdir())
+    swapped = False
+    errors: list[BaseException] = []
+
+    def swap_namespace_after_open(name):
+        nonlocal swapped
+        if name == "generation-namespace-opened":
+            namespace.rename(detached)
+            namespace.symlink_to(outside, target_is_directory=True)
+            swapped = True
+
+    monkeypatch.setattr(
+        artifacts_module, "_publication_boundary", swap_namespace_after_open
+    )
+
+    def write_after_swap():
+        try:
+            write_hqrc_data(
+                destination, _second_data(), settings={"generation": "b"}
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    writer = threading.Thread(target=write_after_swap, name="namespace-swap-writer", daemon=True)
+    try:
+        writer.start()
+        writer.join(5)
+        assert not writer.is_alive(), "namespace-swap writer did not terminate"
+        assert len(errors) == 1
+        assert isinstance(errors[0], HQRCArtifactError)
+        assert "generation namespace" in str(errors[0])
+        assert swapped
+        assert pointer_path.read_bytes() == pointer_before
+        assert {
+            path.name: path.read_bytes() for path in outside.iterdir() if path.is_file()
+        } == outside_before
+        assert {
+            path.name: path.read_bytes() for path in detached.iterdir() if path.is_file()
+        } == generation_before
+    finally:
+        if namespace.is_symlink():
+            namespace.unlink()
+        if detached.is_dir():
+            detached.rename(namespace)
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == parent_before
+    current, settings = load_hqrc_data(destination)
+    stale, stale_settings = load_hqrc_data(first_npz, first_metadata)
+    assert settings == stale_settings == {"generation": "a"}
+    assert current.occurrence_ids == stale.occurrence_ids == ("a", "b")
+
+
+def test_generation_namespace_descriptor_closes_on_injected_failure(tmp_path, monkeypatch):
+    destination = tmp_path / "hqrc.npz"
+    write_hqrc_data(destination, _data(), settings={"generation": "a"})
+    namespace = destination.with_name(".hqrc.generations")
+    real_open = artifacts_module.os.open
+    directory_descriptors: list[int] = []
+
+    def tracked_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if Path(path) == namespace and flags & getattr(artifacts_module.os, "O_DIRECTORY", 0):
+            directory_descriptors.append(descriptor)
+        return descriptor
+
+    def fail_after_open(name):
+        if name == "generation-namespace-opened":
+            raise RuntimeError("injected failure after namespace open")
+
+    monkeypatch.setattr(artifacts_module.os, "open", tracked_open)
+    monkeypatch.setattr(artifacts_module, "_publication_boundary", fail_after_open)
+    with pytest.raises(RuntimeError, match="injected failure after namespace open"):
+        write_hqrc_data(destination, _second_data(), settings={"generation": "b"})
+
+    assert directory_descriptors
+    for descriptor in directory_descriptors:
+        with pytest.raises(OSError):
+            artifacts_module.os.fstat(descriptor)
 
 
 def test_concurrent_pointer_reader_sees_complete_generation_and_writer_terminates(

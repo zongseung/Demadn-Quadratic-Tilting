@@ -133,22 +133,9 @@ def _generation_directory(destination: Path) -> Path:
     return destination.with_name(f".{destination.stem}.generations")
 
 
-def _prepare_generation_namespace(destination: Path) -> Path:
-    parent = destination.parent
-    namespace = _generation_directory(destination)
+def _generation_namespace_identity(namespace: Path, parent: Path) -> os.stat_result:
     try:
         initial = namespace.lstat()
-    except FileNotFoundError:
-        try:
-            os.mkdir(namespace, mode=0o700)
-        except FileExistsError:
-            pass
-        except OSError as error:
-            raise HQRCArtifactError("HQRC generation namespace cannot be created") from error
-        try:
-            initial = namespace.lstat()
-        except OSError as error:
-            raise HQRCArtifactError("HQRC generation namespace is unavailable") from error
     except OSError as error:
         raise HQRCArtifactError("HQRC generation namespace is unavailable") from error
     if stat.S_ISLNK(initial.st_mode) or not stat.S_ISDIR(initial.st_mode):
@@ -166,7 +153,148 @@ def _prepare_generation_namespace(destination: Path) -> Path:
         or (confirmed.st_dev, confirmed.st_ino) != (initial.st_dev, initial.st_ino)
     ):
         raise HQRCArtifactError("HQRC generation namespace escapes its parent")
-    return namespace
+    return confirmed
+
+
+def _open_generation_namespace(destination: Path) -> tuple[Path, int, tuple[int, int]]:
+    parent = destination.parent
+    namespace = _generation_directory(destination)
+    try:
+        namespace.lstat()
+    except FileNotFoundError:
+        try:
+            os.mkdir(namespace, mode=0o700)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise HQRCArtifactError("HQRC generation namespace cannot be created") from error
+    except OSError as error:
+        raise HQRCArtifactError("HQRC generation namespace is unavailable") from error
+    path_identity = _generation_namespace_identity(namespace, parent)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(namespace, flags)
+        held = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(held.st_mode)
+            or (held.st_dev, held.st_ino) != (path_identity.st_dev, path_identity.st_ino)
+        ):
+            raise HQRCArtifactError("HQRC generation namespace changed while opening")
+        identity = (held.st_dev, held.st_ino)
+        _revalidate_generation_namespace(namespace, parent, descriptor, identity)
+        return namespace, descriptor, identity
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise HQRCArtifactError("HQRC generation namespace cannot be opened safely") from error
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+
+
+def _revalidate_generation_namespace(
+    namespace: Path,
+    parent: Path,
+    descriptor: int,
+    identity: tuple[int, int],
+) -> None:
+    path_identity = _generation_namespace_identity(namespace, parent)
+    try:
+        held = os.fstat(descriptor)
+    except OSError as error:
+        raise HQRCArtifactError("HQRC generation namespace descriptor is unavailable") from error
+    if (
+        not stat.S_ISDIR(held.st_mode)
+        or (held.st_dev, held.st_ino) != identity
+        or (path_identity.st_dev, path_identity.st_ino) != identity
+    ):
+        raise HQRCArtifactError("HQRC generation namespace identity changed")
+
+
+def _relative_open_flags(base: int) -> int:
+    return base | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _create_relative_file(directory_fd: int, name: str) -> int:
+    try:
+        return os.open(
+            name,
+            _relative_open_flags(os.O_RDWR | os.O_CREAT | os.O_EXCL),
+            0o600,
+            dir_fd=directory_fd,
+        )
+    except OSError as error:
+        raise HQRCArtifactError("HQRC generation temporary file cannot be created") from error
+
+
+def _write_relative_json(directory_fd: int, name: str, value: dict[str, Any]) -> None:
+    descriptor = _create_relative_file(directory_fd, name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            descriptor = -1
+            output.write(_canonical(value) + b"\n")
+            output.flush()
+            os.fsync(output.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _relative_sha256(directory_fd: int, name: str) -> str:
+    try:
+        descriptor = os.open(
+            name,
+            _relative_open_flags(os.O_RDONLY),
+            dir_fd=directory_fd,
+        )
+    except OSError as error:
+        raise HQRCArtifactError("HQRC generation file cannot be opened safely") from error
+    try:
+        digest = sha256()
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _replace_relative(directory_fd: int, source: str, destination: str) -> None:
+    try:
+        os.replace(
+            source,
+            destination,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+    except OSError as error:
+        raise HQRCArtifactError("HQRC generation file cannot be published") from error
+
+
+def _cleanup_relative(directory_fd: int, names: set[str]) -> None:
+    cleanup_error: OSError | None = None
+    for name in sorted(names):
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            cleanup_error = cleanup_error or error
+    try:
+        os.fsync(directory_fd)
+    except OSError as error:
+        cleanup_error = cleanup_error or error
+    if cleanup_error is not None:
+        raise HQRCArtifactError("HQRC generation cleanup failed") from cleanup_error
 
 
 def _pointer_path(destination: Path) -> Path:
@@ -188,50 +316,72 @@ def write_hqrc_data(
     if destination.suffix != ".npz":
         raise HQRCArtifactError("HQRC data artifact must use .npz")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    generation_directory = _prepare_generation_namespace(destination)
-    generation = uuid.uuid4().hex
-    generation_npz = generation_directory / f"{generation}.npz"
-    generation_metadata = generation_directory / f"{generation}.json"
-    arrays = {
-        "observations": np.asarray(data.observations, dtype=np.float64),
-        "occurrence_index": np.asarray(data.occurrence_index, dtype=np.int64),
-        "holiday_type_index": np.asarray(data.holiday_type_index, dtype=np.int64),
-        "tau_days": np.asarray(data.tau_days, dtype=np.float64),
-        "hour": np.asarray(data.hour, dtype=np.int64),
-        "restriction": np.asarray(data.restriction, dtype=np.int64),
-    }
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{generation}.", suffix=".npz", dir=generation_directory
-    )
-    os.close(descriptor)
-    temporary_npz: Path | None = Path(temporary_name)
-    temporary_metadata: Path | None = None
+    generation_directory: Path
+    directory_fd: int | None = None
+    identity: tuple[int, int]
+    temporary_names: set[str] = set()
+    generation_names: set[str] = set()
     temporary_pointer: Path | None = None
+    pointer_published = False
     try:
-        np.savez_compressed(temporary_npz, **arrays)
-        with temporary_npz.open("r+b") as artifact:
-            artifact.flush()
-            os.fsync(artifact.fileno())
+        generation_directory, directory_fd, identity = _open_generation_namespace(
+            destination
+        )
+        _publication_boundary("generation-namespace-opened")
+        generation = uuid.uuid4().hex
+        generation_npz_name = f"{generation}.npz"
+        generation_metadata_name = f"{generation}.json"
+        generation_npz = generation_directory / generation_npz_name
+        generation_metadata = generation_directory / generation_metadata_name
+        temporary_npz_name = f".{generation}.{uuid.uuid4().hex}.npz.tmp"
+        temporary_metadata_name = f".{generation}.{uuid.uuid4().hex}.json.tmp"
+        temporary_names.add(temporary_npz_name)
+        arrays = {
+            "observations": np.asarray(data.observations, dtype=np.float64),
+            "occurrence_index": np.asarray(data.occurrence_index, dtype=np.int64),
+            "holiday_type_index": np.asarray(data.holiday_type_index, dtype=np.int64),
+            "tau_days": np.asarray(data.tau_days, dtype=np.float64),
+            "hour": np.asarray(data.hour, dtype=np.int64),
+            "restriction": np.asarray(data.restriction, dtype=np.int64),
+        }
+        descriptor = _create_relative_file(directory_fd, temporary_npz_name)
+        try:
+            with os.fdopen(descriptor, "w+b") as artifact:
+                descriptor = -1
+                np.savez_compressed(artifact, **arrays)
+                artifact.flush()
+                os.fsync(artifact.fileno())
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
         payload: dict[str, Any] = {
             "schema_version": _GENERATION_VERSION,
             "artifact_kind": _GENERATION_KIND,
             "generation": generation,
-            "npz_sha256": file_sha256(temporary_npz),
+            "npz_sha256": _relative_sha256(directory_fd, temporary_npz_name),
             "arrays": {name: name for name in sorted(_ARRAYS)},
             "occurrence_ids": list(data.occurrence_ids),
             "settings": _safe_json(settings),
         }
         payload["artifact_sha256"] = _digest(payload)
-        temporary_metadata = _write_json_temporary(generation_metadata, payload)
+        temporary_names.add(temporary_metadata_name)
+        _write_relative_json(directory_fd, temporary_metadata_name, payload)
 
         _publication_boundary("before-generation-npz-publish")
-        os.replace(temporary_npz, generation_npz)
-        temporary_npz = None
+        generation_names.add(generation_npz_name)
+        _replace_relative(directory_fd, temporary_npz_name, generation_npz_name)
+        temporary_names.discard(temporary_npz_name)
         _publication_boundary("generation-npz-published")
-        os.replace(temporary_metadata, generation_metadata)
-        temporary_metadata = None
+        generation_names.add(generation_metadata_name)
+        _replace_relative(
+            directory_fd, temporary_metadata_name, generation_metadata_name
+        )
+        temporary_names.discard(temporary_metadata_name)
         _publication_boundary("generation-metadata-published")
-        _fsync_directory(generation_directory)
+        try:
+            os.fsync(directory_fd)
+        except OSError as error:
+            raise HQRCArtifactError("HQRC generation namespace cannot be synchronized") from error
         _publication_boundary("generation-directory-synced")
 
         pointer_path = _pointer_path(destination)
@@ -241,21 +391,40 @@ def write_hqrc_data(
             "generation": generation,
             "npz": generation_npz.relative_to(destination.parent).as_posix(),
             "metadata": generation_metadata.relative_to(destination.parent).as_posix(),
-            "npz_sha256": file_sha256(generation_npz),
-            "metadata_sha256": file_sha256(generation_metadata),
+            "npz_sha256": _relative_sha256(directory_fd, generation_npz_name),
+            "metadata_sha256": _relative_sha256(
+                directory_fd, generation_metadata_name
+            ),
         }
         pointer["pointer_digest"] = _digest(pointer)
+        _revalidate_generation_namespace(
+            generation_directory, destination.parent, directory_fd, identity
+        )
         temporary_pointer = _write_json_temporary(pointer_path, pointer)
         _publication_boundary("before-pointer-swap")
+        _revalidate_generation_namespace(
+            generation_directory, destination.parent, directory_fd, identity
+        )
         os.replace(temporary_pointer, pointer_path)
         temporary_pointer = None
+        pointer_published = True
         _publication_boundary("pointer-swapped")
         _fsync_directory(destination.parent)
         _publication_boundary("parent-directory-synced")
     finally:
-        for temporary in (temporary_npz, temporary_metadata, temporary_pointer):
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        try:
+            if directory_fd is not None:
+                cleanup_names = set(temporary_names)
+                if not pointer_published:
+                    cleanup_names.update(generation_names)
+                try:
+                    if cleanup_names:
+                        _cleanup_relative(directory_fd, cleanup_names)
+                finally:
+                    os.close(directory_fd)
+        finally:
+            if temporary_pointer is not None:
+                temporary_pointer.unlink(missing_ok=True)
     return generation_npz, generation_metadata
 
 

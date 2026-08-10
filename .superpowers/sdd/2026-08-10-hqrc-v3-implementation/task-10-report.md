@@ -193,6 +193,38 @@ unwired in this tranche.
   non-slow suite passed (`279 passed, 4 deselected`), and the real sampler child-process
   smoke passed (`1 passed`). Repository-wide Ruff and `git diff --check` were clean.
 
+## Fix round 5: remaining exact versions and descriptor-relative publication
+
+- The parent request loader, worker child request loader, parent worker-result loader,
+  final Polars benchmark loader, and strict report-manifest boundary now require an
+  exact runtime `int` schema version. Direct canonical, re-digested regressions reject
+  both `true` and `1.0` at every distinct loader and report path (and the manifest test
+  also rejects `2.0`, which compares equal to its integer version).
+- Generation publication now opens the validated namespace once with directory and
+  no-follow flags, verifies its device/inode against the path, and retains that file
+  descriptor through publication. Random exclusive/no-follow temporary files are
+  created, written, fsynced, hashed, renamed, and cleaned with descriptor-relative
+  operations; the directory itself is fsynced through the same held descriptor.
+- Immediately before pointer staging and again before its atomic swap, the writer
+  confirms that the pathname still resolves inside the expected parent and names the
+  exact held device/inode. If the namespace is renamed or replaced, the current pointer
+  stays unchanged and unpublished files are removed from the held, possibly detached,
+  real directory rather than from an attacker-controlled replacement.
+- The deterministic race regression swaps the namespace for a symlink immediately
+  after descriptor acquisition and before temporary creation. A five-second bounded
+  writer join proves termination with `HQRCArtifactError`; byte/name snapshots prove no
+  outside writes or leaked generation files, and both logical and direct reads retain
+  the prior generation. A separate injected-boundary regression proves every observed
+  namespace descriptor is closed.
+- RED: the focused boundary run produced the intended three failures (`3 failed,
+  7 passed`): the writer completed instead of rejecting the requested post-open swap,
+  the new post-open crash boundary was not reached, and there was no held namespace
+  descriptor for the close-on-failure assertion.
+- GREEN: the focused artifact/data-benchmark/report suite passed (`61 passed`), the
+  full non-slow suite passed (`293 passed, 4 deselected`), and the real sampler
+  child-process smoke passed (`1 passed`). Repository-wide Ruff and
+  `git diff --check` were clean.
+
 Baseline/correction CLI wiring remains outside this fix round and was not changed.
 
 ## Delivered

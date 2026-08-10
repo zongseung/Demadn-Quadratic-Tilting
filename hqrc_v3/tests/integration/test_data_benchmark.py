@@ -15,6 +15,7 @@ from hqrc_v3.evaluation.data_benchmark import (
     benchmark_polars_data,
     load_data_benchmark,
     load_data_benchmark_request,
+    load_data_benchmark_worker_result,
     run_data_benchmark_worker,
     write_data_benchmark_request,
 )
@@ -224,6 +225,62 @@ def test_request_rejects_bound_hash_schema_canonical_and_input_tamper(tmp_path):
         load_data_benchmark_request(request)
 
 
+@pytest.mark.parametrize("invalid_version", [True, 1.0], ids=("boolean", "float"))
+def test_parent_request_loader_rejects_noninteger_version_after_redigest(
+    tmp_path, invalid_version
+):
+    request = _request(tmp_path)
+    payload = json.loads(request.read_bytes())
+    payload.pop("request_digest")
+    payload["schema_version"] = invalid_version
+    payload["request_digest"] = _digest(payload)
+    request.write_text(_canonical(payload) + "\n")
+
+    with pytest.raises(DataBenchmarkError, match="request version"):
+        load_data_benchmark_request(request)
+
+
+@pytest.mark.parametrize("invalid_version", [True, 1.0], ids=("boolean", "float"))
+def test_worker_request_loader_rejects_noninteger_version_after_redigest(
+    tmp_path, invalid_version
+):
+    request = _request(tmp_path)
+    payload = json.loads(request.read_bytes())
+    payload.pop("request_digest")
+    payload["schema_version"] = invalid_version
+    payload["request_digest"] = _digest(payload)
+    request.write_text(_canonical(payload) + "\n")
+
+    with pytest.raises(data_benchmark_worker.DataBenchmarkError, match="request version"):
+        data_benchmark_worker._load_request(request)
+
+
+@pytest.mark.parametrize("invalid_version", [True, 1.0], ids=("boolean", "float"))
+def test_parent_worker_result_loader_rejects_noninteger_version_after_redigest(
+    tmp_path, invalid_version
+):
+    request_path = _request(tmp_path)
+    request = load_data_benchmark_request(request_path)
+    result_path = tmp_path / "result.json"
+    run_data_benchmark_worker(
+        request_path,
+        result_path,
+        requested_threads=1,
+        timeout_seconds=5,
+        worker_command=(sys.executable, str(FAKE), "ok"),
+    )
+    payload = json.loads(result_path.read_bytes())
+    payload.pop("result_digest")
+    payload["schema_version"] = invalid_version
+    payload["result_digest"] = _digest(payload)
+    result_path.write_text(_canonical(payload) + "\n")
+
+    with pytest.raises(DataBenchmarkError, match="worker result version"):
+        load_data_benchmark_worker_result(
+            result_path, request=request, requested_threads=1
+        )
+
+
 def test_real_worker_rejects_nullable_float_that_would_force_copy(tmp_path):
     with pytest.raises(DataBenchmarkError, match="zero-copy"):
         run_data_benchmark_worker(
@@ -326,3 +383,31 @@ def test_production_sampler_loader_rejects_boolean_version_after_redigest(tmp_pa
 
     with pytest.raises(SamplerWorkerError, match="benchmark version"):
         load_sampler_benchmark(sampler)
+
+
+@pytest.mark.parametrize("invalid_version", [True, 1.0], ids=("boolean", "float"))
+def test_final_data_benchmark_loader_rejects_noninteger_version_after_redigest(
+    tmp_path, invalid_version
+):
+    request = _request(tmp_path)
+    sampler = _sampler_benchmark(tmp_path)
+    output = benchmark_polars_data(
+        tmp_path / "data-benchmark.json",
+        request_path=request,
+        sampler_benchmark_path=sampler,
+        sampler_sha256=file_sha256(sampler),
+        worker_directory=tmp_path / "worker-results",
+        timeout_seconds=5,
+        worker_commands={
+            1: (sys.executable, str(FAKE), "ok"),
+            2: (sys.executable, str(FAKE), "ok"),
+        },
+    )
+    payload = json.loads(output.read_bytes())
+    payload.pop("benchmark_digest")
+    payload["schema_version"] = invalid_version
+    payload["benchmark_digest"] = _digest(payload)
+    output.write_text(_canonical(payload) + "\n")
+
+    with pytest.raises(DataBenchmarkError, match="data benchmark version"):
+        load_data_benchmark(output)

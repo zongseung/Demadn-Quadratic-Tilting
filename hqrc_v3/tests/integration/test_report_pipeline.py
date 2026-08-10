@@ -107,6 +107,21 @@ def test_report_rejects_updated_manifest_with_cross_run_approval(tmp_path):
     assert not (run / "COMPLETE").exists()
 
 
+@pytest.mark.parametrize(
+    "invalid_version", [True, 1.0, 2.0], ids=("boolean", "wrong-float", "equal-float")
+)
+def test_report_manifest_rejects_noninteger_version(tmp_path, invalid_version):
+    run = _ready_run(tmp_path)
+    manifest_path = run / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["schema_version"] = invalid_version
+    manifest_path.write_bytes(_canonical(manifest))
+
+    with pytest.raises(ReportContractError, match="versioned strict schema"):
+        build_report(run)
+    assert not (run / "COMPLETE").exists()
+
+
 @pytest.mark.parametrize("raw", [b"not-json", b"{}"])
 def test_report_rejects_malformed_hash_rebound_sampler_benchmark(tmp_path, raw):
     run = _ready_run(tmp_path)

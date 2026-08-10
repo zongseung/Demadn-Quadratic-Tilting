@@ -239,6 +239,7 @@ def _manifest(run: Path) -> dict[str, Any]:
     if (
         not isinstance(value, dict)
         or set(value) != _MANIFEST_KEYS
+        or type(value.get("schema_version")) is not int
         or value.get("schema_version") != _MANIFEST_VERSION
     ):
         raise ReportContractError("manifest is not the versioned strict schema")
