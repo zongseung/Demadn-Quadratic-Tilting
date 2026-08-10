@@ -130,6 +130,44 @@ unwired in this tranche.
   (`258 passed, 4 deselected`), and repository-wide Ruff plus `git diff --check` were
   clean. The warnings were the existing synthetic ArviZ diagnostic warnings.
 
+## Fix round 3: crash-consistent publication and canonical sampler reporting
+
+- Replaced cooperative NPZ/JSON pair locking with immutable version-2 generations and
+  one canonical, digest-bound `*.current.json` pointer. Each generation NPZ and metadata
+  file is fsynced before publication, the generation directory is fsynced before the
+  pointer swap, and the containing directory is fsynced afterward. A logical-path read
+  resolves exactly the pointed generation; direct return values identify the real
+  immutable NPZ/JSON files used by sampler requests, so an older returned tuple remains
+  coherent after another writer advances the pointer.
+- The pointer loader rejects noncanonical bytes, unknown fields or versions, malformed
+  generation identities, missing/tampered hashes, symlinked generation namespaces,
+  missing pointers, absolute paths, traversal, and targets outside the exact generation
+  directory. Legacy version-1 direct pairs remain readable, while new logical namespaces
+  fail closed instead of silently falling back when their pointer is removed.
+- Deterministic failure injection covers every publication boundary. Failures before the
+  pointer swap leave the prior generation current; failures after the swap expose the
+  complete new generation. A gated reader/writer regression proves readers remain
+  nonblocking while an unpublished writer pauses and uses unconditional bounded thread
+  cleanup.
+- `bayes.benchmark.load_sampler_benchmark()` is now the single strict production loader
+  shared by reporting and the Polars data benchmark. It checks canonical bytes, exact
+  schema/version, embedded digest, backend identity/status, child PID/request/environment
+  audit, positive timing/RSS/ESS/R-hat measurements, divergences, every posterior-audit
+  row, recomputed row and maximum distances, and recomputed nutpie eligibility.
+- `build_report()` now accepts the actual artifact emitted by
+  `benchmark_sampler_processes()`. Integration coverage launches controlled PyMC and
+  nutpie child processes, binds their production artifact into the run manifest, and
+  completes reporting; a re-digested false eligibility claim is rejected. The synthetic
+  `write_benchmark()` format is separately versioned as
+  `legacy-smoke-sampler-benchmark`, digest-bound, canonical, and explicitly prohibited
+  from paper reporting.
+- RED: the focused artifact/report run produced `13 failed, 9 passed`, exercising stale
+  returned tuples, all pointer boundaries, path traversal, nonblocking readers, injected
+  worker commands, production artifact acceptance, and semantic eligibility tampering.
+- GREEN: the focused artifact/sampler/data/report suite passed (`48 passed`), the full
+  non-slow suite passed (`272 passed, 4 deselected`), and the real sampler child-process
+  smoke passed (`1 passed`). Repository-wide Ruff and `git diff --check` were clean.
+
 Baseline/correction CLI wiring remains outside this fix round and was not changed.
 
 ## Delivered

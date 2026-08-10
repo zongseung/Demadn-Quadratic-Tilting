@@ -12,7 +12,13 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from hqrc_v3.bayes.benchmark import _atomic_json, _canonical, _digest
+from hqrc_v3.bayes.benchmark import (
+    SamplerWorkerError,
+    _atomic_json,
+    _canonical,
+    _digest,
+    load_sampler_benchmark,
+)
 from hqrc_v3.provenance import file_sha256
 
 _VERSION = 1
@@ -39,27 +45,6 @@ _RESULT_KEYS = {
     "peak_rss_mb",
     "versions",
     "result_digest",
-}
-_SAMPLER_KEYS = {
-    "schema_version",
-    "benchmarks",
-    "maximum_mean_distance_sd",
-    "posterior_audit",
-    "nutpie_eligible_default",
-    "benchmark_digest",
-}
-_SAMPLER_AUDIT_KEYS = {
-    "status",
-    "backend",
-    "pid",
-    "request_digest",
-    "wall_seconds",
-    "peak_rss_mb",
-    "min_bulk_ess_per_second",
-    "min_tail_ess_per_second",
-    "max_rhat",
-    "divergences",
-    "versions",
 }
 _FINAL_KEYS = {
     "schema_version",
@@ -125,17 +110,6 @@ def _positive_float(value: object, name: str) -> float:
         or value <= 0
     ):
         raise DataBenchmarkError(f"{name} must be finite and positive")
-    return float(value)
-
-
-def _nonnegative_float(value: object, name: str) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value < 0
-    ):
-        raise DataBenchmarkError(f"{name} must be finite and non-negative")
     return float(value)
 
 
@@ -434,104 +408,11 @@ def run_data_benchmark_worker(
     return loaded
 
 
-def _validate_sampler_worker(value: object, *, backend: str) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != _SAMPLER_AUDIT_KEYS:
-        raise DataBenchmarkError("sampler benchmark worker schema differs")
-    if value["status"] != "ok" or value["backend"] != backend:
-        raise DataBenchmarkError("sampler benchmark worker identity differs")
-    _integer(value["pid"], "sampler worker PID")
-    _sha(value["request_digest"], "sampler request digest")
-    for name in (
-        "wall_seconds",
-        "peak_rss_mb",
-        "min_bulk_ess_per_second",
-        "min_tail_ess_per_second",
-        "max_rhat",
-    ):
-        _positive_float(value[name], f"sampler {name}")
-    if (
-        isinstance(value["divergences"], bool)
-        or not isinstance(value["divergences"], int)
-        or value["divergences"] < 0
-    ):
-        raise DataBenchmarkError("sampler divergences differ")
-    versions = value["versions"]
-    if (
-        not isinstance(versions, dict)
-        or not versions
-        or any(
-            not isinstance(key, str) or not key or not isinstance(item, str) or not item
-            for key, item in versions.items()
-        )
-    ):
-        raise DataBenchmarkError("sampler environment versions differ")
-    return dict(value)
-
-
-def _load_sampler_benchmark(path: Path, *, bound_sha256: str) -> dict[str, Any]:
-    artifact = Path(path)
-    if not artifact.is_file():
-        raise DataBenchmarkError("sampler benchmark artifact is missing")
-    if _sha(bound_sha256, "sampler_sha256") != file_sha256(artifact):
-        raise DataBenchmarkError("caller-bound sampler benchmark hash differs")
-    payload = _read_canonical(artifact, label="sampler benchmark")
-    if set(payload) != _SAMPLER_KEYS:
-        raise DataBenchmarkError("sampler benchmark schema differs")
-    digest = payload.pop("benchmark_digest")
-    if not isinstance(digest, str) or digest != _digest(payload):
-        raise DataBenchmarkError("sampler benchmark digest differs")
-    payload["benchmark_digest"] = digest
-    if payload["schema_version"] != _VERSION:
-        raise DataBenchmarkError("sampler benchmark version differs")
-    benchmarks = payload["benchmarks"]
-    if not isinstance(benchmarks, dict) or set(benchmarks) != {"pymc", "nutpie"}:
-        raise DataBenchmarkError("sampler benchmark backends differ")
-    _validate_sampler_worker(benchmarks["pymc"], backend="pymc")
-    nutpie = benchmarks["nutpie"]
-    nutpie_missing = nutpie == {"status": "not-installed", "eligible_default": False}
-    if not nutpie_missing:
-        _validate_sampler_worker(nutpie, backend="nutpie")
-    distance = payload["maximum_mean_distance_sd"]
-    posterior_audit = payload["posterior_audit"]
-    if not isinstance(posterior_audit, dict):
-        raise DataBenchmarkError("sampler posterior audit differs")
-    if not isinstance(payload["nutpie_eligible_default"], bool):
-        raise DataBenchmarkError("sampler eligibility differs")
-    if nutpie_missing:
-        if distance is not None or posterior_audit or payload["nutpie_eligible_default"]:
-            raise DataBenchmarkError("missing nutpie benchmark audit differs")
-    else:
-        maximum_distance = _nonnegative_float(distance, "sampler maximum mean distance")
-        if not posterior_audit:
-            raise DataBenchmarkError("sampler posterior audit is empty")
-        audited_maximum = 0.0
-        for name, rows in posterior_audit.items():
-            if not isinstance(name, str) or not name or not isinstance(rows, list) or not rows:
-                raise DataBenchmarkError("sampler posterior audit parameter differs")
-            for row in rows:
-                if not isinstance(row, dict) or set(row) != {
-                    "left_mean",
-                    "right_mean",
-                    "pooled_sd",
-                    "distance_sd",
-                }:
-                    raise DataBenchmarkError("sampler posterior audit row differs")
-                _nonnegative_float(row["pooled_sd"], "sampler pooled posterior SD")
-                row_distance = _nonnegative_float(
-                    row["distance_sd"], "sampler posterior distance"
-                )
-                for mean_name in ("left_mean", "right_mean"):
-                    mean = row[mean_name]
-                    if (
-                        isinstance(mean, bool)
-                        or not isinstance(mean, (int, float))
-                        or not math.isfinite(mean)
-                    ):
-                        raise DataBenchmarkError("sampler posterior mean differs")
-                audited_maximum = max(audited_maximum, row_distance)
-        if not math.isclose(maximum_distance, audited_maximum, rel_tol=1e-12, abs_tol=1e-15):
-            raise DataBenchmarkError("sampler maximum posterior distance differs")
-    return payload
+def _load_bound_sampler_benchmark(path: Path, *, bound_sha256: str) -> dict[str, Any]:
+    try:
+        return load_sampler_benchmark(path, bound_sha256=bound_sha256)
+    except SamplerWorkerError as error:
+        raise DataBenchmarkError(str(error)) from error
 
 
 def _processing_audit(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -560,7 +441,7 @@ def benchmark_polars_data(
 
     request = load_data_benchmark_request(request_path)
     sampler_path = Path(sampler_benchmark_path).resolve()
-    sampler = _load_sampler_benchmark(sampler_path, bound_sha256=sampler_sha256)
+    sampler = _load_bound_sampler_benchmark(sampler_path, bound_sha256=sampler_sha256)
     sampler_artifact_sha = file_sha256(sampler_path)
     workers = request["workers"]
     if worker_commands is not None and set(worker_commands) != {1, workers}:
@@ -799,7 +680,7 @@ def load_data_benchmark(path: Path) -> dict[str, Any]:
     sampler_path = Path(sampler["artifact_path"])
     if not sampler_path.is_absolute():
         raise DataBenchmarkError("sampler artifact path differs")
-    validated_sampler = _load_sampler_benchmark(
+    validated_sampler = _load_bound_sampler_benchmark(
         sampler_path,
         bound_sha256=_sha(sampler["artifact_sha256"], "sampler artifact sha256"),
     )

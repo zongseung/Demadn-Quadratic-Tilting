@@ -1,6 +1,10 @@
+import hashlib
 import json
+import sys
+from pathlib import Path
 
 import pytest
+from hqrc_v3.bayes.benchmark import benchmark_sampler_processes
 from hqrc_v3.diagnostics.ar import approve_calibration
 from hqrc_v3.evaluation.reports import (
     ReportContractError,
@@ -9,6 +13,12 @@ from hqrc_v3.evaluation.reports import (
     run_synthetic_pipeline,
 )
 from hqrc_v3.provenance import file_sha256
+
+FAKE_SAMPLER = Path(__file__).parents[1] / "fixtures" / "fake_sampler_worker.py"
+
+
+def _canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
 
 def _ready_run(tmp_path):
@@ -25,13 +35,54 @@ def _ready_run(tmp_path):
     return run
 
 
-def _replace_sampler_and_rebind_manifest(run, raw):
+def _rebind_sampler_manifest(run):
     sampler = run / "benchmarks/samplers.json"
-    sampler.write_bytes(raw)
     manifest_path = run / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["input_artifacts"]["sampler_benchmark"]["sha256"] = file_sha256(sampler)
     manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+
+
+def _replace_sampler_and_rebind_manifest(run, raw):
+    (run / "benchmarks/samplers.json").write_bytes(raw)
+    _rebind_sampler_manifest(run)
+
+
+def _write_production_sampler_benchmark(run, tmp_path):
+    inputs = tmp_path / "sampler-inputs"
+    inputs.mkdir(exist_ok=True)
+    files = {}
+    for name in ("data.npz", "data.json", "approved.json"):
+        path = inputs / name
+        path.write_text(name)
+        files[name] = path
+    output = benchmark_sampler_processes(
+        run / "benchmarks/samplers.json",
+        request_directory=tmp_path / "sampler-workers",
+        timeout_seconds=5,
+        request_kwargs={
+            "hqrc_npz": files["data.npz"],
+            "hqrc_metadata": files["data.json"],
+            "approved_ar": files["approved.json"],
+            "residual_sha256": "a" * 64,
+            "config_sha256": "b" * 64,
+            "event_sha256": "c" * 64,
+            "variant": "H3",
+            "pooling": "partial",
+            "options": {"covariance": "full"},
+            "seed": 7,
+            "draws": 20,
+            "tune": 20,
+            "chains": 2,
+            "profile": "smoke",
+        },
+        worker_commands={
+            "pymc": (sys.executable, str(FAKE_SAMPLER), "ok"),
+            "nutpie": (sys.executable, str(FAKE_SAMPLER), "ok"),
+        },
+    )
+    _rebind_sampler_manifest(run)
+    return output
 
 
 def test_report_invalidates_stale_complete_before_rejecting_tampered_input(tmp_path):
@@ -84,6 +135,46 @@ def test_report_rejects_noncanonical_sampler_json_even_after_manifest_rebind(tmp
     payload = json.loads(sampler.read_text())
     _replace_sampler_and_rebind_manifest(run, json.dumps(payload, indent=2).encode())
     with pytest.raises(ReportContractError, match="sampler benchmark.*canonical"):
+        build_report(run)
+    assert not (run / "COMPLETE").exists()
+
+
+def test_report_accepts_process_orchestrator_sampler_artifact(tmp_path):
+    run = _ready_run(tmp_path)
+    artifact = _write_production_sampler_benchmark(run, tmp_path)
+    payload = json.loads(artifact.read_text())
+    assert payload["benchmarks"]["pymc"]["status"] == "ok"
+    assert payload["benchmarks"]["nutpie"]["status"] == "ok"
+
+    assert build_report(run) == run / "reports"
+    assert (run / "COMPLETE").is_file()
+
+
+def test_report_recomputes_production_sampler_eligibility_after_redigest(tmp_path):
+    run = _ready_run(tmp_path)
+    artifact = _write_production_sampler_benchmark(run, tmp_path)
+    payload = json.loads(artifact.read_text())
+    assert payload["nutpie_eligible_default"] is False
+    payload.pop("benchmark_digest")
+    payload["nutpie_eligible_default"] = True
+    payload["benchmark_digest"] = hashlib.sha256(_canonical(payload)).hexdigest()
+    _replace_sampler_and_rebind_manifest(run, _canonical(payload) + b"\n")
+
+    with pytest.raises(ReportContractError, match="sampler benchmark|eligibility"):
+        build_report(run)
+    assert not (run / "COMPLETE").exists()
+
+
+def test_report_rejects_boolean_production_sampler_version_after_redigest(tmp_path):
+    run = _ready_run(tmp_path)
+    artifact = _write_production_sampler_benchmark(run, tmp_path)
+    payload = json.loads(artifact.read_text())
+    payload.pop("benchmark_digest")
+    payload["schema_version"] = True
+    payload["benchmark_digest"] = hashlib.sha256(_canonical(payload)).hexdigest()
+    _replace_sampler_and_rebind_manifest(run, _canonical(payload) + b"\n")
+
+    with pytest.raises(ReportContractError, match="sampler benchmark.*version"):
         build_report(run)
     assert not (run / "COMPLETE").exists()
 

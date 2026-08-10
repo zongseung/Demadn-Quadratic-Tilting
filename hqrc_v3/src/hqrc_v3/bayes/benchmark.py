@@ -38,6 +38,33 @@ _RESULT_KEYS = {
     "versions",
     "result_digest",
 }
+_BENCHMARK_KEYS = {
+    "schema_version",
+    "benchmarks",
+    "maximum_mean_distance_sd",
+    "posterior_audit",
+    "nutpie_eligible_default",
+    "benchmark_digest",
+}
+_BENCHMARK_WORKER_KEYS = {
+    "status",
+    "backend",
+    "pid",
+    "request_digest",
+    "wall_seconds",
+    "peak_rss_mb",
+    "min_bulk_ess_per_second",
+    "min_tail_ess_per_second",
+    "max_rhat",
+    "divergences",
+    "versions",
+}
+_POSTERIOR_AUDIT_ROW_KEYS = {
+    "left_mean",
+    "right_mean",
+    "pooled_sd",
+    "distance_sd",
+}
 
 
 class SamplerWorkerError(RuntimeError):
@@ -172,7 +199,10 @@ def load_sampler_request(path: Path) -> dict[str, Any]:
     if not isinstance(digest, str) or digest != _digest(payload):
         raise SamplerWorkerError("sampler request digest differs")
     payload["request_digest"] = digest
-    if payload.get("schema_version") != _VERSION:
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != _VERSION
+    ):
         raise SamplerWorkerError("sampler request version differs")
     if not isinstance(payload.get("inputs"), dict) or set(payload["inputs"]) != {
         "hqrc_npz",
@@ -268,6 +298,63 @@ def _finite_positive(value: object, name: str) -> float:
     return float(value)
 
 
+def _finite_nonnegative(value: object, name: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise SamplerWorkerError(f"{name} must be finite and non-negative")
+    return float(value)
+
+
+def sampler_eligible_measurements(
+    pymc: Mapping[str, Any],
+    nutpie: Mapping[str, Any],
+    *,
+    mean_distance_sd: float,
+) -> bool:
+    """Apply the predeclared nutpie gate to validated or dataclass-like measurements."""
+
+    distance = _finite_nonnegative(mean_distance_sd, "posterior mean distance")
+    try:
+        pymc_status = pymc["status"]
+        nutpie_status = nutpie["status"]
+        pymc_divergences = pymc["divergences"]
+        nutpie_divergences = nutpie["divergences"]
+        pymc_rhat = pymc["max_rhat"]
+        nutpie_rhat = nutpie["max_rhat"]
+        pymc_wall = pymc["wall_seconds"]
+        nutpie_wall = nutpie["wall_seconds"]
+        pymc_bulk = pymc["min_bulk_ess_per_second"]
+        nutpie_bulk = nutpie["min_bulk_ess_per_second"]
+    except KeyError as error:
+        raise SamplerWorkerError("sampler eligibility measurements are incomplete") from error
+    for value, name in (
+        (pymc_rhat, "PyMC max_rhat"),
+        (nutpie_rhat, "nutpie max_rhat"),
+        (pymc_wall, "PyMC wall_seconds"),
+        (nutpie_wall, "nutpie wall_seconds"),
+        (pymc_bulk, "PyMC min_bulk_ess_per_second"),
+        (nutpie_bulk, "nutpie min_bulk_ess_per_second"),
+    ):
+        _finite_positive(value, name)
+    for value, name in (
+        (pymc_divergences, "PyMC divergences"),
+        (nutpie_divergences, "nutpie divergences"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise SamplerWorkerError(f"{name} must be a non-negative integer")
+    return bool(
+        pymc_status == nutpie_status == "ok"
+        and distance <= 0.1
+        and nutpie_divergences <= pymc_divergences
+        and nutpie_rhat <= pymc_rhat + 0.01
+        and (nutpie_wall <= pymc_wall * 0.8 or nutpie_bulk >= pymc_bulk * 1.2)
+    )
+
+
 def _validate_posterior(value: object) -> dict[str, dict[str, Any]]:
     if not isinstance(value, dict) or not value:
         raise SamplerWorkerError("worker posterior summary is empty")
@@ -311,7 +398,7 @@ def load_sampler_result(path: Path, *, request: Mapping[str, Any]) -> SamplerWor
     result_digest = payload.pop("result_digest")
     if not isinstance(result_digest, str) or result_digest != _digest(payload):
         raise SamplerWorkerError("worker result digest differs")
-    if payload["schema_version"] != _VERSION:
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != _VERSION:
         raise SamplerWorkerError("worker result version differs")
     if payload["request_digest"] != request["request_digest"]:
         raise SamplerWorkerError("worker request digest differs")
@@ -457,25 +544,171 @@ def maximum_posterior_mean_distance(
     return maximum, audit
 
 
+def _validate_benchmark_worker(value: object, *, backend: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != _BENCHMARK_WORKER_KEYS:
+        raise SamplerWorkerError("sampler benchmark worker schema differs")
+    if value["status"] != "ok" or value["backend"] != backend:
+        raise SamplerWorkerError("sampler benchmark worker identity differs")
+    pid = value["pid"]
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise SamplerWorkerError("sampler benchmark worker PID differs")
+    _sha(value["request_digest"], "sampler benchmark request digest")
+    for name in (
+        "wall_seconds",
+        "peak_rss_mb",
+        "min_bulk_ess_per_second",
+        "min_tail_ess_per_second",
+        "max_rhat",
+    ):
+        _finite_positive(value[name], f"sampler benchmark {name}")
+    divergences = value["divergences"]
+    if isinstance(divergences, bool) or not isinstance(divergences, int) or divergences < 0:
+        raise SamplerWorkerError("sampler benchmark divergences differ")
+    versions = value["versions"]
+    if (
+        not isinstance(versions, dict)
+        or not versions
+        or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(version, str)
+            or not version
+            for name, version in versions.items()
+        )
+    ):
+        raise SamplerWorkerError("sampler benchmark environment versions differ")
+    return dict(value)
+
+
+def _validate_posterior_audit(value: object) -> float:
+    if not isinstance(value, dict) or not value:
+        raise SamplerWorkerError("sampler benchmark posterior audit is empty")
+    maximum = 0.0
+    for name, rows in value.items():
+        if not isinstance(name, str) or not name or not isinstance(rows, list) or not rows:
+            raise SamplerWorkerError("sampler benchmark posterior audit parameter differs")
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != _POSTERIOR_AUDIT_ROW_KEYS:
+                raise SamplerWorkerError("sampler benchmark posterior audit row differs")
+            left = row["left_mean"]
+            right = row["right_mean"]
+            if any(
+                isinstance(item, bool)
+                or not isinstance(item, (int, float))
+                or not math.isfinite(item)
+                for item in (left, right)
+            ):
+                raise SamplerWorkerError("sampler benchmark posterior mean differs")
+            pooled = _finite_nonnegative(
+                row["pooled_sd"], "sampler benchmark pooled posterior SD"
+            )
+            distance = _finite_nonnegative(
+                row["distance_sd"], "sampler benchmark posterior distance"
+            )
+            difference = abs(float(left) - float(right))
+            if pooled == 0:
+                if difference != 0:
+                    raise SamplerWorkerError(
+                        "sampler benchmark zero pooled SD has unequal posterior means"
+                    )
+                expected = 0.0
+            else:
+                expected = difference / pooled
+            if not math.isclose(distance, expected, rel_tol=1e-12, abs_tol=1e-15):
+                raise SamplerWorkerError("sampler benchmark posterior distance audit differs")
+            maximum = max(maximum, expected)
+    return maximum
+
+
+def _validate_sampler_benchmark_payload(payload: dict[str, Any]) -> None:
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != _VERSION:
+        raise SamplerWorkerError("sampler benchmark version differs")
+    benchmarks = payload["benchmarks"]
+    if not isinstance(benchmarks, dict) or set(benchmarks) != {"pymc", "nutpie"}:
+        raise SamplerWorkerError("sampler benchmark backend mapping differs")
+    pymc = _validate_benchmark_worker(benchmarks["pymc"], backend="pymc")
+    nutpie = benchmarks["nutpie"]
+    unavailable = {"status": "not-installed", "eligible_default": False}
+    eligible = payload["nutpie_eligible_default"]
+    if not isinstance(eligible, bool):
+        raise SamplerWorkerError("sampler benchmark eligibility differs")
+    if nutpie == unavailable:
+        if (
+            payload["maximum_mean_distance_sd"] is not None
+            or payload["posterior_audit"] != {}
+            or eligible
+        ):
+            raise SamplerWorkerError("missing nutpie benchmark audit differs")
+        return
+    nutpie_measurement = _validate_benchmark_worker(nutpie, backend="nutpie")
+    maximum = _finite_nonnegative(
+        payload["maximum_mean_distance_sd"],
+        "sampler benchmark maximum posterior mean distance",
+    )
+    audited_maximum = _validate_posterior_audit(payload["posterior_audit"])
+    if not math.isclose(maximum, audited_maximum, rel_tol=1e-12, abs_tol=1e-15):
+        raise SamplerWorkerError("sampler benchmark maximum posterior distance differs")
+    expected = sampler_eligible_measurements(
+        pymc, nutpie_measurement, mean_distance_sd=maximum
+    )
+    if eligible is not expected:
+        raise SamplerWorkerError("sampler benchmark eligibility differs from its measurements")
+
+
+def load_sampler_benchmark(
+    path: Path, *, bound_sha256: str | None = None
+) -> dict[str, Any]:
+    """Load the canonical production benchmark and recompute every semantic decision."""
+
+    artifact = Path(path)
+    if not artifact.is_file():
+        raise SamplerWorkerError("sampler benchmark artifact is missing")
+    if bound_sha256 is not None and _sha(
+        bound_sha256, "caller-bound sampler benchmark digest"
+    ) != file_sha256(artifact):
+        raise SamplerWorkerError("caller-bound sampler benchmark hash differs")
+    try:
+        raw = artifact.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as error:
+        raise SamplerWorkerError("sampler benchmark is not valid JSON") from error
+    if not isinstance(payload, dict) or set(payload) != _BENCHMARK_KEYS:
+        raise SamplerWorkerError("sampler benchmark schema differs")
+    if raw != _canonical(payload) + b"\n":
+        raise SamplerWorkerError("sampler benchmark is not canonical JSON")
+    digest = payload.pop("benchmark_digest")
+    if not isinstance(digest, str) or digest != _digest(payload):
+        raise SamplerWorkerError("sampler benchmark digest differs")
+    payload["benchmark_digest"] = digest
+    _validate_sampler_benchmark_payload(payload)
+    return payload
+
+
 def benchmark_sampler_processes(
     output_path: Path,
     *,
     request_directory: Path,
     timeout_seconds: float,
     request_kwargs: Mapping[str, Any],
+    worker_commands: Mapping[str, Sequence[str]] | None = None,
 ) -> Path:
     """Run required PyMC and installed nutpie workers and publish an audited comparison."""
 
-    from hqrc_v3.evaluation.reports import (
-        SamplerBenchmark,
-        sampler_eligible_default,
-    )
-
     directory = Path(request_directory)
     directory.mkdir(parents=True, exist_ok=True)
+    if worker_commands is not None and (
+        not set(worker_commands).issubset({"pymc", "nutpie"})
+        or "pymc" not in worker_commands
+        or any(
+            isinstance(command, (str, bytes)) or not command
+            for command in worker_commands.values()
+        )
+    ):
+        raise SamplerWorkerError("worker command mapping is invalid")
     results: dict[str, SamplerWorkerResult] = {}
     for backend in ("pymc", "nutpie"):
-        if backend == "nutpie" and find_spec("nutpie") is None:
+        injected = worker_commands is not None and backend in worker_commands
+        if backend == "nutpie" and find_spec("nutpie") is None and not injected:
             continue
         kwargs = dict(request_kwargs)
         kwargs["backend"] = backend
@@ -484,19 +717,13 @@ def benchmark_sampler_processes(
             request,
             directory / f"{backend}-result.json",
             timeout_seconds=timeout_seconds,
+            worker_command=(
+                None if worker_commands is None else worker_commands.get(backend)
+            ),
         )
     if "pymc" not in results:
         raise SamplerWorkerError("required PyMC worker did not run")
     pymc_result = results["pymc"]
-    pymc_benchmark = SamplerBenchmark(
-        "pymc",
-        pymc_result.wall_seconds,
-        pymc_result.peak_rss_mb,
-        pymc_result.min_bulk_ess_per_second,
-        pymc_result.min_tail_ess_per_second,
-        pymc_result.max_rhat,
-        pymc_result.divergences,
-    )
     benchmarks: dict[str, dict[str, Any]] = {"pymc": _worker_audit(pymc_result)}
     distance: float | None = None
     posterior_audit: dict[str, list[dict[str, float]]] = {}
@@ -506,28 +733,22 @@ def benchmark_sampler_processes(
         distance, posterior_audit = maximum_posterior_mean_distance(
             pymc_result.posterior, nutpie_result.posterior
         )
-        nutpie_benchmark = SamplerBenchmark(
-            "nutpie",
-            nutpie_result.wall_seconds,
-            nutpie_result.peak_rss_mb,
-            nutpie_result.min_bulk_ess_per_second,
-            nutpie_result.min_tail_ess_per_second,
-            nutpie_result.max_rhat,
-            nutpie_result.divergences,
-        )
-        eligible = sampler_eligible_default(
-            pymc_benchmark, nutpie_benchmark, mean_distance_sd=distance
-        )
         benchmarks["nutpie"] = _worker_audit(nutpie_result)
+        eligible = sampler_eligible_measurements(
+            benchmarks["pymc"], benchmarks["nutpie"], mean_distance_sd=distance
+        )
     else:
         benchmarks["nutpie"] = {"status": "not-installed", "eligible_default": False}
-    payload = {
+    payload: dict[str, Any] = {
         "schema_version": _VERSION,
         "benchmarks": benchmarks,
         "maximum_mean_distance_sd": distance,
         "posterior_audit": posterior_audit,
         "nutpie_eligible_default": eligible,
     }
+    payload["benchmark_digest"] = ""
+    _validate_sampler_benchmark_payload(payload)
+    payload.pop("benchmark_digest")
     payload["benchmark_digest"] = _digest(payload)
     return _atomic_json(Path(output_path), payload)
 
@@ -552,9 +773,11 @@ __all__ = [
     "SamplerWorkerError",
     "SamplerWorkerResult",
     "benchmark_sampler_processes",
+    "load_sampler_benchmark",
     "load_sampler_request",
     "load_sampler_result",
     "maximum_posterior_mean_distance",
     "run_sampler_worker",
+    "sampler_eligible_measurements",
     "write_sampler_request",
 ]

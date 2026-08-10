@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+from hashlib import sha256
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Literal
@@ -20,6 +21,11 @@ import arviz as az
 import numpy as np
 import polars as pl
 
+from hqrc_v3.bayes.benchmark import (
+    SamplerWorkerError,
+    load_sampler_benchmark,
+    sampler_eligible_measurements,
+)
 from hqrc_v3.bayes.samplers import SamplingError, validate_inference_data
 from hqrc_v3.contracts import DataContractError, validate_prediction_frame
 from hqrc_v3.diagnostics.ar import (
@@ -73,16 +79,21 @@ _MANIFEST_KEYS = frozenset(
         "output_artifacts",
     }
 )
-_SAMPLER_BENCHMARK_KEYS = frozenset(
+_LEGACY_SAMPLER_BENCHMARK_VERSION = 1
+_LEGACY_SAMPLER_BENCHMARK_KIND = "legacy-smoke-sampler-benchmark"
+_LEGACY_SAMPLER_BENCHMARK_KEYS = frozenset(
     {
+        "schema_version",
+        "schema_kind",
         "benchmarks",
         "mean_distance_sd",
         "arrow_polars",
         "parallel",
         "custom_rust_rewrite",
+        "benchmark_digest",
     }
 )
-_SAMPLER_BENCHMARK_ROW_KEYS = frozenset(
+_LEGACY_SAMPLER_BENCHMARK_ROW_KEYS = frozenset(
     {
         "backend",
         "wall_seconds",
@@ -158,22 +169,12 @@ def sampler_eligible_default(
 ) -> bool:
     """Apply the exact predeclared optional-backend selection rule."""
 
-    if (
-        not isinstance(mean_distance_sd, (int, float))
-        or not math.isfinite(mean_distance_sd)
-        or mean_distance_sd < 0
-    ):
-        raise ReportContractError("posterior mean distance must be finite and non-negative")
-    return bool(
-        pymc.status == nutpie.status == "ok"
-        and mean_distance_sd <= 0.1
-        and nutpie.divergences <= pymc.divergences
-        and nutpie.max_rhat <= pymc.max_rhat + 0.01
-        and (
-            nutpie.wall_seconds <= pymc.wall_seconds * 0.8
-            or nutpie.min_bulk_ess_per_second >= pymc.min_bulk_ess_per_second * 1.2
+    try:
+        return sampler_eligible_measurements(
+            asdict(pymc), asdict(nutpie), mean_distance_sd=mean_distance_sd
         )
-    )
+    except SamplerWorkerError as error:
+        raise ReportContractError(str(error)) from error
 
 
 def _safe_path(run: Path, value: object) -> Path:
@@ -298,25 +299,44 @@ def _validate_posterior(path: Path, manifest: dict[str, Any], *, paper: bool) ->
         )
 
 
-def _validate_sampler_benchmark_payload(value: object) -> None:
-    if not isinstance(value, dict) or set(value) != _SAMPLER_BENCHMARK_KEYS:
-        raise ReportContractError("sampler benchmark has an invalid top-level schema")
+def _sampler_canonical(value: object) -> bytes:
+    try:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+    except (TypeError, ValueError) as error:
+        raise ReportContractError("sampler benchmark is not finite canonical JSON") from error
+
+
+def _sampler_digest(value: object) -> str:
+    return sha256(_sampler_canonical(value)).hexdigest()
+
+
+def _validate_legacy_sampler_benchmark_payload(value: object) -> None:
+    if not isinstance(value, dict) or set(value) != _LEGACY_SAMPLER_BENCHMARK_KEYS:
+        raise ReportContractError("legacy sampler benchmark has an invalid top-level schema")
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != _LEGACY_SAMPLER_BENCHMARK_VERSION
+        or value["schema_kind"] != _LEGACY_SAMPLER_BENCHMARK_KIND
+    ):
+        raise ReportContractError("legacy sampler benchmark identity differs")
     rows = value["benchmarks"]
     if not isinstance(rows, list) or len(rows) != 2:
-        raise ReportContractError("sampler benchmark must contain two backend rows")
+        raise ReportContractError("legacy sampler benchmark must contain two backend rows")
     benchmarks: list[SamplerBenchmark] = []
     for row in rows:
-        if not isinstance(row, dict) or set(row) != _SAMPLER_BENCHMARK_ROW_KEYS:
-            raise ReportContractError("sampler benchmark backend row schema is invalid")
+        if not isinstance(row, dict) or set(row) != _LEGACY_SAMPLER_BENCHMARK_ROW_KEYS:
+            raise ReportContractError("legacy sampler benchmark backend row schema is invalid")
         if not isinstance(row["eligible_default"], bool):
-            raise ReportContractError("sampler benchmark eligibility must be boolean")
+            raise ReportContractError("legacy sampler benchmark eligibility must be boolean")
         benchmarks.append(SamplerBenchmark(**row))
     if [item.backend for item in benchmarks] != ["nutpie", "pymc"]:
-        raise ReportContractError("sampler benchmark backends must be unique and sorted")
+        raise ReportContractError("legacy sampler benchmark backends must be unique and sorted")
     by_backend = {item.backend: item for item in benchmarks}
     pymc, nutpie = by_backend["pymc"], by_backend["nutpie"]
     if pymc.status != "ok" or pymc.eligible_default:
-        raise ReportContractError("sampler benchmark requires measured non-default PyMC")
+        raise ReportContractError("legacy sampler benchmark requires measured non-default PyMC")
     distance = value["mean_distance_sd"]
     if nutpie.status == "not-installed":
         unavailable_values = (
@@ -328,7 +348,9 @@ def _validate_sampler_benchmark_payload(value: object) -> None:
             nutpie.divergences,
         )
         if any(item != 0 for item in unavailable_values) or distance is not None:
-            raise ReportContractError("unavailable nutpie benchmark must contain zero sentinels")
+            raise ReportContractError(
+                "unavailable legacy nutpie benchmark must contain zero sentinels"
+            )
     else:
         if (
             isinstance(distance, bool)
@@ -336,33 +358,52 @@ def _validate_sampler_benchmark_payload(value: object) -> None:
             or not math.isfinite(distance)
             or distance < 0
         ):
-            raise ReportContractError("measured nutpie benchmark requires a valid distance")
+            raise ReportContractError(
+                "measured legacy nutpie benchmark requires a valid distance"
+            )
         expected = sampler_eligible_default(pymc, nutpie, mean_distance_sd=float(distance))
         if nutpie.eligible_default is not expected:
-            raise ReportContractError("sampler benchmark eligibility differs from its measurements")
+            raise ReportContractError(
+                "legacy sampler benchmark eligibility differs from its measurements"
+            )
     if value["arrow_polars"] != {"status": "not-run"}:
-        raise ReportContractError("sampler benchmark Arrow/Polars schema is invalid")
+        raise ReportContractError("legacy sampler benchmark Arrow/Polars schema is invalid")
     if value["parallel"] != {"status": "not-run"}:
-        raise ReportContractError("sampler benchmark parallel schema is invalid")
+        raise ReportContractError("legacy sampler benchmark parallel schema is invalid")
     if value["custom_rust_rewrite"] != "deferred-without-measured-copy-bottleneck":
-        raise ReportContractError("sampler benchmark Rust decision schema is invalid")
+        raise ReportContractError("legacy sampler benchmark Rust decision schema is invalid")
 
 
-def _load_sampler_benchmark(path: Path) -> None:
+def _validate_report_sampler_benchmark(
+    path: Path, *, profile: Literal["smoke", "paper"]
+) -> None:
     try:
         raw = Path(path).read_bytes()
         value = json.loads(raw)
-        canonical = json.dumps(
-            value, sort_keys=True, separators=(",", ":"), allow_nan=False
-        ).encode()
-    except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
-        raise ReportContractError("sampler benchmark is not valid canonical JSON") from error
-    if raw != canonical:
-        raise ReportContractError("sampler benchmark is not canonical JSON")
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReportContractError("sampler benchmark is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise ReportContractError("sampler benchmark schema differs")
+    if value.get("schema_kind") != _LEGACY_SAMPLER_BENCHMARK_KIND:
+        try:
+            load_sampler_benchmark(path)
+        except SamplerWorkerError as error:
+            raise ReportContractError(str(error)) from error
+        return
+    if profile != "smoke":
+        raise ReportContractError("legacy smoke sampler benchmark cannot support paper output")
+    if raw != _sampler_canonical(value) + b"\n":
+        raise ReportContractError("legacy sampler benchmark is not canonical JSON")
+    digest = value.pop("benchmark_digest", None)
+    if not isinstance(digest, str) or digest != _sampler_digest(value):
+        raise ReportContractError("legacy sampler benchmark digest differs")
+    value["benchmark_digest"] = digest
     try:
-        _validate_sampler_benchmark_payload(value)
+        _validate_legacy_sampler_benchmark_payload(value)
     except ReportContractError as error:
-        raise ReportContractError("sampler benchmark schema or values are invalid") from error
+        raise ReportContractError(
+            "legacy sampler benchmark schema or values are invalid"
+        ) from error
 
 
 def _data_svg(metrics: pl.DataFrame) -> str:
@@ -395,6 +436,19 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         raise
 
 
+def _atomic_sampler_json(path: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(_sampler_canonical(value) + b"\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
 def build_report(run_dir: Path, *, profile: Literal["smoke", "paper"] = "smoke") -> Path:
     """Revalidate every bound input, stage data-derived results, then publish atomically."""
 
@@ -404,7 +458,9 @@ def build_report(run_dir: Path, *, profile: Literal["smoke", "paper"] = "smoke")
     if manifest["profile"] != profile:
         raise ReportContractError("requested report profile differs from the run manifest")
     inputs = manifest["input_artifacts"]
-    _load_sampler_benchmark(_safe_path(run, inputs["sampler_benchmark"]["path"]))
+    _validate_report_sampler_benchmark(
+        _safe_path(run, inputs["sampler_benchmark"]["path"]), profile=profile
+    )
     residual, config, events = (
         inputs[name]["sha256"]
         for name in ("standardized_residuals", "resolved_config", "event_registry")
@@ -622,7 +678,7 @@ def _git_commit() -> str:
 def write_benchmark(
     path: Path, benchmarks: list[SamplerBenchmark], *, mean_distance_sd: float | None = None
 ) -> Path:
-    """Serialize already measured backend results; production runners must supply measurements."""
+    """Serialize the explicitly versioned synthetic-smoke benchmark contract."""
 
     by_backend = {item.backend: item for item in benchmarks}
     if (
@@ -646,14 +702,17 @@ def write_benchmark(
                 by_backend["pymc"], by_backend["nutpie"], mean_distance_sd=mean_distance_sd
             ),
         )
-    payload = {
+    payload: dict[str, Any] = {
+        "schema_version": _LEGACY_SAMPLER_BENCHMARK_VERSION,
+        "schema_kind": _LEGACY_SAMPLER_BENCHMARK_KIND,
         "benchmarks": [asdict(by_backend[name]) for name in sorted(by_backend)],
         "mean_distance_sd": mean_distance_sd,
         "arrow_polars": {"status": "not-run"},
         "parallel": {"status": "not-run"},
         "custom_rust_rewrite": "deferred-without-measured-copy-bottleneck",
     }
-    _validate_sampler_benchmark_payload(payload)
+    payload["benchmark_digest"] = _sampler_digest(payload)
+    _validate_legacy_sampler_benchmark_payload(payload)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    _atomic_json(Path(path), payload)
+    _atomic_sampler_json(Path(path), payload)
     return Path(path)
