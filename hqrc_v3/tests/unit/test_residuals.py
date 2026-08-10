@@ -52,12 +52,13 @@ def test_scale_rejects_empty_non_event_nonfinite_and_nonpositive_values():
             compute_fold_scale(frame)
 
 
-def test_scale_rejects_non_oof_contexts():
+@pytest.mark.parametrize("split_id", ["oof-2024", "oof-x", "final-2024"])
+def test_scale_rejects_non_immutable_oof_contexts(split_id):
     frame = (
         _prediction_frame()
         .head(3)
         .with_columns(
-            pl.lit("final-2024").alias("split_id"),
+            pl.lit(split_id).alias("split_id"),
             pl.Series("is_event", [False, False, False]),
             pl.Series("residual_mw", [1.0, 1.0, 1.0]),
         )

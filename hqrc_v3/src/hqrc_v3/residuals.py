@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
 import re
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +17,7 @@ import polars as pl
 
 from hqrc_v3.contracts import PREDICTION_COLUMNS, DataContractError
 from hqrc_v3.provenance import ArtifactMismatch
+from hqrc_v3.splits import is_oof_split_id
 
 _RESIDUAL_COLUMNS = ("is_event", "residual_mw")
 _CACHE_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
@@ -71,7 +74,7 @@ def compute_fold_scale(frame: pl.DataFrame) -> FoldScale:
     """Compute RMS scale from only non-event residuals in one OOF context."""
 
     context = _residual_context(frame)
-    if not context.split_id.startswith("oof-"):
+    if not is_oof_split_id(context.split_id):
         raise DataContractError("fold scale must be computed from an OOF prediction context")
     non_event = frame.filter(~pl.col("is_event"))["residual_mw"]
     if non_event.is_empty():
@@ -105,6 +108,11 @@ class PredictionCache:
     def read(self, key: str, expected_hashes: Mapping[str, str]) -> pl.DataFrame | None:
         """Return None when absent; return a compatible frame; raise on hash mismatch."""
 
+        self._paths(key)
+        with self._lock(key, exclusive=False):
+            return self._read_unlocked(key, expected_hashes)
+
+    def _read_unlocked(self, key: str, expected_hashes: Mapping[str, str]) -> pl.DataFrame | None:
         parquet_path, metadata_path = self._paths(key)
         parquet_exists, metadata_exists = parquet_path.is_file(), metadata_path.is_file()
         if not parquet_exists and not metadata_exists:
@@ -130,25 +138,13 @@ class PredictionCache:
 
         normalized = validate_prediction_frame(frame)
         hashes_dict = self._normalize_hashes(hashes)
-        existing = self.read(key, expected_hashes=hashes_dict)
-        if existing is not None:
-            return existing
-
-        parquet_path, metadata_path = self._paths(key)
-        parquet_temp = self._temporary_path(key, ".parquet")
-        metadata_temp = self._temporary_path(key, ".json")
-        try:
-            normalized.write_parquet(parquet_temp)
-            self._fsync_file(parquet_temp)
-            self._write_metadata(metadata_temp, hashes_dict)
-            os.replace(parquet_temp, parquet_path)
-            os.replace(metadata_temp, metadata_path)
-            self._fsync_directory()
-        except Exception:
-            parquet_temp.unlink(missing_ok=True)
-            metadata_temp.unlink(missing_ok=True)
-            raise
-        return normalized
+        self._paths(key)
+        with self._lock(key, exclusive=True):
+            self._cleanup_stale_partial(key)
+            existing = self._read_unlocked(key, expected_hashes=hashes_dict)
+            if existing is not None:
+                return existing
+            return self._publish_unlocked(key, normalized, hashes_dict)
 
     def _paths(self, key: str) -> tuple[Path, Path]:
         if not isinstance(key, str) or not _CACHE_KEY.fullmatch(key) or key in {".", ".."}:
@@ -159,6 +155,57 @@ class PredictionCache:
         descriptor, path = tempfile.mkstemp(prefix=f".{key}.", suffix=suffix, dir=self.root)
         os.close(descriptor)
         return Path(path)
+
+    @contextmanager
+    def _lock(self, key: str, *, exclusive: bool) -> Iterator[None]:
+        """Hold a per-key advisory lock, released by the OS if the owner crashes."""
+
+        self._paths(key)
+        lock_path = self.root / f".{key}.lock"
+        with lock_path.open("a+") as lock_file:
+            mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(lock_file.fileno(), mode)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _cleanup_stale_partial(self, key: str) -> None:
+        """Remove only an incomplete pair while holding the exclusive key lock."""
+
+        parquet_path, metadata_path = self._paths(key)
+        parquet_exists, metadata_exists = parquet_path.is_file(), metadata_path.is_file()
+        if parquet_exists == metadata_exists:
+            return
+        parquet_path.unlink(missing_ok=True)
+        metadata_path.unlink(missing_ok=True)
+        self._fsync_directory()
+
+    def _publish_unlocked(
+        self, key: str, frame: pl.DataFrame, hashes: Mapping[str, str]
+    ) -> pl.DataFrame:
+        """Publish a new pair while its exclusive key lock prevents observation gaps."""
+
+        parquet_path, metadata_path = self._paths(key)
+        parquet_temp = self._temporary_path(key, ".parquet")
+        metadata_temp = self._temporary_path(key, ".json")
+        published_parquet = False
+        try:
+            frame.write_parquet(parquet_temp)
+            self._fsync_file(parquet_temp)
+            self._write_metadata(metadata_temp, hashes)
+            os.replace(parquet_temp, parquet_path)
+            published_parquet = True
+            os.replace(metadata_temp, metadata_path)
+            self._fsync_directory()
+        except Exception:
+            parquet_temp.unlink(missing_ok=True)
+            metadata_temp.unlink(missing_ok=True)
+            if published_parquet:
+                parquet_path.unlink(missing_ok=True)
+                metadata_path.unlink(missing_ok=True)
+            raise
+        return frame
 
     @staticmethod
     def _normalize_hashes(hashes: Mapping[str, str]) -> dict[str, str]:

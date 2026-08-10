@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -130,12 +130,19 @@ def validate_prediction_frame(
     expected_targets = pl.col("origin") + (pl.col("horizon") - 1) * pl.duration(hours=1)
     if not validated.filter(pl.col("target_timestamp") != expected_targets).is_empty():
         raise DataContractError("target timestamp is inconsistent with origin and horizon")
-    if fold is not None:
-        earliest_eval_target = datetime.combine(fold.eval_start, time.min)
-        if validated.filter(pl.col("target_timestamp") < earliest_eval_target).height:
-            raise DataContractError("evaluation target is at or before the training end")
-        if validated["split_id"].item(0) != fold.split_id:
-            raise DataContractError("prediction split_id does not match its fold")
+    from hqrc_v3.splits import fold_for_split_id
+
+    resolved_fold = fold_for_split_id(validated["split_id"].item(0))
+    if fold is not None and fold != resolved_fold:
+        raise DataContractError("prediction split_id does not match its fold")
+    eval_start = datetime.combine(resolved_fold.eval_start, time.min)
+    eval_end_exclusive = datetime.combine(resolved_fold.eval_end + timedelta(days=1), time.min)
+    if not validated.filter(pl.col("target_timestamp") < eval_start).is_empty():
+        raise DataContractError("evaluation target is at or before the training end")
+    if not validated.filter(pl.col("target_timestamp") >= eval_end_exclusive).is_empty():
+        raise DataContractError(
+            "prediction target timestamps must lie within the resolved evaluation range"
+        )
     return validated
 
 

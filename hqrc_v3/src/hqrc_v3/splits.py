@@ -83,6 +83,22 @@ def final_fold() -> AnnualFold:
     return AnnualFold.final()
 
 
+def fold_for_split_id(split_id: str) -> AnnualFold:
+    """Resolve one of the five immutable prediction split identities."""
+
+    folds = (*expanding_oof_folds(), final_fold())
+    for fold in folds:
+        if fold.split_id == split_id:
+            return fold
+    raise DataContractError(f"unknown immutable split_id: {split_id!r}")
+
+
+def is_oof_split_id(split_id: str) -> bool:
+    """Return whether a split identity is one of the four allowed OOF folds."""
+
+    return split_id in {fold.split_id for fold in expanding_oof_folds()}
+
+
 def select_fold_samples(matrix: ForecastMatrix, fold: AnnualFold) -> tuple[np.ndarray, np.ndarray]:
     """Select only samples whose complete 24-hour targets belong to a fold side."""
 

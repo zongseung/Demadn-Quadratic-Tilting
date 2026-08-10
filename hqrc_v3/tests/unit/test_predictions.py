@@ -8,8 +8,9 @@ from hqrc_v3.contracts import PREDICTION_COLUMNS, DataContractError, validate_pr
 from hqrc_v3.splits import AnnualFold
 
 
-def _prediction_frame() -> pl.DataFrame:
-    origin = datetime(2023, 1, 1)
+def _prediction_frame(
+    origin: datetime = datetime(2023, 1, 1), split_id: str = "oof-2023"
+) -> pl.DataFrame:
     return pl.DataFrame(
         {
             "origin": [origin] * 24,
@@ -20,7 +21,7 @@ def _prediction_frame() -> pl.DataFrame:
             "model": ["xgb"] * 24,
             "feature_set": ["B0"] * 24,
             "seed": [7] * 24,
-            "split_id": ["oof-2023"] * 24,
+            "split_id": [split_id] * 24,
         }
     )
 
@@ -99,3 +100,22 @@ def test_prediction_frame_rejects_targets_at_or_before_its_training_end():
 
     with pytest.raises(DataContractError, match="training end"):
         validate_prediction_frame(frame, fold=fold)
+
+
+@pytest.mark.parametrize(
+    ("origin", "split_id", "message"),
+    [
+        (datetime(2024, 1, 1), "oof-2023", "evaluation range"),
+        (datetime(2024, 1, 1), "not-a-split", "unknown immutable split_id"),
+    ],
+)
+def test_prediction_frame_resolves_immutable_fold_from_its_split_id(origin, split_id, message):
+    with pytest.raises(DataContractError, match=message):
+        validate_prediction_frame(_prediction_frame(origin, split_id))
+
+
+def test_prediction_frame_rejects_targets_past_its_resolved_eval_end():
+    frame = _prediction_frame(datetime(2023, 12, 31, 12), "oof-2023")
+
+    with pytest.raises(DataContractError, match="evaluation range"):
+        validate_prediction_frame(frame)
