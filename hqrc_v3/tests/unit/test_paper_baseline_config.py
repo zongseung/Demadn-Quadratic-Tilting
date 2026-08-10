@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import hqrc_v3.baselines as baselines
 import hqrc_v3.baselines.classical as classical
 import numpy as np
 import pytest
@@ -13,10 +14,15 @@ from hqrc_v3.baselines.classical import ClassicalBaseline
 from hqrc_v3.baselines.config import (
     MODEL_NAMES,
     PAPER_SEEDS,
+    PaperBaselineConfig,
     PaperBaselineConfigError,
     load_paper_baselines,
 )
-from hqrc_v3.baselines.paper import make_paper_factory
+from hqrc_v3.baselines.paper import (
+    make_paper_factory,
+    run_paper_final_stage,
+    run_paper_oof_stage,
+)
 from hqrc_v3.baselines.sequence import (
     Seq2SeqLSTM,
     TimeSeriesTransformer,
@@ -64,6 +70,14 @@ def test_versioned_config_loads_only_the_five_exact_paper_models() -> None:
     assert config.models == MODEL_NAMES
     assert config.validation_days == 61
     assert config.seq2seq_lstm.seeds == config.transformer.seeds == PAPER_SEEDS
+
+
+def test_paper_baseline_api_is_available_from_the_package_namespace() -> None:
+    assert baselines.PaperBaselineConfig is PaperBaselineConfig
+    assert baselines.load_paper_baselines is load_paper_baselines
+    assert baselines.make_paper_factory is make_paper_factory
+    assert baselines.run_paper_oof_stage is run_paper_oof_stage
+    assert baselines.run_paper_final_stage is run_paper_final_stage
 
 
 def test_versioned_config_freezes_every_manuscript_parameter() -> None:

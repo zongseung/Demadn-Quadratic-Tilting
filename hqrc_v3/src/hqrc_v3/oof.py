@@ -62,7 +62,8 @@ def chronological_validation_tail(
     expected_targets = origins[:, None] + np.arange(24).astype("timedelta64[h]")
     if not np.array_equal(targets.astype("datetime64[ns]"), expected_targets):
         raise ValueError("training samples must contain complete midnight-origin days")
-    if not np.all(np.diff(origins.astype("datetime64[D]")) == np.timedelta64(1, "D")):
+    validation_block = origins[count - days - 1 :].astype("datetime64[D]")
+    if not np.all(np.diff(validation_block) == np.timedelta64(1, "D")):
         raise ValueError("training samples must be consecutive daily samples")
     boundary = count - days
     return (
@@ -166,6 +167,18 @@ def _select_nonempty(
     if train_indices.size == 0 or eval_indices.size == 0:
         raise DataContractError(f"{fold.split_id} requires non-empty train and evaluation samples")
     return matrix.take(train_indices), matrix.take(eval_indices)
+
+
+def _training_partitions(
+    outer_train: ForecastMatrix,
+    factory: BaselineFactory,
+    validation_days: int | None,
+) -> tuple[ForecastMatrix, ForecastMatrix | None]:
+    if validation_days is None:
+        return outer_train, None
+    if not getattr(factory, "uses_validation_tail", False):
+        return outer_train, None
+    return chronological_validation_tail(outer_train, days=validation_days)
 
 
 @dataclass(frozen=True)
@@ -279,6 +292,20 @@ class OOFRunSummary:
 
 
 @dataclass(frozen=True)
+class OOFStreamResult:
+    """A cache-aware OOF stream over an explicit immutable fold subset."""
+
+    frames: tuple[pl.DataFrame, ...]
+    combined_frame: pl.DataFrame
+    folds: tuple[AnnualFold, ...]
+    fit_count: int
+    cache_hit_count: int
+    model: str
+    feature_set: FeatureSet
+    seed: int
+
+
+@dataclass(frozen=True)
 class FinalBaselineResult:
     """The one final fitted baseline and its validated 2024 prediction frame."""
 
@@ -299,8 +326,43 @@ def generate_expanding_oof(
     cache: PredictionCache,
     artifact_hashes: Mapping[str, str],
     seed: int,
+    *,
+    validation_days: int | None = None,
 ) -> OOFRunSummary:
     """Generate exactly the four frozen OOF folds without selection or tuning."""
+
+    stream = generate_oof_stream(
+        matrix,
+        factory,
+        feature_set,
+        cache,
+        artifact_hashes,
+        seed,
+        folds=expanding_oof_folds(),
+        validation_days=validation_days,
+    )
+    return OOFRunSummary.from_frames(
+        list(stream.frames),
+        model=stream.model,
+        feature_set=stream.feature_set,
+        seed=stream.seed,
+        fit_count=stream.fit_count,
+        cache_hit_count=stream.cache_hit_count,
+    )
+
+
+def generate_oof_stream(
+    matrix: ForecastMatrix,
+    factory: BaselineFactory,
+    feature_set: FeatureSet,
+    cache: PredictionCache,
+    artifact_hashes: Mapping[str, str],
+    seed: int,
+    *,
+    folds: tuple[AnnualFold, ...],
+    validation_days: int | None = None,
+) -> OOFStreamResult:
+    """Generate a declared subset of the four immutable OOF folds."""
 
     selected_feature_set = _require_feature_set(feature_set)
     selected_seed = _require_seed(seed)
@@ -309,11 +371,19 @@ def generate_expanding_oof(
     hashes = _require_hashes(artifact_hashes)
     if not isinstance(cache, PredictionCache):
         raise TypeError("cache must be a PredictionCache")
+    allowed = {fold.split_id: fold for fold in expanding_oof_folds()}
+    if (
+        not isinstance(folds, tuple)
+        or not folds
+        or len({fold.split_id for fold in folds}) != len(folds)
+        or any(allowed.get(fold.split_id) != fold for fold in folds)
+    ):
+        raise DataContractError("OOF stream folds must be a unique immutable OOF subset")
 
     frames: list[pl.DataFrame] = []
     fit_count = 0
     cache_hit_count = 0
-    for fold in expanding_oof_folds():
+    for fold in folds:
         key = cache_key(model, selected_feature_set, selected_seed, fold)
         cached = cache.read(key, expected_hashes=hashes)
         if cached is not None:
@@ -328,8 +398,11 @@ def generate_expanding_oof(
             )
             cache_hit_count += 1
             continue
-        train, evaluation = _select_nonempty(matrix, fold)
-        fitted = factory.fit(train, validation=None, seed=selected_seed)
+        outer_train, evaluation = _select_nonempty(matrix, fold)
+        train, validation = _training_partitions(
+            outer_train, factory, validation_days
+        )
+        fitted = factory.fit(train, validation=validation, seed=selected_seed)
         prediction = fitted.predict(evaluation)
         frame = predictions_to_frame(
             evaluation,
@@ -349,8 +422,10 @@ def generate_expanding_oof(
             )
         )
         fit_count += 1
-    return OOFRunSummary.from_frames(
-        frames,
+    return OOFStreamResult(
+        frames=tuple(frames),
+        combined_frame=pl.concat(frames, how="vertical"),
+        folds=folds,
         model=model,
         feature_set=selected_feature_set,
         seed=selected_seed,
@@ -365,6 +440,7 @@ def fit_final_baseline(
     feature_set: FeatureSet,
     *,
     seed: int,
+    validation_days: int | None = None,
 ) -> FinalBaselineResult:
     """Fit only 2019--2023 and predict available complete 2024 targets."""
 
@@ -373,8 +449,9 @@ def fit_final_baseline(
     _require_matrix_feature_set(matrix, selected_feature_set)
     model = _factory_name(factory)
     fold = final_fold()
-    train, evaluation = _select_nonempty(matrix, fold)
-    fitted = factory.fit(train, validation=None, seed=selected_seed)
+    outer_train, evaluation = _select_nonempty(matrix, fold)
+    train, validation = _training_partitions(outer_train, factory, validation_days)
+    fitted = factory.fit(train, validation=validation, seed=selected_seed)
     frame = predictions_to_frame(
         evaluation,
         fitted.predict(evaluation),
@@ -392,4 +469,88 @@ def fit_final_baseline(
             feature_set=selected_feature_set,
             seed=selected_seed,
         ),
+    )
+
+
+@dataclass(frozen=True)
+class CachedFinalResult:
+    """One final prediction frame with explicit fit/cache accounting."""
+
+    frame: pl.DataFrame
+    fit_count: int
+    cache_hit_count: int
+    model: str
+    feature_set: FeatureSet
+    seed: int
+
+    def __post_init__(self) -> None:
+        if self.fit_count + self.cache_hit_count != 1:
+            raise DataContractError("final fit_count and cache_hit_count must sum to one")
+        _validate_context(
+            self.frame,
+            fold=final_fold(),
+            model=self.model,
+            feature_set=_require_feature_set(self.feature_set),
+            seed=_require_seed(self.seed),
+        )
+
+
+def generate_cached_final(
+    matrix: ForecastMatrix,
+    factory: BaselineFactory,
+    feature_set: FeatureSet,
+    cache: PredictionCache,
+    artifact_hashes: Mapping[str, str],
+    seed: int,
+    *,
+    validation_days: int | None = None,
+) -> CachedFinalResult:
+    """Generate or reuse the one immutable 2019--2023 to 2024 stream."""
+
+    selected_feature_set = _require_feature_set(feature_set)
+    selected_seed = _require_seed(seed)
+    _require_matrix_feature_set(matrix, selected_feature_set)
+    model = _factory_name(factory)
+    hashes = _require_hashes(artifact_hashes)
+    if not isinstance(cache, PredictionCache):
+        raise TypeError("cache must be a PredictionCache")
+    fold = final_fold()
+    key = cache_key(model, selected_feature_set, selected_seed, fold)
+    cached = cache.read(key, expected_hashes=hashes)
+    if cached is not None:
+        return CachedFinalResult(
+            frame=_validate_context(
+                cached,
+                fold=fold,
+                model=model,
+                feature_set=selected_feature_set,
+                seed=selected_seed,
+            ),
+            fit_count=0,
+            cache_hit_count=1,
+            model=model,
+            feature_set=selected_feature_set,
+            seed=selected_seed,
+        )
+    result = fit_final_baseline(
+        matrix,
+        factory,
+        selected_feature_set,
+        seed=selected_seed,
+        validation_days=validation_days,
+    )
+    frame = cache.write(key, result.frame, hashes=hashes)
+    return CachedFinalResult(
+        frame=_validate_context(
+            frame,
+            fold=fold,
+            model=model,
+            feature_set=selected_feature_set,
+            seed=selected_seed,
+        ),
+        fit_count=1,
+        cache_hit_count=0,
+        model=model,
+        feature_set=selected_feature_set,
+        seed=selected_seed,
     )

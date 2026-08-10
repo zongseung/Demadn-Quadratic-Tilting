@@ -12,7 +12,9 @@ from typing import NoReturn
 import numpy as np
 import polars as pl
 
-from hqrc_v3.config import ConfigError
+from hqrc_v3.baselines.config import MODEL_NAMES, load_paper_baselines
+from hqrc_v3.baselines.paper import run_paper_final_stage, run_paper_oof_stage
+from hqrc_v3.config import ConfigError, load_config
 from hqrc_v3.contracts import DataContractError
 from hqrc_v3.data import audit_hourly_data, read_hourly_data
 from hqrc_v3.diagnostics.ar import (
@@ -21,6 +23,8 @@ from hqrc_v3.diagnostics.ar import (
     diagnose_event_residuals,
     write_ar_diagnostics,
 )
+from hqrc_v3.events import load_event_registry, load_holiday_calendar
+from hqrc_v3.features import attach_calendar_features, build_daily_forecast_matrix
 from hqrc_v3.provenance import file_sha256
 
 StageHandler = Callable[[argparse.Namespace], object]
@@ -58,11 +62,72 @@ def tune_baselines_handler(arguments: argparse.Namespace) -> object:
 
 
 def generate_oof_handler(arguments: argparse.Namespace) -> object:
-    return _unavailable_handler("generate-oof")(arguments)
+    inputs = _paper_stage_inputs(arguments)
+    return run_paper_oof_stage(
+        **inputs,
+        oof_years=None if arguments.oof_years is None else tuple(arguments.oof_years),
+    )
 
 
 def fit_final_baselines_handler(arguments: argparse.Namespace) -> object:
-    return _unavailable_handler("fit-final-baselines")(arguments)
+    return run_paper_final_stage(**_paper_stage_inputs(arguments))
+
+
+def _paper_stage_inputs(arguments: argparse.Namespace) -> dict[str, object]:
+    """Load, validate, feature, and hash every concrete baseline-stage input."""
+
+    if not arguments.run_dir:
+        raise StageInputError("baseline stages require --run-dir for immutable publication")
+    data_path = Path(arguments.data)
+    experiment_path = Path(arguments.config)
+    model_path = Path(arguments.frozen_model_config)
+    config_directory = experiment_path.parent
+    event_path = Path(arguments.event_registry or config_directory / "events.csv")
+    holiday_path = Path(arguments.holiday_calendar or config_directory / "holiday_calendar.csv")
+    load_config(experiment_path)
+    load_event_registry(event_path)
+    calendar = load_holiday_calendar(holiday_path)
+    baseline_config = load_paper_baselines(
+        model_path,
+        expected_sha256=arguments.frozen_model_hash,
+    )
+    audited = audit_hourly_data(
+        read_hourly_data(data_path),
+        expected_start=None,
+        expected_end=None,
+        expected_rows=None,
+    )
+    featured = attach_calendar_features(audited, calendar)
+    selected_features = (
+        ("B0", "B1") if arguments.feature_set == "all" else (arguments.feature_set,)
+    )
+    matrices = {
+        feature_set: build_daily_forecast_matrix(featured, feature_set=feature_set)
+        for feature_set in selected_features
+    }
+    selected_models = (
+        baseline_config.models if arguments.model == "all" else (arguments.model,)
+    )
+    run_dir = Path(arguments.run_dir)
+    cache_dir = Path(arguments.cache_dir or run_dir / "prediction-stream-cache")
+    return {
+        "matrices": matrices,
+        "config": baseline_config,
+        "run_dir": run_dir,
+        "cache_dir": cache_dir,
+        "artifact_hashes": {
+            "data_sha256": file_sha256(data_path),
+            "experiment_sha256": file_sha256(experiment_path),
+            "model_config_sha256": file_sha256(model_path),
+            "event_registry_sha256": file_sha256(event_path),
+            "holiday_calendar_sha256": file_sha256(holiday_path),
+        },
+        "classical_seed": arguments.seed,
+        "models": selected_models,
+        "feature_sets": selected_features,
+        "profile": arguments.profile,
+        "smoke_boosting_rounds": arguments.smoke_boosting_rounds,
+    }
 
 
 def diagnose_ar_handler(arguments: argparse.Namespace) -> object:
@@ -126,8 +191,20 @@ def _add_frozen_model_inputs(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--frozen-model-hash", required=True, help="hash of the frozen model config"
     )
-    parser.add_argument("--feature-set", choices=("B0", "B1"), required=True)
+    parser.add_argument("--model", choices=(*MODEL_NAMES, "all"), default="all")
+    parser.add_argument("--feature-set", choices=("B0", "B1", "all"), default="all")
     parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--profile", choices=("paper", "smoke"), default="paper")
+    parser.add_argument(
+        "--smoke-boosting-rounds",
+        type=int,
+        help="explicit non-paper XGBoost/LightGBM round cap",
+    )
+    parser.add_argument("--run-dir", help="run root containing predictions/")
+    parser.add_argument("--event-registry", help="event registry CSV; defaults beside --config")
+    parser.add_argument(
+        "--holiday-calendar", help="holiday feature calendar CSV; defaults beside --config"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -155,10 +232,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_data_inputs(oof)
     _add_frozen_model_inputs(oof)
     oof.add_argument("--cache-dir", required=True, help="immutable prediction cache directory")
+    oof.add_argument(
+        "--oof-years",
+        nargs="+",
+        type=int,
+        help="smoke-only ordered OOF-year subset; paper always uses 2020 2021 2022 2023",
+    )
 
     final = subcommands.add_parser("fit-final-baselines", help="refit frozen config for 2024")
     _add_data_inputs(final)
     _add_frozen_model_inputs(final)
+    final.add_argument("--cache-dir", help="immutable prediction cache directory")
 
     diagnose = subcommands.add_parser(
         "diagnose-ar", help="generate an unapproved event-reset AR diagnostic proposal"

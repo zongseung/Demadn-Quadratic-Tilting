@@ -1,7 +1,84 @@
 # HQRC v3 operator boundary
 
-The CLI deliberately exposes only stages with a complete artifact contract.  These
-are runnable now:
+The baseline commands now execute the five frozen manuscript models directly from
+`configs/model_spaces.toml`: XGBoost, LightGBM, RBF-SVR, two-layer Seq2Seq-LSTM,
+and a one-encoder/one-decoder-layer Transformer. There is no tuning command on this
+path and no model substitution. XGBoost, LightGBM, and SVR fit 24 independent
+horizon estimators; both neural models jointly predict all 24 hours from observed
+history and known future covariates only.
+
+For a paper baseline run, calculate the model-config digest and run both stages with
+all models and both feature sets:
+
+```text
+MODEL_SHA256=<sha256 of hqrc_v3/configs/model_spaces.toml>
+
+uv run hqrc generate-oof \
+  --data power_demand_final.csv \
+  --config hqrc_v3/configs/experiment.toml \
+  --frozen-model-config hqrc_v3/configs/model_spaces.toml \
+  --frozen-model-hash MODEL_SHA256 \
+  --event-registry hqrc_v3/configs/events.csv \
+  --holiday-calendar hqrc_v3/configs/holiday_calendar.csv \
+  --run-dir runs/RUN_ID \
+  --cache-dir runs/RUN_ID/prediction-stream-cache \
+  --model all --feature-set all --seed 7 --profile paper
+
+uv run hqrc fit-final-baselines \
+  --data power_demand_final.csv \
+  --config hqrc_v3/configs/experiment.toml \
+  --frozen-model-config hqrc_v3/configs/model_spaces.toml \
+  --frozen-model-hash MODEL_SHA256 \
+  --event-registry hqrc_v3/configs/events.csv \
+  --holiday-calendar hqrc_v3/configs/holiday_calendar.csv \
+  --run-dir runs/RUN_ID \
+  --cache-dir runs/RUN_ID/prediction-stream-cache \
+  --model all --feature-set all --seed 7 --profile paper
+```
+
+The OOF stage is immutably fixed to `2019→2020`, `2019–2020→2021`,
+`2019–2021→2022`, and `2019–2022→2023`. The final stage fits 2019–2023 and
+produces the sole 2024 baseline. Boosting and neural fits reserve the final 61
+complete pre-evaluation days for chronological early stopping; SVR uses the full
+outer training range. Hyperparameters never vary by fold.
+
+Successful execution publishes:
+
+```text
+runs/RUN_ID/predictions/oof_members.parquet
+runs/RUN_ID/predictions/oof.parquet
+runs/RUN_ID/predictions/final_2024_members.parquet
+runs/RUN_ID/predictions/final_2024.parquet
+runs/RUN_ID/predictions/baseline_manifest.json
+```
+
+Member files retain seeds 11, 23, 37, 41, and 53 for each neural model. Point
+files identify the neural ensemble with seed 0 and contain its exact pointwise
+arithmetic mean; classical rows are their direct forecasts. The manifest binds
+the raw data, experiment, model registry, event registry, holiday calendar,
+feature schemas, selected streams, seeds, profile, and output digests. Per-fold
+stream caches are immutable and resumable. A partial pair, changed hash, changed
+schema, altered seed/model identity, or tampered publication fails closed.
+
+The opt-in real smoke uses the same LightGBM-B1 stage with a reduced round cap:
+
+```text
+uv run hqrc generate-oof \
+  --data power_demand_final.csv \
+  --config hqrc_v3/configs/experiment.toml \
+  --frozen-model-config hqrc_v3/configs/model_spaces.toml \
+  --frozen-model-hash MODEL_SHA256 \
+  --run-dir runs/SMOKE_ID \
+  --cache-dir runs/SMOKE_ID/prediction-stream-cache \
+  --model lightgbm --feature-set B1 --seed 7 \
+  --profile smoke --oof-years 2020 --smoke-boosting-rounds 3
+```
+
+This is always recorded as `profile="smoke"` with its execution override and can
+never populate paper numbers. A `paper` profile rejects model/feature/fold subsets
+and round overrides.
+
+Other concrete operator stages are:
 
 ```text
 hqrc audit-data --data power_demand_final.csv --fixed-bounds
@@ -10,22 +87,12 @@ hqrc approve-ar-calibration --proposal runs/RUN_ID/ar_diagnostics/proposed.json 
 hqrc report --run-dir runs/RUN_ID --profile smoke
 ```
 
-`RUN_ID` is a directory prepared by the Python adapter boundary.  Before `report`,
-it must contain the strict version-2 manifest and its run-local source audit,
-resolved config, event registry, standardized residuals, validated OOF predictions,
-approved AR artifact, NetCDF InferenceData, event metrics, and sampler benchmark.
-Every manifest digest is recalculated from those files.  Reporting reloads the AR
-approval using the actual residual/config/event hashes, removes any stale `COMPLETE`,
-stages reports, then writes a JSON completion marker bound to the final manifest.
+Before `report`, the run must contain the strict version-2 reporting manifest and
+its run-local source audit, resolved config, event registry, standardized
+residuals, validated OOF predictions, approved AR artifact, NetCDF InferenceData,
+event metrics, and sampler benchmark. Reporting reloads every digest and diagnostic
+gate before writing `COMPLETE`. Only a full `paper` run satisfying posterior
+diagnostics may populate manuscript numbers.
 
-The four OOF fits (`2019→2020` through `2019–2022→2023`) create internal residual
-targets.  The separate `2019–2023→2024` baseline refit is the only causal 2024
-baseline.  `fit-corrections`, `run-ablations`, and `benchmark-samplers` are Python
-adapter boundaries until a serialized `HQRCData`/frozen-model loader is supplied;
-they do not claim to execute from partial CLI inputs.  A smoke report is labeled
-non-paper.  Paper reporting is rejected until the full normalized manuscript-table
-suite and actual four-chain, 1000-draw/tune posterior diagnostics are present.
-
-Run fast contracts with `pytest -m "not slow"`.  The slow smoke audits the real
-51,144-row source and fits/caches a small real SVR OOF prediction; it is not a paper
-experiment.
+Run fast contracts with `pytest -m "not slow"`; real-data and sampler checks are
+opt-in under `pytest -m slow`.

@@ -196,6 +196,12 @@ class ClassicalBaseline:
             if self.name != "lightgbm":
                 raise ValueError("adapter-managed early stopping is only supported for lightgbm")
 
+    @property
+    def uses_validation_tail(self) -> bool:
+        """Whether this fixed model consumes a train-only early-stopping partition."""
+
+        return self.name in {"xgboost", "lightgbm"}
+
     def fit(
         self, train: ForecastMatrix, validation: ForecastMatrix | None, seed: int
     ) -> HorizonRegressor:

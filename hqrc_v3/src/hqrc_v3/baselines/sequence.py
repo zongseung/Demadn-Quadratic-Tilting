@@ -219,6 +219,12 @@ class TorchBaselineFactory:
 
         return _build_model(self.name, history_features, future_features, self.config)
 
+    @property
+    def uses_validation_tail(self) -> bool:
+        """Sequence members use the fixed chronological tail for early stopping."""
+
+        return True
+
 
 @dataclass(frozen=True)
 class SeedEnsembleBaseline:
