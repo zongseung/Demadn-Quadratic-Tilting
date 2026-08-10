@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import NoReturn
 
 from hqrc_v3.config import ConfigError
@@ -60,6 +61,14 @@ def approve_ar_calibration_handler(arguments: argparse.Namespace) -> object:
         current_config_sha256=arguments.config_sha256,
         current_event_sha256=arguments.event_sha256,
     )
+
+
+def report_handler(arguments: argparse.Namespace) -> object:
+    """Build a concrete report only from an already materialized run directory."""
+
+    from hqrc_v3.evaluation.reports import build_report
+
+    return build_report(Path(arguments.run_dir), profile=arguments.profile)
 
 
 def _add_data_inputs(parser: argparse.ArgumentParser, *, config: bool = True) -> None:
@@ -128,6 +137,41 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("--residual-sha256", required=True, help="current residual artifact hash")
     approve.add_argument("--config-sha256", required=True, help="current experiment config hash")
     approve.add_argument("--event-sha256", required=True, help="current event registry hash")
+
+    corrections = subcommands.add_parser(
+        "fit-corrections", help="fit a correction only from an approved AR artifact"
+    )
+    corrections.add_argument("--run-dir", required=True)
+    corrections.add_argument("--config", required=True)
+    corrections.add_argument("--approved-ar", required=True)
+    corrections.add_argument("--evaluation", choices=("causal-2024", "loeo"), required=True)
+    corrections.add_argument("--seed", type=int, required=True)
+    corrections.add_argument("--profile", choices=("smoke", "paper"), required=True)
+
+    ablations = subcommands.add_parser("run-ablations", help="run declared H0--H5 ablations")
+    ablations.add_argument("--run-dir", required=True)
+    ablations.add_argument("--config", required=True)
+    ablations.add_argument("--approved-ar", required=True)
+    ablations.add_argument("--seed", type=int, required=True)
+    ablations.add_argument("--profile", choices=("smoke", "paper"), required=True)
+
+    benchmark = subcommands.add_parser(
+        "benchmark-samplers", help="benchmark PyMC and optional nutpie under identical inputs"
+    )
+    benchmark.add_argument("--run-dir", required=True)
+    benchmark.add_argument("--config", required=True)
+    benchmark.add_argument("--approved-ar", required=True)
+    benchmark.add_argument("--seed", type=int, required=True)
+    benchmark.add_argument("--draws", type=int, required=True)
+    benchmark.add_argument("--tune", type=int, required=True)
+    benchmark.add_argument("--chains", type=int, required=True)
+    benchmark.add_argument("--profile", choices=("smoke", "paper"), required=True)
+
+    report = subcommands.add_parser(
+        "report", help="validate a completed run and emit normalized outputs"
+    )
+    report.add_argument("--run-dir", required=True)
+    report.add_argument("--profile", choices=("smoke", "paper"), required=True)
     return parser
 
 
@@ -139,6 +183,10 @@ def _default_handlers() -> dict[str, StageHandler]:
         "fit-final-baselines": fit_final_baselines_handler,
         "diagnose-ar": diagnose_ar_handler,
         "approve-ar-calibration": approve_ar_calibration_handler,
+        "fit-corrections": _unavailable_handler("fit-corrections"),
+        "run-ablations": _unavailable_handler("run-ablations"),
+        "benchmark-samplers": _unavailable_handler("benchmark-samplers"),
+        "report": report_handler,
     }
 
 
