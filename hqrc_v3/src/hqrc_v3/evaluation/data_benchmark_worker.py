@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import platform
 import resource
@@ -132,6 +133,47 @@ def _peak_rss_mb() -> float:
     return max(raw / divisor, sys.float_info.epsilon)
 
 
+def _canonical_aggregate_value(value: object) -> dict[str, object]:
+    if value is None:
+        return {"type": "null"}
+    if isinstance(value, bool):
+        return {"type": "boolean", "value": value}
+    if isinstance(value, int):
+        return {"type": "integer", "value": str(value)}
+    if isinstance(value, float):
+        if math.isnan(value):
+            encoded = "nan"
+        elif math.isinf(value):
+            encoded = "positive-infinity" if value > 0 else "negative-infinity"
+        else:
+            encoded = value.hex()
+        return {"type": "float", "value": encoded}
+    if isinstance(value, str):
+        return {"type": "string", "value": value}
+    raise DataBenchmarkError(
+        f"workload aggregate value type is unsupported: {type(value).__name__}"
+    )
+
+
+def _aggregate_checksum(
+    *, identity: str, seed: int, columns: list[str], rows: list[tuple[object, ...]]
+) -> str:
+    if any(len(row) != len(columns) for row in rows):
+        raise DataBenchmarkError("workload aggregate shape differs")
+    values = [
+        [_canonical_aggregate_value(value) for value in row]
+        for row in rows
+    ]
+    return _digest(
+        {
+            "identity": identity,
+            "seed": seed,
+            "columns": columns,
+            "aggregate_values": values,
+        }
+    )
+
+
 def _workload(pl: Any, request: dict[str, Any]) -> str:
     expressions = []
     for position, name in enumerate(request["columns"], start=1):
@@ -149,13 +191,11 @@ def _workload(pl: Any, request: dict[str, Any]) -> str:
         .select(expressions)
         .collect()
     )
-    return _digest(
-        {
-            "identity": request["workload"],
-            "seed": request["seed"],
-            "columns": result.columns,
-            "rows": result.rows(),
-        }
+    return _aggregate_checksum(
+        identity=request["workload"],
+        seed=request["seed"],
+        columns=result.columns,
+        rows=result.rows(),
     )
 
 

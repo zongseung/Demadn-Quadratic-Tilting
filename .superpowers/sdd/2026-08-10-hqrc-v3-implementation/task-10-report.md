@@ -101,6 +101,37 @@ Remaining Task 10 work is production CLI wiring and the separate correction/abla
 fit-handler and manuscript execution paths. Those boundaries remain intentionally
 unwired in this tranche.
 
+## Fix round 2: integrity review findings
+
+- The Polars workload checksum now serializes the computed aggregate cell values,
+  rather than relying on workload metadata. Every value receives an explicit type tag;
+  finite floats use exact hexadecimal encoding and null, NaN, signed infinity, integer,
+  boolean, and string values have deterministic canonical representations. A regression
+  changes only one aggregate value between simulated serial and parallel results and
+  proves the checksums differ while independently created NaNs hash identically.
+- `write_hqrc_data()` now prepares a hash-bound NPZ/JSON generation and holds a stable
+  per-artifact `flock` exclusively across both atomic replacements. `load_hqrc_data()`
+  holds the same lock shared across metadata parsing, NPZ digest verification, archive
+  loading, and `HQRCData` reconstruction. The deterministic concurrency regression
+  pauses writer A immediately after its NPZ replacement, observes writer B blocked on
+  the exclusive lock and a reader blocked on the shared lock, then proves the reader
+  sees one coherent generation, writer B publishes the final coherent pair, and no
+  thread is stranded.
+- `build_report()` now parses the manifest-bound sampler benchmark before publication.
+  It requires exact canonical JSON, the complete top-level and per-backend schemas,
+  sorted unique PyMC/nutpie rows, finite typed measurements, consistent optional-backend
+  eligibility, and the declared Arrow/parallel/Rust fields. Malformed JSON, unknown
+  schema, noncanonical bytes, and semantically tampered measurements remain rejected
+  even when an attacker updates the manifest file hash.
+- RED: the three focused files produced five intended failures: missing aggregate
+  canonicalization, missing pair locking, and three accepted malformed/tampered sampler
+  artifacts.
+- GREEN: the focused suite passed (`28 passed`), the complete non-slow suite passed
+  (`258 passed, 4 deselected`), and repository-wide Ruff plus `git diff --check` were
+  clean. The warnings were the existing synthetic ArviZ diagnostic warnings.
+
+Baseline/correction CLI wiring remains outside this fix round and was not changed.
+
 ## Delivered
 
 - Added fail-closed report validation with manifest hash checks, approved-AR and

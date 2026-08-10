@@ -73,6 +73,28 @@ _MANIFEST_KEYS = frozenset(
         "output_artifacts",
     }
 )
+_SAMPLER_BENCHMARK_KEYS = frozenset(
+    {
+        "benchmarks",
+        "mean_distance_sd",
+        "arrow_polars",
+        "parallel",
+        "custom_rust_rewrite",
+    }
+)
+_SAMPLER_BENCHMARK_ROW_KEYS = frozenset(
+    {
+        "backend",
+        "wall_seconds",
+        "peak_rss_mb",
+        "min_bulk_ess_per_second",
+        "min_tail_ess_per_second",
+        "max_rhat",
+        "divergences",
+        "status",
+        "eligible_default",
+    }
+)
 
 
 class ReportContractError(ValueError):
@@ -104,7 +126,10 @@ class SamplerBenchmark:
             self.max_rhat,
         )
         if any(
-            not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
             for value in numeric
         ):
             raise ReportContractError("benchmark numbers must be finite and non-negative")
@@ -273,6 +298,73 @@ def _validate_posterior(path: Path, manifest: dict[str, Any], *, paper: bool) ->
         )
 
 
+def _validate_sampler_benchmark_payload(value: object) -> None:
+    if not isinstance(value, dict) or set(value) != _SAMPLER_BENCHMARK_KEYS:
+        raise ReportContractError("sampler benchmark has an invalid top-level schema")
+    rows = value["benchmarks"]
+    if not isinstance(rows, list) or len(rows) != 2:
+        raise ReportContractError("sampler benchmark must contain two backend rows")
+    benchmarks: list[SamplerBenchmark] = []
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != _SAMPLER_BENCHMARK_ROW_KEYS:
+            raise ReportContractError("sampler benchmark backend row schema is invalid")
+        if not isinstance(row["eligible_default"], bool):
+            raise ReportContractError("sampler benchmark eligibility must be boolean")
+        benchmarks.append(SamplerBenchmark(**row))
+    if [item.backend for item in benchmarks] != ["nutpie", "pymc"]:
+        raise ReportContractError("sampler benchmark backends must be unique and sorted")
+    by_backend = {item.backend: item for item in benchmarks}
+    pymc, nutpie = by_backend["pymc"], by_backend["nutpie"]
+    if pymc.status != "ok" or pymc.eligible_default:
+        raise ReportContractError("sampler benchmark requires measured non-default PyMC")
+    distance = value["mean_distance_sd"]
+    if nutpie.status == "not-installed":
+        unavailable_values = (
+            nutpie.wall_seconds,
+            nutpie.peak_rss_mb,
+            nutpie.min_bulk_ess_per_second,
+            nutpie.min_tail_ess_per_second,
+            nutpie.max_rhat,
+            nutpie.divergences,
+        )
+        if any(item != 0 for item in unavailable_values) or distance is not None:
+            raise ReportContractError("unavailable nutpie benchmark must contain zero sentinels")
+    else:
+        if (
+            isinstance(distance, bool)
+            or not isinstance(distance, (int, float))
+            or not math.isfinite(distance)
+            or distance < 0
+        ):
+            raise ReportContractError("measured nutpie benchmark requires a valid distance")
+        expected = sampler_eligible_default(pymc, nutpie, mean_distance_sd=float(distance))
+        if nutpie.eligible_default is not expected:
+            raise ReportContractError("sampler benchmark eligibility differs from its measurements")
+    if value["arrow_polars"] != {"status": "not-run"}:
+        raise ReportContractError("sampler benchmark Arrow/Polars schema is invalid")
+    if value["parallel"] != {"status": "not-run"}:
+        raise ReportContractError("sampler benchmark parallel schema is invalid")
+    if value["custom_rust_rewrite"] != "deferred-without-measured-copy-bottleneck":
+        raise ReportContractError("sampler benchmark Rust decision schema is invalid")
+
+
+def _load_sampler_benchmark(path: Path) -> None:
+    try:
+        raw = Path(path).read_bytes()
+        value = json.loads(raw)
+        canonical = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise ReportContractError("sampler benchmark is not valid canonical JSON") from error
+    if raw != canonical:
+        raise ReportContractError("sampler benchmark is not canonical JSON")
+    try:
+        _validate_sampler_benchmark_payload(value)
+    except ReportContractError as error:
+        raise ReportContractError("sampler benchmark schema or values are invalid") from error
+
+
 def _data_svg(metrics: pl.DataFrame) -> str:
     values = [
         float(value)
@@ -312,6 +404,7 @@ def build_report(run_dir: Path, *, profile: Literal["smoke", "paper"] = "smoke")
     if manifest["profile"] != profile:
         raise ReportContractError("requested report profile differs from the run manifest")
     inputs = manifest["input_artifacts"]
+    _load_sampler_benchmark(_safe_path(run, inputs["sampler_benchmark"]["path"]))
     residual, config, events = (
         inputs[name]["sha256"]
         for name in ("standardized_residuals", "resolved_config", "event_registry")
@@ -560,6 +653,7 @@ def write_benchmark(
         "parallel": {"status": "not-run"},
         "custom_rust_rewrite": "deferred-without-measured-copy-bottleneck",
     }
+    _validate_sampler_benchmark_payload(payload)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     _atomic_json(Path(path), payload)
     return Path(path)

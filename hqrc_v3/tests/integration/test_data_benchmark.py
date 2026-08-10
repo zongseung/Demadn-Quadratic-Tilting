@@ -6,6 +6,7 @@ import os
 import sys
 from pathlib import Path
 
+import hqrc_v3.evaluation.data_benchmark_worker as data_benchmark_worker
 import polars as pl
 import pytest
 from hqrc_v3.evaluation.data_benchmark import (
@@ -131,6 +132,34 @@ def test_real_polars_workers_measure_copy_ownership_and_parallelism(tmp_path):
     output.write_text(_canonical(payload) + "\n")
     with pytest.raises(DataBenchmarkError, match="measured share"):
         load_data_benchmark(output)
+
+
+def test_aggregate_checksum_binds_computed_values_and_canonicalizes_null_nan():
+    columns = ["minimum", "maximum", "null_count", "row_count"]
+    serial_rows = [(1.0, float("nan"), None, 4)]
+    parallel_rows = [(1.25, float("nan"), None, 4)]
+
+    serial = data_benchmark_worker._aggregate_checksum(
+        identity="polars-numeric-summary-v1",
+        seed=19,
+        columns=columns,
+        rows=serial_rows,
+    )
+    parallel = data_benchmark_worker._aggregate_checksum(
+        identity="polars-numeric-summary-v1",
+        seed=19,
+        columns=columns,
+        rows=parallel_rows,
+    )
+    repeated_serial = data_benchmark_worker._aggregate_checksum(
+        identity="polars-numeric-summary-v1",
+        seed=19,
+        columns=columns,
+        rows=[(1.0, float("nan"), None, 4)],
+    )
+
+    assert serial != parallel
+    assert serial == repeated_serial
 
 
 @pytest.mark.parametrize(
