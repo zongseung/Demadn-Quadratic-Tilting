@@ -103,3 +103,29 @@ def test_audit_fixed_bounds_are_provided_to_its_handler():
         "2024-10-31T23:00:00",
         51_144,
     )
+
+
+def test_ar_commands_require_explicit_hashes_and_diagnose_never_auto_approves(capsys):
+    diagnose_arguments = [
+        "diagnose-ar",
+        "--residuals",
+        "residuals.parquet",
+        "--output",
+        "proposal.json",
+        "--residual-sha256",
+        "residual",
+        "--config-sha256",
+        "config",
+        "--event-sha256",
+        "events",
+        "--through",
+        "2023",
+    ]
+    received = []
+    assert cli.main(diagnose_arguments, handlers={"diagnose-ar": received.append}) == 0
+    assert received[0].command == "diagnose-ar"
+    assert cli.main(diagnose_arguments) == 2
+    assert "handler" in capsys.readouterr().err
+
+    assert cli.main(["approve-ar-calibration", "--proposal", "proposal.json"]) != 0
+    assert "residual-sha256" in capsys.readouterr().err

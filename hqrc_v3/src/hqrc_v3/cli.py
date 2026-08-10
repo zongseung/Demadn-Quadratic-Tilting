@@ -9,6 +9,7 @@ from typing import NoReturn
 
 from hqrc_v3.config import ConfigError
 from hqrc_v3.contracts import DataContractError
+from hqrc_v3.diagnostics.ar import approve_calibration
 
 StageHandler = Callable[[argparse.Namespace], object]
 _EXPECTED_START = "2019-01-01T00:00:00"
@@ -43,6 +44,22 @@ def generate_oof_handler(arguments: argparse.Namespace) -> object:
 
 def fit_final_baselines_handler(arguments: argparse.Namespace) -> object:
     return _unavailable_handler("fit-final-baselines")(arguments)
+
+
+def diagnose_ar_handler(arguments: argparse.Namespace) -> object:
+    return _unavailable_handler("diagnose-ar")(arguments)
+
+
+def approve_ar_calibration_handler(arguments: argparse.Namespace) -> object:
+    """Perform only the explicit approval gate; it never derives a new proposal."""
+
+    return approve_calibration(
+        arguments.proposal,
+        arguments.output,
+        current_residual_sha256=arguments.residual_sha256,
+        current_config_sha256=arguments.config_sha256,
+        current_event_sha256=arguments.event_sha256,
+    )
 
 
 def _add_data_inputs(parser: argparse.ArgumentParser, *, config: bool = True) -> None:
@@ -91,6 +108,26 @@ def build_parser() -> argparse.ArgumentParser:
     final = subcommands.add_parser("fit-final-baselines", help="refit frozen config for 2024")
     _add_data_inputs(final)
     _add_frozen_model_inputs(final)
+
+    diagnose = subcommands.add_parser(
+        "diagnose-ar", help="generate an unapproved event-reset AR diagnostic proposal"
+    )
+    diagnose.add_argument("--residuals", required=True, help="standardized event residual artifact")
+    diagnose.add_argument("--output", required=True, help="unapproved AR diagnostic JSON path")
+    diagnose.add_argument("--residual-sha256", required=True, help="hash of the residual artifact")
+    diagnose.add_argument("--config-sha256", required=True, help="hash of the experiment config")
+    diagnose.add_argument("--event-sha256", required=True, help="hash of the event registry")
+    diagnose.add_argument("--through", type=int, required=True, help="latest OOF year included")
+
+    approve = subcommands.add_parser(
+        "approve-ar-calibration", help="freeze a reviewed AR calibration proposal"
+    )
+    approve.add_argument("proposal_path", nargs="?", help="unapproved AR diagnostic JSON path")
+    approve.add_argument("--proposal", help="unapproved AR diagnostic JSON path")
+    approve.add_argument("--output", required=True, help="approved AR calibration JSON path")
+    approve.add_argument("--residual-sha256", required=True, help="current residual artifact hash")
+    approve.add_argument("--config-sha256", required=True, help="current experiment config hash")
+    approve.add_argument("--event-sha256", required=True, help="current event registry hash")
     return parser
 
 
@@ -100,6 +137,8 @@ def _default_handlers() -> dict[str, StageHandler]:
         "tune-baselines": tune_baselines_handler,
         "generate-oof": generate_oof_handler,
         "fit-final-baselines": fit_final_baselines_handler,
+        "diagnose-ar": diagnose_ar_handler,
+        "approve-ar-calibration": approve_ar_calibration_handler,
     }
 
 
@@ -115,6 +154,15 @@ def main(
     parser = build_parser()
     try:
         arguments = parser.parse_args(argv)
+        if arguments.command == "approve-ar-calibration":
+            if arguments.proposal is None:
+                arguments.proposal = arguments.proposal_path
+            elif arguments.proposal_path is not None:
+                raise StageInputError(
+                    "provide the AR proposal once, either positionally or with --proposal"
+                )
+            if arguments.proposal is None:
+                raise StageInputError("approve-ar-calibration requires a proposal artifact")
         if arguments.command == "audit-data" and arguments.fixed_expected_bounds:
             arguments.expected_start = _EXPECTED_START
             arguments.expected_end = _EXPECTED_END
