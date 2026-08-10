@@ -41,3 +41,21 @@
 - Prediction-frame seed, shape, fold, and nonblank context validation.
 - LightGBM now receives a consistent named feature representation for fit and predict, removing
   the prior feature-name warnings without global warning suppression.
+
+## Contract-fix round 2: boosting reproducibility
+
+- Added repeated independent fit/predict checks for both XGBoost and LightGBM using the same
+  seed and small sampling-capable parameter sets.  Predictions must be finite and agree at
+  `rtol=0`, `atol=1e-12`; the small absolute tolerance documents floating-point comparison
+  intent while remaining strict for repeated fits on the same environment.
+- Added a fake estimator test that directly verifies the adapter propagates the supplied seed
+  and the single-thread default, rather than relying on a different-seed prediction difference.
+- RED evidence: temporarily replacing seed propagation with the constant `0` made the focused
+  suite fail `4` tests (`22 passed`), including the fake estimator assertion (`{0} != {19}`) and
+  the real boosting seed/default checks.  The correct propagation was restored before GREEN.
+- GREEN focused command passed `26` tests in `0.85s`.
+- The new real reproducibility test was repeated three times; each run passed both adapters
+  (`2 passed, 3 deselected`) in `0.67s`, `0.66s`, and `0.67s`.
+- Full unit and integration verification passed `80` tests in `1.69s`; Ruff and diff whitespace
+  checks passed.  LightGBM fit logging is explicitly set to quiet in addition to the stable named
+  input representation, so the reproducibility test remains warning-free.

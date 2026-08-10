@@ -52,6 +52,27 @@ def tiny_params(name: str) -> dict[str, float | int | str]:
     }[name]
 
 
+def stochastic_tiny_params(name: str) -> dict[str, float | int | str]:
+    return {
+        "xgboost": {
+            "colsample_bytree": 0.75,
+            "learning_rate": 0.2,
+            "max_depth": 2,
+            "n_estimators": 5,
+            "subsample": 0.75,
+        },
+        "lightgbm": {
+            "colsample_bytree": 0.75,
+            "learning_rate": 0.2,
+            "min_child_samples": 2,
+            "n_estimators": 5,
+            "num_leaves": 4,
+            "subsample": 0.75,
+            "subsample_freq": 1,
+        },
+    }[name]
+
+
 @pytest.mark.parametrize("name", ["xgboost", "lightgbm", "svr"])
 def test_classical_baseline_returns_24_horizons(name, tiny_forecast_matrix):
     baseline = make_classical_baseline(name, tiny_params(name))
@@ -61,3 +82,25 @@ def test_classical_baseline_returns_24_horizons(name, tiny_forecast_matrix):
 
     assert prediction.shape == (4, 24)
     assert np.isfinite(prediction).all()
+
+
+@pytest.mark.parametrize("name", ["xgboost", "lightgbm"])
+def test_boosting_repeated_fits_with_the_same_seed_are_reproducible(name, tiny_forecast_matrix):
+    train = tiny_forecast_matrix.take(np.arange(20))
+    batch = tiny_forecast_matrix.take(np.arange(20, 24))
+    first = make_classical_baseline(name, stochastic_tiny_params(name)).fit(
+        train, validation=None, seed=17
+    )
+    second = make_classical_baseline(name, stochastic_tiny_params(name)).fit(
+        train, validation=None, seed=17
+    )
+
+    first_prediction = first.predict(batch)
+    second_prediction = second.predict(batch)
+
+    assert np.isfinite(first_prediction).all()
+    assert np.isfinite(second_prediction).all()
+    assert {id(model) for model in first.estimators}.isdisjoint(
+        {id(model) for model in second.estimators}
+    )
+    np.testing.assert_allclose(first_prediction, second_prediction, rtol=0.0, atol=1e-12)

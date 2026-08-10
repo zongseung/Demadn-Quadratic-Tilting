@@ -4,6 +4,7 @@ import builtins
 import json
 from dataclasses import dataclass, replace
 
+import hqrc_v3.baselines.classical as classical
 import numpy as np
 import pytest
 from hqrc_v3.baselines.classical import (
@@ -214,6 +215,32 @@ def test_boosting_models_receive_seed_and_single_thread_defaults(
         fitted_params = estimator.get_params(deep=False)
         assert fitted_params["random_state"] == 7
         assert fitted_params["n_jobs"] == 1
+
+
+def test_boosting_adapter_propagates_the_provided_seed(monkeypatch, tiny_forecast_matrix):
+    class SeedRecordingRegressor:
+        def __init__(self, **params):
+            self.params = params
+
+        def get_params(self, deep=False):
+            del deep
+            return {"n_jobs": None, "random_state": None}
+
+        def fit(self, features, target):
+            del features, target
+            return self
+
+        def predict(self, features):
+            return np.zeros(features.shape[0])
+
+    monkeypatch.setattr(classical, "_estimator_class", lambda name: SeedRecordingRegressor)
+
+    fitted = classical.make_classical_baseline("xgboost", {}).fit(
+        tiny_forecast_matrix.take(np.arange(20)), validation=None, seed=19
+    )
+
+    assert {estimator.params["random_state"] for estimator in fitted.estimators} == {19}
+    assert {estimator.params["n_jobs"] for estimator in fitted.estimators} == {1}
 
 
 def test_fixed_fit_does_not_inspect_validation(tiny_forecast_matrix):

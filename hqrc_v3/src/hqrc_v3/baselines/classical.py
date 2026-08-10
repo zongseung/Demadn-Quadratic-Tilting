@@ -188,7 +188,7 @@ class ClassicalBaseline:
                 estimator_params["nthread"] = 1
             if self.name == "xgboost" and "verbosity" in available:
                 estimator_params["verbosity"] = 0
-            if self.name == "lightgbm" and "verbosity" in available:
+            if self.name == "lightgbm":
                 estimator_params["verbosity"] = -1
             estimator = estimator_class(**estimator_params)
             estimator.fit(_estimator_input(self.name, features), target[:, horizon])
