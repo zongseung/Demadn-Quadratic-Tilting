@@ -114,8 +114,16 @@ class SamplerBenchmark:
             or self.divergences < 0
         ):
             raise ReportContractError("benchmark divergences must be a non-negative integer")
-        if self.status == "ok" and (self.wall_seconds <= 0 or self.max_rhat <= 0):
-            raise ReportContractError("measured benchmark requires positive wall time and R-hat")
+        if self.status == "ok" and (
+            self.wall_seconds <= 0
+            or self.peak_rss_mb <= 0
+            or self.min_bulk_ess_per_second <= 0
+            or self.min_tail_ess_per_second <= 0
+            or self.max_rhat <= 0
+        ):
+            raise ReportContractError(
+                "measured benchmark requires positive timing, RSS, ESS, and R-hat"
+            )
         if self.status == "not-installed" and self.eligible_default:
             raise ReportContractError("unavailable nutpie cannot be the default")
 
@@ -125,8 +133,12 @@ def sampler_eligible_default(
 ) -> bool:
     """Apply the exact predeclared optional-backend selection rule."""
 
-    if not isinstance(mean_distance_sd, (int, float)) or not math.isfinite(mean_distance_sd):
-        raise ReportContractError("posterior mean distance must be finite")
+    if (
+        not isinstance(mean_distance_sd, (int, float))
+        or not math.isfinite(mean_distance_sd)
+        or mean_distance_sd < 0
+    ):
+        raise ReportContractError("posterior mean distance must be finite and non-negative")
     return bool(
         pymc.status == nutpie.status == "ok"
         and mean_distance_sd <= 0.1

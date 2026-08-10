@@ -45,3 +45,21 @@ def test_report_rejects_updated_manifest_with_cross_run_approval(tmp_path):
     with pytest.raises(ReportContractError, match="AR-approval provenance"):
         build_report(run)
     assert not (run / "COMPLETE").exists()
+
+
+def test_sampler_gate_rejects_negative_posterior_distance():
+    from hqrc_v3.evaluation.reports import SamplerBenchmark, sampler_eligible_default
+
+    measured = SamplerBenchmark("pymc", 1.0, 1.0, 1.0, 1.0, 1.0, 0)
+    with pytest.raises(ReportContractError, match="non-negative"):
+        sampler_eligible_default(measured, measured, mean_distance_sd=-0.01)
+
+
+def test_sampler_gate_accepts_exact_distance_and_twenty_percent_boundaries():
+    from hqrc_v3.evaluation.reports import SamplerBenchmark, sampler_eligible_default
+
+    pymc = SamplerBenchmark("pymc", 10.0, 2.0, 100.0, 90.0, 1.0, 0)
+    faster = SamplerBenchmark("nutpie", 8.0, 2.0, 100.0, 90.0, 1.01, 0)
+    higher_ess = SamplerBenchmark("nutpie", 10.0, 2.0, 120.0, 90.0, 1.01, 0)
+    assert sampler_eligible_default(pymc, faster, mean_distance_sd=0.1)
+    assert sampler_eligible_default(pymc, higher_ess, mean_distance_sd=0.1)

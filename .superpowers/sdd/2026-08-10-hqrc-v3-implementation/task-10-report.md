@@ -37,6 +37,30 @@ This is only the safe-input foundation.  It does not yet provide the required
 process-isolated sampler worker, measured Arrow/parallel benchmarks, or concrete
 correction/ablation/benchmark CLI execution.
 
+## Sampler-worker tranche
+
+- Added canonical digest-bound sampler request/result JSON contracts and a parent
+  runner that launches `sys.executable -m hqrc_v3.bayes.sampler_worker`, enforces a
+  timeout, checks the exact child PID, and rejects nonzero, missing, malformed,
+  mismatched, nonfinite, or stale results.
+- The child reloads the hash-bound HQRC NPZ/metadata and approved AR artifact using
+  the current residual/config/event hashes, executes the existing real sampler,
+  measures child wall time and normalized peak RSS, revalidates inference diagnostics,
+  and atomically emits per-element posterior means/SDs and software versions.
+- Backend comparison runs required PyMC and only launches nutpie when installed. It
+  computes the maximum per-element mean distance in pooled-SD units, audits every
+  parameter element, and applies the existing strict eligibility gate. Zero pooled SD
+  requires exact mean equality.
+- RED: the focused worker test initially failed collection with
+  `ModuleNotFoundError: hqrc_v3.bayes.benchmark`.
+- GREEN: focused worker/report tests passed (`10 passed`), the non-slow suite passed
+  (`236 passed, 3 deselected`), the real PyMC child-process smoke passed (`1 passed`),
+  and Ruff plus `git diff --check` were clean.
+
+Remaining Task 10 work is the measured Arrow/Polars and serial/parallel data
+microbenchmark tranche plus production CLI wiring; those are intentionally not part of
+this commit.
+
 ## Delivered
 
 - Added fail-closed report validation with manifest hash checks, approved-AR and
