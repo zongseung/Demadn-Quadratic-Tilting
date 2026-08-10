@@ -7,3 +7,5 @@
 .ruff_cache/
 __pycache__/
 /artifacts/
+.worktrees/
+.superpowers/
