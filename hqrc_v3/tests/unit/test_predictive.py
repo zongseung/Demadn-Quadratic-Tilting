@@ -5,6 +5,8 @@ from hqrc_v3.bayes.predictive import (
     baseline_bootstrap_draws,
     corrected_predictive_draws,
     draw_new_event_correction,
+    posterior_values,
+    select_posterior_indices,
     simulate_stationary_ar1,
     simulate_stationary_ar2,
     simulate_student_t_ar1,
@@ -87,3 +89,20 @@ def test_student_t_and_stationary_ar2_sensitivity_draws_are_finite():
     )
     assert student.shape == ar2.shape == (1, 8)
     assert np.isfinite(student).all() and np.isfinite(ar2).all()
+
+
+def test_scalar_chain_draw_posteriors_flatten_and_share_indices():
+    posterior = {
+        "mu": np.zeros((2, 3, 2, 3)),
+        "gamma": np.zeros((2, 3, 2, 24)),
+        "phi": np.arange(6.0).reshape(2, 3),
+        "sigma_r": np.arange(10.0, 16.0).reshape(2, 3),
+    }
+    indices = select_posterior_indices(
+        posterior, specifications={"mu": 2, "gamma": 2, "phi": 0, "sigma_r": 0}, draws=4, seed=12
+    )
+    np.testing.assert_allclose(
+        posterior_values(posterior, "sigma_r", trailing=0, indices=indices)
+        - posterior_values(posterior, "phi", trailing=0, indices=indices),
+        10.0,
+    )

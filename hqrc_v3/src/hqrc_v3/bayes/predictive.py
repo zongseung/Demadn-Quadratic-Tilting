@@ -27,6 +27,8 @@ def _sample_matrix(value: object, *, name: str, trailing: int) -> np.ndarray:
     array = _finite(value, f"posterior {name}")
     if array.ndim < trailing + 1:
         raise PredictiveShapeError(f"posterior {name} has too few dimensions")
+    if trailing == 0:
+        return array.reshape(-1)
     return array.reshape((-1,) + array.shape[-trailing:])
 
 

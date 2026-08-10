@@ -115,6 +115,21 @@ def holm_adjust(p_values: Mapping[str, float]) -> dict[str, float]:
     return {name: adjusted[name] for name in p_values}
 
 
+def _hac_statistic(differential: np.ndarray, bandwidth: int) -> float:
+    centered = differential - differential.mean()
+    long_run = float(np.mean(centered**2))
+    for lag in range(1, min(bandwidth, differential.size - 1) + 1):
+        covariance = float(np.mean(centered[lag:] * centered[:-lag]))
+        long_run += 2.0 * (1.0 - lag / (bandwidth + 1.0)) * covariance
+    if long_run <= np.finfo(float).eps:
+        return (
+            0.0
+            if abs(float(differential.mean())) <= np.finfo(float).eps
+            else math.copysign(math.inf, differential.mean())
+        )
+    return float(math.sqrt(differential.size) * differential.mean() / math.sqrt(long_run))
+
+
 def hac_dm_test(
     reference_loss: np.ndarray,
     candidate_loss: np.ndarray,
@@ -143,20 +158,11 @@ def hac_dm_test(
     if any(not isinstance(event_id, str) or not event_id.strip() for event_id in event_ids):
         raise InferenceContractError("event_ids must be nonblank strings")
     differential = reference - candidate
-    centered = differential - differential.mean()
-    long_run = float(np.mean(centered**2))
-    for lag in range(1, min(bandwidth, differential.size - 1) + 1):
-        covariance = float(np.mean(centered[lag:] * centered[:-lag]))
-        long_run += 2.0 * (1.0 - lag / (bandwidth + 1.0)) * covariance
-    if long_run <= np.finfo(float).eps:
-        statistic = (
-            0.0
-            if abs(float(differential.mean())) <= np.finfo(float).eps
-            else math.copysign(math.inf, differential.mean())
-        )
+    statistic = _hac_statistic(differential, bandwidth)
+    if not math.isfinite(statistic):
         p_value = 1.0 if statistic == 0.0 else 0.0
     else:
-        statistic = float(math.sqrt(differential.size) * differential.mean() / math.sqrt(long_run))
+        centered = differential - differential.mean()
         blocks = [
             centered[np.asarray(event_ids) == event_id] for event_id in dict.fromkeys(event_ids)
         ]
@@ -165,7 +171,7 @@ def hac_dm_test(
         for draw in range(bootstrap_draws):
             chosen = rng.integers(0, len(blocks), size=len(blocks))
             resampled = np.concatenate([blocks[index] for index in chosen])
-            bootstrap[draw] = math.sqrt(resampled.size) * resampled.mean() / math.sqrt(long_run)
+            bootstrap[draw] = _hac_statistic(resampled, bandwidth)
         p_value = float(
             (1 + np.count_nonzero(np.abs(bootstrap) >= abs(statistic))) / (bootstrap_draws + 1)
         )

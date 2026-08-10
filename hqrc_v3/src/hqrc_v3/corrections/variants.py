@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -39,12 +40,39 @@ class CorrectionContractError(ValueError):
     """Raised when correction evaluation would violate a time or provenance contract."""
 
 
-@dataclass(frozen=True)
 class NonEventBlockPool:
     """Validated complete non-event 24-hour residual trajectories."""
 
-    blocks: np.ndarray
-    _token: object | None = field(default=None, repr=False, compare=False)
+    __slots__ = ("__blocks", "shape", "digest")
+
+    def __init__(self, blocks: np.ndarray, token: object):
+        if token is not _BLOCK_POOL_TOKEN:
+            raise TypeError(
+                "NonEventBlockPool objects must be created by build_non_event_block_pool"
+            )
+        owned = np.array(blocks, dtype=float, order="C", copy=True)
+        owned.setflags(write=False)
+        self.__blocks = owned
+        self.shape = owned.shape
+        self.digest = hashlib.sha256(owned.tobytes()).hexdigest()
+
+    @property
+    def blocks(self) -> np.ndarray:
+        """Return a detached read-only copy; callers cannot mutate the pool."""
+        copied = self.__blocks.copy()
+        copied.setflags(write=False)
+        return copied
+
+    def _validated_blocks(self) -> np.ndarray:
+        blocks = self.__blocks
+        if (
+            not blocks.flags.c_contiguous
+            or blocks.flags.writeable
+            or blocks.shape != self.shape
+            or hashlib.sha256(blocks.tobytes()).hexdigest() != self.digest
+        ):
+            raise CorrectionContractError("non-event block pool integrity digest differs")
+        return blocks
 
 
 def build_non_event_block_pool(frame: pl.DataFrame) -> NonEventBlockPool:
@@ -57,6 +85,26 @@ def build_non_event_block_pool(frame: pl.DataFrame) -> NonEventBlockPool:
         )
     if frame.is_empty() or frame["is_event"].dtype != pl.Boolean:
         raise CorrectionContractError("non-event pool requires a non-empty boolean is_event column")
+    if any(frame[column].null_count() for column in required):
+        raise CorrectionContractError("non-event pool columns must not contain nulls")
+    if (
+        frame["origin"].dtype.base_type() != pl.Datetime
+        or frame["target_timestamp"].dtype.base_type() != pl.Datetime
+    ):
+        raise CorrectionContractError(
+            "non-event pool origin and target_timestamp must be datetimes"
+        )
+    if frame["horizon"].dtype not in {
+        pl.Int8,
+        pl.Int16,
+        pl.Int32,
+        pl.Int64,
+        pl.UInt8,
+        pl.UInt16,
+        pl.UInt32,
+        pl.UInt64,
+    }:
+        raise CorrectionContractError("non-event pool horizon must be integer")
     subset = frame.filter(~pl.col("is_event"))
     if (
         subset.is_empty()
@@ -75,6 +123,7 @@ def build_non_event_block_pool(frame: pl.DataFrame) -> NonEventBlockPool:
                 timestamps[index] != timestamps[0] + timedelta(hours=index)
                 for index in range(len(timestamps))
             )
+            or timestamps[0] != origin
         ):
             raise CorrectionContractError(
                 "each non-event H0 block must be one complete hourly horizon"
@@ -207,18 +256,19 @@ def _shape_q(
     holiday = _holiday_index(context.holiday_type)
     if variant == "H4":
         profile = posterior_values(context.posterior, "day_effect", trailing=2, indices=indices)
-        positions = np.asarray(
-            context.day_positions
-            if context.day_positions is not None
-            else np.unique(np.floor(tau)),
-            dtype=int,
-        )
+        if context.day_positions is None:
+            raise CorrectionContractError("H4 requires explicit training/model day_positions")
+        raw_positions = np.asarray(context.day_positions)
+        if not np.issubdtype(raw_positions.dtype, np.integer):
+            raise CorrectionContractError("H4 day_positions must be integer-valued")
+        positions = raw_positions.astype(int, copy=False)
         days = np.floor(tau).astype(int)
         if (
             profile.ndim != 3
             or profile.shape[1] <= holiday
             or profile.shape[2] != positions.size
             or not np.array_equal(positions, np.unique(positions))
+            or (positions.size > 1 and not np.all(np.diff(positions) > 0))
             or np.setdiff1d(days, positions).size
         ):
             raise CorrectionContractError("H4 day_effect is incompatible with target day positions")
@@ -293,13 +343,10 @@ def run_variant(variant: Variant, context: VariantContext) -> pl.DataFrame:
         raise CorrectionContractError("variant must be H0 through H5")
     baseline, observed, tau, hour = context.validate()
     if variant == "H0":
-        if (
-            not isinstance(context.non_event_pool, NonEventBlockPool)
-            or context.non_event_pool._token is not _BLOCK_POOL_TOKEN
-        ):
+        if not isinstance(context.non_event_pool, NonEventBlockPool):
             raise CorrectionContractError("H0 requires a validated non-event block pool")
         draws = baseline[None] + bootstrap_horizon_draws(
-            context.non_event_pool.blocks,
+            context.non_event_pool._validated_blocks(),
             horizon=len(baseline),
             draws=context.draws,
             seed=context.seed,
@@ -384,6 +431,10 @@ def run_event_loeo(event_frames: Mapping[str, pl.DataFrame], backend: LOEOBacken
         calibration = require_approved_calibration(
             backend.load_approved_fold_calibration(held_out, fit_events)
         )
+        if tuple(sorted(calibration.calibration.event_ids)) != fit_events:
+            raise CorrectionContractError(
+                "fold calibration event ids must exactly match fit/ar event ids"
+            )
         fitted = backend.fit_correction(fit_events, calibration)
         output = _valid_event_frame(
             backend.predict_heldout(fitted, held_out, checked[held_out], causal=False),

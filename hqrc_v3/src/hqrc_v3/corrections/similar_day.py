@@ -66,9 +66,22 @@ def same_holiday_profile(
         raise SimilarDayError(f"target frame is missing required columns: {missing_target}")
     if any(target[column].null_count() for column in required_target):
         raise SimilarDayError("target frame must have complete holiday/day/hour keys")
+    integer_dtypes = {
+        pl.Int8,
+        pl.Int16,
+        pl.Int32,
+        pl.Int64,
+        pl.UInt8,
+        pl.UInt16,
+        pl.UInt32,
+        pl.UInt64,
+    }
     for frame, label in ((train, "training"), (target, "target")):
-        if not frame["relative_day"].cast(pl.Int64, strict=True).equals(frame["relative_day"]):
-            raise SimilarDayError(f"H5 {label} relative_day must be integer-valued")
+        if (
+            frame.schema["relative_day"] not in integer_dtypes
+            or frame.schema["hour"] not in integer_dtypes
+        ):
+            raise SimilarDayError(f"H5 {label} relative_day and hour must have integer dtypes")
     for occurrence in train["occurrence_id"].unique().to_list():
         for day in (
             train.filter(pl.col("occurrence_id") == occurrence)["relative_day"].unique().to_list()

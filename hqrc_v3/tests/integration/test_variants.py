@@ -62,6 +62,7 @@ def tiny_variant_context():
             }
         ),
         held_out_occurrence_id="seollal-2024",
+        day_positions=np.array([0]),
         draws=3,
         seed=9,
     )
@@ -129,13 +130,39 @@ def approved_calibration(tmp_path):
 
 
 class _RecordingBackend:
-    def __init__(self, calibration):
-        self.calibration = calibration
+    def __init__(self, tmp_path):
+        self.tmp_path = tmp_path
         self.calls = []
 
     def load_approved_fold_calibration(self, held_out, ar_events):
         self.calls.append([held_out, (), tuple(ar_events), None])
-        return self.calibration
+        proposal = write_ar_diagnostics(
+            self.tmp_path / f"{held_out}-proposal.json",
+            (),
+            calibrate_beta_prior(np.linspace(0.2, 0.6, len(ar_events)), event_ids=tuple(ar_events)),
+            residual_sha256="residual",
+            config_sha256="config",
+            event_sha256="events",
+            context={
+                "model": "baseline",
+                "feature_set": "B1",
+                "seed": 1,
+                "split_ids": ("oof-2020",),
+            },
+        )
+        approved = approve_calibration(
+            proposal,
+            self.tmp_path / f"{held_out}-approved.json",
+            current_residual_sha256="residual",
+            current_config_sha256="config",
+            current_event_sha256="events",
+        )
+        return load_approved_calibration(
+            approved,
+            current_residual_sha256="residual",
+            current_config_sha256="config",
+            current_event_sha256="events",
+        )
 
     def fit_correction(self, fit_events, calibration):
         self.calls[-1][1] = tuple(fit_events)
@@ -148,12 +175,12 @@ class _RecordingBackend:
         )
 
 
-def test_loeo_excludes_heldout_event_from_fit_and_ar_calibration(approved_calibration):
+def test_loeo_excludes_heldout_event_from_fit_and_ar_calibration(tmp_path):
     ids = [f"{holiday}-{year}" for holiday in ("seollal", "chuseok") for year in range(2020, 2025)]
     frames = {
         event_id: pl.DataFrame({"target_timestamp": [datetime(2024, 1, 1)]}) for event_id in ids
     }
-    backend = _RecordingBackend(approved_calibration)
+    backend = _RecordingBackend(tmp_path)
     results = run_event_loeo(frames, backend)
     assert results.height == 10
     for held_out, fit_events, ar_events, causal in backend.calls:

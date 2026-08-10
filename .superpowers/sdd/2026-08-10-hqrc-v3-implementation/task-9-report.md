@@ -78,3 +78,23 @@ The pre-existing untracked `hqrc_v3/uv.lock` was not edited or staged.
 - GREEN: expanded focused suite passed with `23 passed`.
 - Full HQRC v3 regression: `215 passed`; existing tiny-draw ArviZ warnings remain
   expected. Ruff and diff checks passed.
+
+## Fix round 2: provenance and sample-shape closure
+
+- Scalar posterior variables now flatten real `(chain, draw)` arrays to the same
+  chain-by-draw sample bank as coefficient and hour-profile tensors; a regression
+  verifies shared selected indices.
+- H0's block pool is a factory-only object with a private C-contiguous owned
+  read-only array, shape/digest metadata, safe-copy accessor, and digest check at
+  every use boundary.  The block-frame builder also rejects nulls, bad dtypes, and
+  origin/target inconsistency.
+- H4 no longer derives day positions from target data: explicit sorted integer
+  training/model positions are mandatory. H5 requires integer day/hour dtypes.
+- Each LOEO fold now requires the approved artifact's sorted event ids to equal the
+  nine fit/ar ids exactly; integration tests create genuine per-fold approved
+  artifacts rather than reusing a generic one.
+- HAC-DM re-computes its bandwidth-specific HAC studentization for every resampled
+  whole-event series.
+
+Verification: focused predictive/inference/variant tests passed with `20 passed`; full
+HQRC v3 regression passed with `216 passed`; Ruff and diff checks passed.
