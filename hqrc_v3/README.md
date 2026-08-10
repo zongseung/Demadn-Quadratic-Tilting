@@ -10,14 +10,14 @@ history and known future covariates only.
 Run these commands from the repository root. For a paper baseline run, calculate
 the model-config digest and run both stages with all models and both feature sets:
 
-```text
-MODEL_SHA256=<sha256 of hqrc_v3/configs/model_spaces.toml>
+```bash
+MODEL_SHA256="$(openssl dgst -sha256 hqrc_v3/configs/model_spaces.toml | awk '{print $NF}')"
 
 uv run --project hqrc_v3 hqrc generate-oof \
   --data power_demand_final.csv \
   --config hqrc_v3/configs/experiment.toml \
   --frozen-model-config hqrc_v3/configs/model_spaces.toml \
-  --frozen-model-hash MODEL_SHA256 \
+  --frozen-model-hash "$MODEL_SHA256" \
   --event-registry hqrc_v3/configs/events.csv \
   --holiday-calendar hqrc_v3/configs/holiday_calendar.csv \
   --run-dir runs/RUN_ID \
@@ -28,7 +28,7 @@ uv run --project hqrc_v3 hqrc fit-final-baselines \
   --data power_demand_final.csv \
   --config hqrc_v3/configs/experiment.toml \
   --frozen-model-config hqrc_v3/configs/model_spaces.toml \
-  --frozen-model-hash MODEL_SHA256 \
+  --frozen-model-hash "$MODEL_SHA256" \
   --event-registry hqrc_v3/configs/events.csv \
   --holiday-calendar hqrc_v3/configs/holiday_calendar.csv \
   --run-dir runs/RUN_ID \
@@ -67,7 +67,7 @@ uv run --project hqrc_v3 hqrc generate-oof \
   --data power_demand_final.csv \
   --config hqrc_v3/configs/experiment.toml \
   --frozen-model-config hqrc_v3/configs/model_spaces.toml \
-  --frozen-model-hash MODEL_SHA256 \
+  --frozen-model-hash "$MODEL_SHA256" \
   --run-dir runs/SMOKE_ID \
   --cache-dir runs/SMOKE_ID/prediction-stream-cache \
   --model lightgbm --feature-set B1 --seed 7 \

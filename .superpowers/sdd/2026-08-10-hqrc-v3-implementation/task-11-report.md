@@ -48,7 +48,10 @@ manifest before making cache-hit decisions. Journal paths are restricted to exac
 basenames in the predictions directory. Ordinary failures roll back immediately;
 abrupt termination after members, point, or manifest replacement is recoverable.
 Prior completed stages are preserved, and unmanifested OOF/final products fail as
-orphans rather than being ignored.
+orphans rather than being ignored. Every stage entry recomputes and applies the
+full fold, coverage, stream-context, seed, ensemble, and Parquet validation to all
+manifest-recorded stages, including a non-requested OOF/final sibling. Recovery
+performs the same run-level validation before deleting its journal.
 
 The manifest and stream metadata bind separate SHA-256 identities for raw data,
 experiment config, frozen model config, event registry, and holiday calendar. They
@@ -76,7 +79,8 @@ the shared cache/publication stage. Paper CLI execution requires the exact
 2019-01-01 00:00 through 2024-10-31 23:00 range and 51,144 rows before feature
 construction; only the explicit smoke profile is relaxed. No handler invokes the
 tuning boundary. README commands declare repository-root execution and consistently
-use `uv run --project hqrc_v3 hqrc ...`.
+use `uv run --project hqrc_v3 hqrc ...`; they compute the model hash with OpenSSL
+and pass the quoted `"$MODEL_SHA256"` value.
 
 The opt-in real smoke audited the 51,144-row source and executed actual LightGBM-B1
 for OOF 2020 with three boosting rounds. It traversed the same loader, frozen
@@ -124,12 +128,36 @@ no fallback estimator was used.
   seconds), and the existing real-data smoke passed (`1 passed` in 1.29 seconds).
 - Full Ruff: `All checks passed!`; `git diff --check`: clean.
 
+### Fix round 2
+
+- RED: nine targeted cases failed. Rehashed uniform OOF truncation was accepted
+  before final execution; a rehashed wrong-model final artifact was accepted
+  before OOF execution; paper sibling fold records could omit OOF 2023 or replace
+  final-2024; smoke sibling split records accepted unknown, duplicate, and reordered
+  identifiers; journal recovery accepted a consistently rebound corrupt sibling;
+  and README commands used a placeholder/unexpanded hash token.
+- GREEN: preflight reconstructs every recorded stage from the current matrix and
+  canonical fold objects and invokes the complete stage validator for both OOF and
+  final. Paper siblings require exactly OOF 2020–2023 and final-2024. Smoke sibling
+  OOF splits are resolved only from a non-empty, known, unique, canonical-order
+  manifest sequence before coverage is derived.
+- Recovery now runs that same full preflight while the journal is still durable.
+  Semantic failure rolls back the interrupted stage, restores the prior manifest,
+  removes/fsyncs the journal, and preserves the fail-closed error.
+- Focused suite: `55 passed` in 38.13 seconds.
+- Full fast suite: `348 passed, 5 deselected` in 45.63 seconds; only the existing
+  47 tiny-draw ArviZ/runtime warnings were emitted.
+- Real verification: the paper-stage LightGBM smoke passed (`1 passed` in 1.92
+  seconds), and the existing real-data smoke passed (`1 passed` in 1.52 seconds).
+- Full Ruff: `All checks passed!`; `git diff --check`: clean.
+
 ## Commits
 
 - `f857e04 feat(hqrc-v3): freeze paper baseline factories`
 - `4fad1ce feat(hqrc-v3): execute frozen paper baselines`
 - `c4a30ec docs(hqrc-v3): report Task 11 verification`
-- `fix(hqrc-v3): harden paper baseline execution` (fix round 1)
+- `ddf86ba fix(hqrc-v3): harden paper baseline execution`
+- `fix(hqrc-v3): validate complete baseline run state` (fix round 2)
 
 The protected workspace-local `hqrc_v3/uv.lock` was not staged or modified and
 remains the only untracked path.

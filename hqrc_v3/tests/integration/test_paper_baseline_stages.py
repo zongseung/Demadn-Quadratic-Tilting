@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -167,6 +168,52 @@ def _run_oof(run: Path, *, factory_builder: Any | None = None):
     )
 
 
+def _run_final(run: Path, *, factory_builder: Any | None = None):
+    _, default_builder = _recording_builder()
+    return run_paper_final_stage(
+        matrices={"B0": _matrix("B0"), "B1": _matrix("B1")},
+        config=load_paper_baselines(MODEL_CONFIG),
+        run_dir=run,
+        cache_dir=run / "stream-cache",
+        artifact_hashes=HASHES,
+        classical_seed=7,
+        factory_builder=factory_builder or default_builder,
+    )
+
+
+def _run_smoke_oof(run: Path, *, years: tuple[int, ...] = (2020, 2021)):
+    _, builder = _recording_builder()
+    return run_paper_oof_stage(
+        matrices={"B0": _matrix("B0")},
+        config=load_paper_baselines(MODEL_CONFIG),
+        run_dir=run,
+        cache_dir=run / "stream-cache",
+        artifact_hashes=HASHES,
+        classical_seed=7,
+        factory_builder=builder,
+        models=("xgboost",),
+        feature_sets=("B0",),
+        profile="smoke",
+        oof_years=years,
+    )
+
+
+def _run_smoke_final(run: Path):
+    _, builder = _recording_builder()
+    return run_paper_final_stage(
+        matrices={"B0": _matrix("B0")},
+        config=load_paper_baselines(MODEL_CONFIG),
+        run_dir=run,
+        cache_dir=run / "stream-cache",
+        artifact_hashes=HASHES,
+        classical_seed=7,
+        factory_builder=builder,
+        models=("xgboost",),
+        feature_sets=("B0",),
+        profile="smoke",
+    )
+
+
 def _rebind_artifact_hash(run: Path, *, stage: str, artifact: str, path: Path) -> None:
     manifest_path = run / "predictions/baseline_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -174,6 +221,59 @@ def _rebind_artifact_hash(run: Path, *, stage: str, artifact: str, path: Path) -
     manifest_path.write_text(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")),
         encoding="utf-8",
+    )
+
+
+def _truncate_stage_uniformly(run: Path, *, stage: str) -> None:
+    predictions = run / "predictions"
+    paths = (
+        {
+            "members": predictions / "oof_members.parquet",
+            "point": predictions / "oof.parquet",
+        }
+        if stage == "oof"
+        else {
+            "members": predictions / "final_2024_members.parquet",
+            "point": predictions / "final_2024.parquet",
+        }
+    )
+    for artifact, path in paths.items():
+        frame = pl.read_parquet(path)
+        frame.filter(pl.col("origin") != frame["origin"].min()).write_parquet(path)
+        _rebind_artifact_hash(run, stage=stage, artifact=artifact, path=path)
+
+
+def _rewrite_interrupted_manifest_binding(run: Path, *, sibling_stage: str) -> None:
+    predictions = run / "predictions"
+    journal_path = predictions / ".baseline-transaction.json"
+    manifest_path = predictions / "baseline_manifest.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    filenames = (
+        {"members": "oof_members.parquet", "point": "oof.parquet"}
+        if sibling_stage == "oof"
+        else {
+            "members": "final_2024_members.parquet",
+            "point": "final_2024.parquet",
+        }
+    )
+    for artifact, filename in filenames.items():
+        path = predictions / filename
+        frame = pl.read_parquet(path)
+        frame.filter(pl.col("origin") != frame["origin"].min()).write_parquet(path)
+        digest = file_sha256(path)
+        journal["prior_manifest"]["stages"][sibling_stage]["artifacts"][artifact][
+            "sha256"
+        ] = digest
+        journal["intended_manifest"]["stages"][sibling_stage]["artifacts"][artifact][
+            "sha256"
+        ] = digest
+    intended_payload = json.dumps(
+        journal["intended_manifest"], sort_keys=True, separators=(",", ":")
+    ).encode()
+    journal["manifest"]["sha256"] = hashlib.sha256(intended_payload).hexdigest()
+    manifest_path.write_bytes(intended_payload)
+    journal_path.write_text(
+        json.dumps(journal, sort_keys=True, separators=(",", ":")), encoding="utf-8"
     )
 
 
@@ -469,6 +569,89 @@ def test_hash_rebound_changed_member_seed_set_still_fails_semantically(tmp_path:
         _run_oof(tmp_path)
 
 
+def test_rehashed_uniformly_truncated_oof_sibling_blocks_final_stage(
+    tmp_path: Path,
+) -> None:
+    _run_oof(tmp_path)
+    _truncate_stage_uniformly(tmp_path, stage="oof")
+
+    with pytest.raises(ArtifactMismatch, match="coverage"):
+        _run_final(tmp_path)
+
+
+def test_rehashed_wrong_model_final_sibling_blocks_oof_stage(tmp_path: Path) -> None:
+    final = _run_final(tmp_path)
+    changed = pl.read_parquet(final.point_path).with_columns(
+        pl.when(pl.col("model") == "xgboost")
+        .then(pl.lit("wrong-model"))
+        .otherwise(pl.col("model"))
+        .alias("model")
+    )
+    changed.write_parquet(final.point_path)
+    _rebind_artifact_hash(
+        tmp_path, stage="final", artifact="point", path=final.point_path
+    )
+
+    with pytest.raises(ArtifactMismatch, match="model"):
+        _run_oof(tmp_path)
+
+
+def test_paper_final_rejects_nonexact_recorded_oof_fold_contract(tmp_path: Path) -> None:
+    result = _run_oof(tmp_path)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    manifest["stages"]["oof"]["split_ids"] = [
+        "oof-2020",
+        "oof-2021",
+        "oof-2022",
+    ]
+    manifest["stages"]["oof"]["eval_years"] = [2020, 2021, 2022]
+    result.manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+
+    with pytest.raises(ArtifactMismatch, match="fold identities"):
+        _run_final(tmp_path)
+
+
+def test_paper_oof_rejects_nonfinal_recorded_final_fold_contract(tmp_path: Path) -> None:
+    result = _run_final(tmp_path)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    manifest["stages"]["final"]["split_ids"] = ["oof-2023"]
+    manifest["stages"]["final"]["eval_years"] = [2023]
+    result.manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+
+    with pytest.raises(ArtifactMismatch, match="fold identities"):
+        _run_oof(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("split_ids", "eval_years"),
+    [
+        (["oof-2020", "oof-2099"], [2020, 2099]),
+        (["oof-2020", "oof-2020"], [2020, 2020]),
+        (["oof-2021", "oof-2020"], [2021, 2020]),
+    ],
+    ids=("unknown", "duplicate", "reordered"),
+)
+def test_smoke_final_rejects_invalid_recorded_oof_split_identity_or_order(
+    tmp_path: Path,
+    split_ids: list[str],
+    eval_years: list[int],
+) -> None:
+    result = _run_smoke_oof(tmp_path)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    manifest["stages"]["oof"]["split_ids"] = split_ids
+    manifest["stages"]["oof"]["eval_years"] = eval_years
+    result.manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+
+    with pytest.raises(ArtifactMismatch, match="split identities"):
+        _run_smoke_final(tmp_path)
+
+
 def test_changed_feature_schema_fails_before_cache_reuse(tmp_path: Path) -> None:
     _run_oof(tmp_path)
     b0 = _matrix("B0")
@@ -600,6 +783,30 @@ def test_abrupt_oof_recovery_preserves_a_completed_final_stage(
     manifest = json.loads(final.manifest_path.read_text(encoding="utf-8"))
     assert set(manifest["stages"]) == {"oof", "final"}
     assert (file_sha256(final.members_path), file_sha256(final.point_path)) == final_hashes
+
+
+def test_journal_recovery_semantically_validates_a_rehashed_sibling_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _run_oof(tmp_path)
+
+    def terminate_after_manifest(boundary: str) -> None:
+        if boundary == "final-manifest-published":
+            raise AbruptPublicationStop(boundary)
+
+    monkeypatch.setattr(paper, "_publication_boundary", terminate_after_manifest)
+    with pytest.raises(AbruptPublicationStop):
+        _run_final(tmp_path)
+    journal = tmp_path / "predictions/.baseline-transaction.json"
+    assert journal.is_file()
+    _rewrite_interrupted_manifest_binding(tmp_path, sibling_stage="oof")
+    monkeypatch.setattr(paper, "_publication_boundary", lambda _: None)
+
+    with pytest.raises(ArtifactMismatch, match="coverage"):
+        _run_final(tmp_path)
+
+    assert not journal.exists()
 
 
 def test_orphan_final_products_are_not_ignored_by_oof_cache_hit(tmp_path: Path) -> None:
@@ -750,3 +957,10 @@ def test_readme_hqrc_commands_are_executable_from_the_repository_root() -> None:
         assert f"uv run --project hqrc_v3 hqrc {command}" in readme
     assert "uv run hqrc " not in readme
     assert "\nhqrc " not in readme
+    assert "MODEL_SHA256=<" not in readme
+    assert (
+        "MODEL_SHA256=\"$(openssl dgst -sha256 "
+        "hqrc_v3/configs/model_spaces.toml | awk '{print $NF}')\""
+    ) in readme
+    assert readme.count('--frozen-model-hash "$MODEL_SHA256"') == 3
+    assert "--frozen-model-hash MODEL_SHA256" not in readme

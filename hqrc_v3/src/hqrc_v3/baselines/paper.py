@@ -959,10 +959,12 @@ def _rollback_transaction(
     _fsync_directory(directory)
 
 
-def _recover_publication(directory: Path) -> None:
+def _recover_publication(
+    directory: Path, *, validate_completed: Callable[[], Any]
+) -> Any | None:
     loaded = _load_transaction(directory)
     if loaded is None:
-        return
+        return None
     transaction, paths = loaded
     try:
         for component in ("members", "point", "manifest"):
@@ -973,10 +975,16 @@ def _recover_publication(directory: Path) -> None:
                 description=component,
             )
         _fsync_directory(directory)
+        validated = validate_completed()
         _unlink_transaction_file(paths["journal"])
         _fsync_directory(directory)
+        return validated
     except _RecoveryImpossible:
         _rollback_transaction(directory, transaction, paths)
+        return None
+    except ArtifactMismatch:
+        _rollback_transaction(directory, transaction, paths)
+        raise
 
 
 def _publish_stage(
@@ -1069,6 +1077,36 @@ def _publish_stage(
     return members_path, point_path, manifest_path
 
 
+def _recorded_stage_folds(
+    *,
+    recorded_stage: Literal["oof", "final"],
+    record: object,
+    requested_stage: Literal["oof", "final"],
+    requested_folds: tuple[AnnualFold, ...],
+    profile: Literal["paper", "smoke"],
+) -> tuple[AnnualFold, ...]:
+    if recorded_stage == requested_stage:
+        return requested_folds
+    if recorded_stage == "final":
+        return (final_fold(),)
+    if profile == "paper":
+        return expanding_oof_folds()
+    if not isinstance(record, dict):
+        raise ArtifactMismatch("oof stage manifest is invalid")
+    split_ids = record.get("split_ids")
+    if (
+        not isinstance(split_ids, list)
+        or not split_ids
+        or any(not isinstance(split_id, str) for split_id in split_ids)
+    ):
+        raise ArtifactMismatch("smoke OOF split identities are invalid")
+    allowed = expanding_oof_folds()
+    selected = tuple(fold for fold in allowed if fold.split_id in split_ids)
+    if tuple(fold.split_id for fold in selected) != tuple(split_ids):
+        raise ArtifactMismatch("smoke OOF split identities are invalid")
+    return selected
+
+
 def _stage_preflight(
     *,
     run_dir: Path,
@@ -1076,8 +1114,8 @@ def _stage_preflight(
     identity: Mapping[str, object],
     models: tuple[str, ...],
     feature_sets: tuple[FeatureSet, ...],
-    split_ids: tuple[str, ...],
-    eval_years: tuple[int, ...],
+    matrix: ForecastMatrix,
+    folds: tuple[AnnualFold, ...],
     classical_seed: int,
     expected_coverage: Mapping[str, object],
     profile: Literal["paper", "smoke"],
@@ -1088,6 +1126,7 @@ def _stage_preflight(
         name: _artifact_paths(run_dir, name)[:2] for name in ("oof", "final")
     }
     all_products = [path for products in stage_products.values() for path in products]
+    validated_stages: dict[str, tuple[Path, Path]] = {}
     if manifest is None:
         if any(path.exists() or path.is_symlink() for path in all_products):
             raise ArtifactMismatch("partial baseline publication without a manifest")
@@ -1105,24 +1144,43 @@ def _stage_preflight(
                     f"partial {recorded_stage} baseline publication"
                 )
         for recorded_stage, record in manifest["stages"].items():
-            _verify_artifact_hashes(run_dir, recorded_stage, record)
+            recorded_folds = _recorded_stage_folds(
+                recorded_stage=recorded_stage,
+                record=record,
+                requested_stage=stage,
+                requested_folds=folds,
+                profile=profile,
+            )
+            recorded_split_ids = tuple(fold.split_id for fold in recorded_folds)
+            recorded_eval_years = tuple(fold.eval_year for fold in recorded_folds)
+            try:
+                recorded_coverage = (
+                    dict(expected_coverage)
+                    if recorded_stage == stage
+                    else _expected_stage_coverage(matrix, recorded_folds)
+                )
+            except DataContractError as error:
+                raise ArtifactMismatch(
+                    f"{recorded_stage} expected coverage cannot be derived"
+                ) from error
+            validated_stages[recorded_stage] = _validate_completed_stage(
+                run_dir,
+                recorded_stage,
+                manifest,
+                models=models,
+                feature_sets=feature_sets,
+                split_ids=recorded_split_ids,
+                eval_years=recorded_eval_years,
+                classical_seed=classical_seed,
+                expected_coverage=recorded_coverage,
+            )
     stage_exists = members_path.exists() or point_path.exists() or stage in manifest["stages"]
     if not stage_exists:
         return manifest, members_path, point_path, manifest_path
     if not (members_path.is_file() and point_path.is_file() and stage in manifest["stages"]):
         raise ArtifactMismatch(f"partial {stage} baseline publication")
-    validated_members, validated_point = _validate_completed_stage(
-        run_dir,
-        stage,
-        manifest,
-        models=models,
-        feature_sets=feature_sets,
-        split_ids=split_ids,
-        eval_years=eval_years,
-        classical_seed=classical_seed,
-        expected_coverage=expected_coverage,
-    )
-    units = _expected_fit_units(models, feature_sets, len(split_ids))
+    validated_members, validated_point = validated_stages[stage]
+    units = _expected_fit_units(models, feature_sets, len(folds))
     return PaperStageResult(
         stage=stage,
         members_path=validated_members,
@@ -1216,19 +1274,26 @@ def _run_paper_stage(
     cache = PredictionCache(Path(cache_dir))
     predictions_dir = run / "predictions"
     with _publication_lock(predictions_dir):
-        _recover_publication(predictions_dir)
-        preflight = _stage_preflight(
-            run_dir=run,
-            stage=stage,
-            identity=identity,
-            models=selected_models,
-            feature_sets=selected_features,
-            split_ids=split_ids,
-            eval_years=eval_years,
-            classical_seed=classical_seed,
-            expected_coverage=expected_coverage,
-            profile=profile,
+        def preflight_publication() -> (
+            PaperStageResult | tuple[dict[str, Any], Path, Path, Path]
+        ):
+            return _stage_preflight(
+                run_dir=run,
+                stage=stage,
+                identity=identity,
+                models=selected_models,
+                feature_sets=selected_features,
+                matrix=normalized_matrices[selected_features[0]],
+                folds=folds,
+                classical_seed=classical_seed,
+                expected_coverage=expected_coverage,
+                profile=profile,
+            )
+
+        recovered = _recover_publication(
+            predictions_dir, validate_completed=preflight_publication
         )
+        preflight = preflight_publication() if recovered is None else recovered
         if isinstance(preflight, PaperStageResult):
             return preflight
         manifest, _, _, _ = preflight
