@@ -13,7 +13,7 @@ class DataContractError(ValueError):
 
 @dataclass(frozen=True)
 class ForecastMatrix:
-    """Daily forecast samples with 168 observed hours and 24 forecast hours."""
+    """Daily samples issued at 00:00 with 168 observed and 24 target hours."""
 
     origins: np.ndarray
     target_times: np.ndarray

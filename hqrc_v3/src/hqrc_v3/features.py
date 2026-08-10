@@ -181,7 +181,7 @@ def build_daily_forecast_matrix(
         [timestamps[start : start + 24] for start in valid_starts], axis=0
     )
     return ForecastMatrix(
-        origins=timestamps[valid_starts] - np.timedelta64(1, "h"),
+        origins=timestamps[valid_starts],
         target_times=target_times,
         history=history,
         future=future,
