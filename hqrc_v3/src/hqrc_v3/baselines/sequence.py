@@ -462,6 +462,7 @@ def _deterministic_cpu_context(seed: int) -> Iterator[None]:
     numpy_state = np.random.get_state()
     threads = torch.get_num_threads()
     deterministic = torch.are_deterministic_algorithms_enabled()
+    deterministic_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     with torch.random.fork_rng(devices=[]):
         try:
             random.seed(seed)
@@ -471,7 +472,9 @@ def _deterministic_cpu_context(seed: int) -> Iterator[None]:
             torch.use_deterministic_algorithms(True)
             yield
         finally:
-            torch.use_deterministic_algorithms(deterministic)
+            torch.use_deterministic_algorithms(
+                deterministic, warn_only=deterministic_warn_only
+            )
             torch.set_num_threads(threads)
             random.setstate(python_state)
             np.random.set_state(numpy_state)

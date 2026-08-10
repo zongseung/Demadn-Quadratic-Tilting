@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import hqrc_v3.baselines.sequence as sequence
 import numpy as np
 import pytest
 import torch
@@ -48,6 +49,20 @@ def _change_feature_schema(matrix, stream, change):
         matrix,
         **{f"{stream}_columns": (f"renamed_{columns[0]}", *columns[1:])},
     )
+
+
+@pytest.mark.parametrize(("enabled", "warn_only"), [(True, True), (False, False)])
+def test_deterministic_context_restores_caller_determinism_mode(enabled, warn_only):
+    original_enabled = torch.are_deterministic_algorithms_enabled()
+    original_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+        with sequence._deterministic_cpu_context(seed=3):
+            assert torch.are_deterministic_algorithms_enabled()
+        assert torch.are_deterministic_algorithms_enabled() is enabled
+        assert torch.is_deterministic_algorithms_warn_only_enabled() is warn_only
+    finally:
+        torch.use_deterministic_algorithms(original_enabled, warn_only=original_warn_only)
 
 
 @pytest.mark.parametrize("model_cls", [Seq2SeqLSTM, TimeSeriesTransformer])
