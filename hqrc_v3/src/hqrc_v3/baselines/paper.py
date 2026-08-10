@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 import tempfile
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -17,7 +18,11 @@ from typing import Any, Literal
 import numpy as np
 import polars as pl
 
-from hqrc_v3.baselines.classical import ClassicalBaseline, make_classical_baseline
+from hqrc_v3.baselines.classical import (
+    ClassicalBaseline,
+    make_classical_baseline,
+    predictions_to_frame,
+)
 from hqrc_v3.baselines.config import (
     MODEL_NAMES,
     PAPER_SEEDS,
@@ -42,7 +47,12 @@ from hqrc_v3.oof import (
 )
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
 from hqrc_v3.residuals import PredictionCache
-from hqrc_v3.splits import AnnualFold, expanding_oof_folds, final_fold
+from hqrc_v3.splits import (
+    AnnualFold,
+    expanding_oof_folds,
+    final_fold,
+    select_fold_samples,
+)
 
 ENSEMBLE_SEED = 0
 PAPER_HASH_KEYS = (
@@ -55,6 +65,26 @@ PAPER_HASH_KEYS = (
 _FEATURE_SETS: tuple[FeatureSet, ...] = ("B0", "B1")
 _NEURAL_MODELS = frozenset(("seq2seq_lstm", "transformer"))
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_TRANSACTION_NAME = ".baseline-transaction.json"
+_COVERAGE_COLUMNS = (
+    "origin",
+    "target_timestamp",
+    "horizon",
+    "split_id",
+    "observed_mw",
+)
+_MANIFEST_IDENTITY_KEYS = {
+    "schema_version",
+    "profile",
+    "input_hashes",
+    "models",
+    "feature_sets",
+    "classical_seed",
+    "neural_seeds",
+    "ensemble_seed",
+    "feature_schemas",
+    "execution_overrides",
+}
 _FactoryBuilder = Callable[..., BaselineFactory]
 
 
@@ -203,18 +233,24 @@ def _matrix_contracts(
         raise DataContractError("matrices must contain exactly the selected feature sets")
     normalized: dict[FeatureSet, ForecastMatrix] = {}
     schemas: dict[str, dict[str, list[str]]] = {}
+    reference_origins: np.ndarray | None = None
     reference_times: np.ndarray | None = None
     reference_target: np.ndarray | None = None
     for feature_set in feature_sets:
         matrix = matrices[feature_set]
         schemas[feature_set] = _feature_schema(matrix, feature_set)
         if reference_times is None:
+            reference_origins = matrix.origins
             reference_times = matrix.target_times
             reference_target = matrix.target
-        elif not np.array_equal(matrix.target_times, reference_times) or not np.array_equal(
-            matrix.target, reference_target
+        elif (
+            not np.array_equal(matrix.origins, reference_origins)
+            or not np.array_equal(matrix.target_times, reference_times)
+            or not np.array_equal(matrix.target, reference_target)
         ):
-            raise DataContractError("B0 and B1 matrices must share target timestamps and values")
+            raise DataContractError(
+                "B0 and B1 matrix coverage keys or observed values differ"
+            )
         normalized[feature_set] = matrix
     return normalized, schemas
 
@@ -440,6 +476,75 @@ def _expected_combinations(
     return combinations
 
 
+def _coverage_record(frame: pl.DataFrame) -> dict[str, object]:
+    if tuple(frame.columns) != _COVERAGE_COLUMNS or frame.is_empty():
+        raise DataContractError("expected prediction coverage must be non-empty and exact")
+    normalized = frame.select(
+        pl.col("origin").cast(pl.Datetime("ns"), strict=True),
+        pl.col("target_timestamp").cast(pl.Datetime("ns"), strict=True),
+        pl.col("horizon").cast(pl.Int64, strict=True),
+        pl.col("split_id").cast(pl.String, strict=True),
+        pl.col("observed_mw").cast(pl.Float64, strict=True),
+    )
+    if any(normalized[column].null_count() for column in _COVERAGE_COLUMNS):
+        raise DataContractError("expected prediction coverage must not contain nulls")
+    if not normalized["observed_mw"].is_finite().all():
+        raise DataContractError("expected prediction coverage values must be finite")
+    canonical = (
+        normalized.with_columns(
+            pl.col("origin").cast(pl.Int64),
+            pl.col("target_timestamp").cast(pl.Int64),
+        )
+        .sort("split_id", "origin", "target_timestamp", "horizon")
+    )
+    digest = hashlib.sha256()
+    for origin, target, horizon, split_id, observed in canonical.iter_rows():
+        encoded_split = split_id.encode("utf-8")
+        digest.update(
+            struct.pack(">qqqI", origin, target, horizon, len(encoded_split))
+        )
+        digest.update(encoded_split)
+        digest.update(struct.pack(">d", observed))
+    return {"count": canonical.height, "sha256": digest.hexdigest()}
+
+
+def _expected_stage_coverage(
+    matrix: ForecastMatrix, folds: tuple[AnnualFold, ...]
+) -> dict[str, object]:
+    frames: list[pl.DataFrame] = []
+    for fold in folds:
+        _, evaluation_indices = select_fold_samples(matrix, fold)
+        if evaluation_indices.size == 0:
+            raise DataContractError(
+                f"{fold.split_id} requires non-empty expected prediction coverage"
+            )
+        evaluation = matrix.take(evaluation_indices)
+        frames.append(
+            predictions_to_frame(
+                evaluation,
+                evaluation.target,
+                model="expected-coverage",
+                feature_set="expected-coverage",
+                seed=0,
+                fold=fold,
+            ).select(_COVERAGE_COLUMNS)
+        )
+    return _coverage_record(pl.concat(frames, how="vertical"))
+
+
+def _require_expected_coverage(value: object) -> dict[str, object]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"count", "sha256"}
+        or type(value.get("count")) is not int
+        or value["count"] <= 0
+        or not isinstance(value.get("sha256"), str)
+        or _SHA256.fullmatch(value["sha256"]) is None
+    ):
+        raise ArtifactMismatch("expected coverage manifest is invalid")
+    return value
+
+
 def _validate_published_frames(
     members: pl.DataFrame,
     point: pl.DataFrame,
@@ -449,11 +554,13 @@ def _validate_published_frames(
     split_ids: tuple[str, ...],
     eval_years: tuple[int, ...],
     classical_seed: int,
+    expected_coverage: Mapping[str, object],
 ) -> None:
     members = _validated_groups(members, description="member")
     point = _validated_groups(point, description="point")
     if point.is_empty():
         raise ArtifactMismatch("point prediction publication must not be empty")
+    normalized_coverage = _require_expected_coverage(dict(expected_coverage))
 
     def combinations(frame: pl.DataFrame) -> set[tuple[str, str, int, str]]:
         if frame.is_empty():
@@ -480,6 +587,26 @@ def _validate_published_frames(
         members=True,
     ):
         raise ArtifactMismatch("member model, feature, seed, or split identities differ")
+
+    def validate_stream_coverage(frame: pl.DataFrame, *, description: str) -> None:
+        if frame.is_empty():
+            return
+        for stream in frame.partition_by(
+            ["model", "feature_set", "seed"], maintain_order=True
+        ):
+            try:
+                actual = _coverage_record(stream.select(_COVERAGE_COLUMNS))
+            except (DataContractError, TypeError, ValueError) as error:
+                raise ArtifactMismatch(
+                    f"{description} prediction coverage is invalid: {error}"
+                ) from error
+            if actual != normalized_coverage:
+                raise ArtifactMismatch(
+                    f"{description} prediction coverage differs from expected coverage"
+                )
+
+    validate_stream_coverage(point, description="point")
+    validate_stream_coverage(members, description="member")
     if set(point["target_timestamp"].dt.year()) != set(eval_years):
         raise ArtifactMismatch("prediction evaluation years differ from the stage contract")
     if not members.is_empty() and set(members["target_timestamp"].dt.year()) != set(
@@ -542,17 +669,27 @@ def _validate_completed_stage(
     split_ids: tuple[str, ...],
     eval_years: tuple[int, ...],
     classical_seed: int,
+    expected_coverage: Mapping[str, object],
 ) -> tuple[Path, Path]:
     record = manifest["stages"].get(stage)
     if not isinstance(record, dict):
         raise ArtifactMismatch(f"partial {stage} baseline publication")
-    required = {"artifacts", "eval_years", "split_ids", "streams"}
+    required = {
+        "artifacts",
+        "eval_years",
+        "expected_coverage",
+        "split_ids",
+        "streams",
+    }
     if set(record) != required:
         raise ArtifactMismatch(f"{stage} stage manifest is invalid")
     if record["eval_years"] != list(eval_years) or record["split_ids"] != list(split_ids):
         raise ArtifactMismatch(f"{stage} fold identities differ from the manifest")
     if record["streams"] != _stream_records(models, feature_sets, classical_seed):
         raise ArtifactMismatch(f"{stage} model streams differ from the manifest")
+    recorded_coverage = _require_expected_coverage(record["expected_coverage"])
+    if recorded_coverage != dict(expected_coverage):
+        raise ArtifactMismatch(f"{stage} expected coverage differs from the supplied matrix")
     members_path, point_path = _verify_artifact_hashes(run_dir, stage, record)
     _validate_published_frames(
         _read_parquet(members_path, description=f"{stage} member"),
@@ -562,6 +699,7 @@ def _validate_completed_stage(
         split_ids=split_ids,
         eval_years=eval_years,
         classical_seed=classical_seed,
+        expected_coverage=expected_coverage,
     )
     return members_path, point_path
 
@@ -611,6 +749,236 @@ def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
 
+class _RecoveryImpossible(Exception):
+    """Signal that a valid interrupted transaction must be rolled back."""
+
+
+def _write_fsynced(path: Path, payload: bytes) -> None:
+    with path.open("wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _write_atomic_canonical_json(path: Path, value: Mapping[str, Any]) -> None:
+    temporary = _temporary_path(path.parent, ".atomic.json")
+    try:
+        _write_fsynced(temporary, _canonical_json_bytes(value))
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _safe_journal_child(directory: Path, name: object) -> Path:
+    if (
+        not isinstance(name, str)
+        or not name
+        or Path(name).is_absolute()
+        or Path(name).parts != (name,)
+        or name in {".", ".."}
+    ):
+        raise ArtifactMismatch("unsafe publication journal path")
+    path = directory / name
+    if path.parent.resolve() != directory.resolve() or path.is_symlink():
+        raise ArtifactMismatch("unsafe publication journal path")
+    return path
+
+
+def _require_transaction_manifest(value: object, *, description: str) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {*_MANIFEST_IDENTITY_KEYS, "stages"}
+        or not isinstance(value.get("stages"), dict)
+        or not set(value["stages"]).issubset({"oof", "final"})
+    ):
+        raise ArtifactMismatch(f"publication journal {description} manifest is invalid")
+    return value
+
+
+def _load_transaction(
+    directory: Path,
+) -> tuple[dict[str, Any], dict[str, Path]] | None:
+    journal_path = directory / _TRANSACTION_NAME
+    if journal_path.is_symlink():
+        raise ArtifactMismatch("unsafe publication journal path")
+    if not journal_path.exists():
+        return None
+    if not journal_path.is_file():
+        raise ArtifactMismatch("publication journal is invalid")
+    try:
+        payload = journal_path.read_bytes()
+        raw = json.loads(payload)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ArtifactMismatch("publication journal is invalid") from error
+    required = {
+        "schema_version",
+        "stage",
+        "members",
+        "point",
+        "manifest",
+        "intended_manifest",
+        "prior_manifest",
+    }
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != required
+        or type(raw.get("schema_version")) is not int
+        or raw["schema_version"] != 1
+        or raw.get("stage") not in {"oof", "final"}
+    ):
+        raise ArtifactMismatch("publication journal schema is invalid")
+    try:
+        if payload != _canonical_json_bytes(raw):
+            raise ArtifactMismatch("publication journal is not canonical")
+    except (TypeError, ValueError) as error:
+        raise ArtifactMismatch("publication journal is invalid") from error
+
+    stage: Literal["oof", "final"] = raw["stage"]
+    expected_members, expected_point, expected_manifest = _artifact_paths(
+        directory.parent, stage
+    )
+    expected_finals = {
+        "members": expected_members.name,
+        "point": expected_point.name,
+        "manifest": expected_manifest.name,
+    }
+    expected_suffixes = {
+        "members": ".members.parquet",
+        "point": ".point.parquet",
+        "manifest": ".manifest.json",
+    }
+    paths: dict[str, Path] = {"journal": journal_path}
+    temporary_names: set[str] = set()
+    for component in ("members", "point", "manifest"):
+        entry = raw[component]
+        if not isinstance(entry, dict) or set(entry) != {"temp", "final", "sha256"}:
+            raise ArtifactMismatch(f"publication journal {component} entry is invalid")
+        temporary = entry["temp"]
+        final = entry["final"]
+        digest = entry["sha256"]
+        temporary_path = _safe_journal_child(directory, temporary)
+        final_path = _safe_journal_child(directory, final)
+        if (
+            not temporary.startswith(".baseline.")
+            or not temporary.endswith(expected_suffixes[component])
+            or temporary in temporary_names
+            or final != expected_finals[component]
+            or not isinstance(digest, str)
+            or _SHA256.fullmatch(digest) is None
+        ):
+            raise ArtifactMismatch(f"publication journal {component} entry is invalid")
+        temporary_names.add(temporary)
+        paths[f"{component}_temp"] = temporary_path
+        paths[f"{component}_final"] = final_path
+
+    intended = _require_transaction_manifest(
+        raw["intended_manifest"], description="intended"
+    )
+    prior_value = raw["prior_manifest"]
+    prior = (
+        None
+        if prior_value is None
+        else _require_transaction_manifest(prior_value, description="prior")
+    )
+    intended_stage = intended["stages"].get(stage)
+    if not isinstance(intended_stage, dict):
+        raise ArtifactMismatch("publication journal intended stage is invalid")
+    prior_stages = {} if prior is None else prior["stages"]
+    if stage in prior_stages:
+        raise ArtifactMismatch("publication journal prior stage is invalid")
+    for name in _MANIFEST_IDENTITY_KEYS:
+        if prior is not None and prior[name] != intended[name]:
+            raise ArtifactMismatch("publication journal manifest identity differs")
+    if {
+        name: record for name, record in intended["stages"].items() if name != stage
+    } != prior_stages:
+        raise ArtifactMismatch("publication journal does not preserve prior stages")
+    artifacts = intended_stage.get("artifacts")
+    expected_artifacts = {
+        "members": {
+            "path": f"predictions/{expected_members.name}",
+            "sha256": raw["members"]["sha256"],
+        },
+        "point": {
+            "path": f"predictions/{expected_point.name}",
+            "sha256": raw["point"]["sha256"],
+        },
+    }
+    if artifacts != expected_artifacts:
+        raise ArtifactMismatch("publication journal artifact binding is invalid")
+    if hashlib.sha256(_canonical_json_bytes(intended)).hexdigest() != raw["manifest"][
+        "sha256"
+    ]:
+        raise ArtifactMismatch("publication journal manifest hash differs")
+    return raw, paths
+
+
+def _matches_digest(path: Path, digest: str) -> bool:
+    return path.is_file() and not path.is_symlink() and file_sha256(path) == digest
+
+
+def _recover_component(
+    *, temporary: Path, final: Path, digest: str, description: str
+) -> None:
+    if _matches_digest(final, digest):
+        if temporary.exists():
+            if not temporary.is_file() or temporary.is_symlink():
+                raise _RecoveryImpossible(description)
+            temporary.unlink()
+        return
+    if not _matches_digest(temporary, digest):
+        raise _RecoveryImpossible(description)
+    if final.exists() and (not final.is_file() or final.is_symlink()):
+        raise _RecoveryImpossible(description)
+    os.replace(temporary, final)
+
+
+def _unlink_transaction_file(path: Path) -> None:
+    if path.exists():
+        if not path.is_file() or path.is_symlink():
+            raise ArtifactMismatch("publication transaction path is invalid")
+        path.unlink()
+
+
+def _rollback_transaction(
+    directory: Path, transaction: Mapping[str, Any], paths: Mapping[str, Path]
+) -> None:
+    for component in ("members", "point"):
+        _unlink_transaction_file(paths[f"{component}_temp"])
+        _unlink_transaction_file(paths[f"{component}_final"])
+    _unlink_transaction_file(paths["manifest_temp"])
+    manifest_path = paths["manifest_final"]
+    prior = transaction["prior_manifest"]
+    if prior is None:
+        _unlink_transaction_file(manifest_path)
+    else:
+        _write_atomic_canonical_json(manifest_path, prior)
+    _fsync_directory(directory)
+    _unlink_transaction_file(paths["journal"])
+    _fsync_directory(directory)
+
+
+def _recover_publication(directory: Path) -> None:
+    loaded = _load_transaction(directory)
+    if loaded is None:
+        return
+    transaction, paths = loaded
+    try:
+        for component in ("members", "point", "manifest"):
+            _recover_component(
+                temporary=paths[f"{component}_temp"],
+                final=paths[f"{component}_final"],
+                digest=transaction[component]["sha256"],
+                description=component,
+            )
+        _fsync_directory(directory)
+        _unlink_transaction_file(paths["journal"])
+        _fsync_directory(directory)
+    except _RecoveryImpossible:
+        _rollback_transaction(directory, transaction, paths)
+
+
 def _publish_stage(
     *,
     run_dir: Path,
@@ -625,15 +993,21 @@ def _publish_stage(
     members_temp = _temporary_path(directory, ".members.parquet")
     point_temp = _temporary_path(directory, ".point.parquet")
     manifest_temp = _temporary_path(directory, ".manifest.json")
-    old_manifest = manifest_path.read_bytes() if manifest_path.is_file() else None
-    published: list[Path] = []
-    manifest_published = False
+    journal_path = directory / _TRANSACTION_NAME
+    prior_manifest = (
+        json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest_path.is_file()
+        else None
+    )
+    transaction: dict[str, Any] | None = None
+    paths: dict[str, Path] | None = None
     try:
         members.write_parquet(members_temp)
         point.write_parquet(point_temp)
         _fsync_file(members_temp)
         _fsync_file(point_temp)
-        stage_record["artifacts"] = {
+        intended_record = json.loads(_canonical_json_bytes(stage_record))
+        intended_record["artifacts"] = {
             "members": {
                 "path": members_path.relative_to(run_dir).as_posix(),
                 "sha256": file_sha256(members_temp),
@@ -643,40 +1017,54 @@ def _publish_stage(
                 "sha256": file_sha256(point_temp),
             },
         }
-        manifest["stages"][stage] = stage_record
-        with manifest_temp.open("wb") as stream:
-            stream.write(_canonical_json_bytes(manifest))
-            stream.flush()
-            os.fsync(stream.fileno())
+        intended_manifest = json.loads(_canonical_json_bytes(manifest))
+        intended_manifest["stages"][stage] = intended_record
+        manifest_payload = _canonical_json_bytes(intended_manifest)
+        _write_fsynced(manifest_temp, manifest_payload)
+        transaction = {
+            "schema_version": 1,
+            "stage": stage,
+            "members": {
+                "temp": members_temp.name,
+                "final": members_path.name,
+                "sha256": intended_record["artifacts"]["members"]["sha256"],
+            },
+            "point": {
+                "temp": point_temp.name,
+                "final": point_path.name,
+                "sha256": intended_record["artifacts"]["point"]["sha256"],
+            },
+            "manifest": {
+                "temp": manifest_temp.name,
+                "final": manifest_path.name,
+                "sha256": hashlib.sha256(manifest_payload).hexdigest(),
+            },
+            "intended_manifest": intended_manifest,
+            "prior_manifest": prior_manifest,
+        }
+        _write_atomic_canonical_json(journal_path, transaction)
+        loaded = _load_transaction(directory)
+        if loaded is None:  # pragma: no cover - atomic writer guarantees existence
+            raise ArtifactMismatch("publication journal disappeared")
+        _, paths = loaded
         os.replace(members_temp, members_path)
-        published.append(members_path)
         _publication_boundary(f"{stage}-members-published")
         os.replace(point_temp, point_path)
-        published.append(point_path)
         _publication_boundary(f"{stage}-point-published")
         os.replace(manifest_temp, manifest_path)
-        manifest_published = True
+        _publication_boundary(f"{stage}-manifest-published")
+        _fsync_directory(directory)
+        journal_path.unlink()
         _fsync_directory(directory)
     except Exception:
-        members_temp.unlink(missing_ok=True)
-        point_temp.unlink(missing_ok=True)
-        manifest_temp.unlink(missing_ok=True)
-        for path in published:
-            path.unlink(missing_ok=True)
-        if manifest_published:
-            if old_manifest is None:
-                manifest_path.unlink(missing_ok=True)
-            else:
-                restore = _temporary_path(directory, ".restore.json")
-                try:
-                    with restore.open("wb") as stream:
-                        stream.write(old_manifest)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    os.replace(restore, manifest_path)
-                finally:
-                    restore.unlink(missing_ok=True)
-        _fsync_directory(directory)
+        if transaction is not None and paths is not None:
+            _rollback_transaction(directory, transaction, paths)
+        else:
+            members_temp.unlink(missing_ok=True)
+            point_temp.unlink(missing_ok=True)
+            manifest_temp.unlink(missing_ok=True)
+            journal_path.unlink(missing_ok=True)
+            _fsync_directory(directory)
         raise
     return members_path, point_path, manifest_path
 
@@ -691,21 +1079,31 @@ def _stage_preflight(
     split_ids: tuple[str, ...],
     eval_years: tuple[int, ...],
     classical_seed: int,
+    expected_coverage: Mapping[str, object],
     profile: Literal["paper", "smoke"],
 ) -> PaperStageResult | tuple[dict[str, Any], Path, Path, Path]:
     members_path, point_path, manifest_path = _artifact_paths(run_dir, stage)
     manifest = _load_manifest(manifest_path, identity)
-    all_products = [
-        run_dir / "predictions/oof_members.parquet",
-        run_dir / "predictions/oof.parquet",
-        run_dir / "predictions/final_2024_members.parquet",
-        run_dir / "predictions/final_2024.parquet",
-    ]
+    stage_products = {
+        name: _artifact_paths(run_dir, name)[:2] for name in ("oof", "final")
+    }
+    all_products = [path for products in stage_products.values() for path in products]
     if manifest is None:
-        if any(path.exists() for path in all_products):
+        if any(path.exists() or path.is_symlink() for path in all_products):
             raise ArtifactMismatch("partial baseline publication without a manifest")
         manifest = {**identity, "stages": {}}
     else:
+        for recorded_stage, products in stage_products.items():
+            present = [path.is_file() and not path.is_symlink() for path in products]
+            exists = [path.exists() or path.is_symlink() for path in products]
+            if recorded_stage not in manifest["stages"] and any(exists):
+                raise ArtifactMismatch(
+                    f"orphan {recorded_stage} baseline publication"
+                )
+            if recorded_stage in manifest["stages"] and not all(present):
+                raise ArtifactMismatch(
+                    f"partial {recorded_stage} baseline publication"
+                )
         for recorded_stage, record in manifest["stages"].items():
             _verify_artifact_hashes(run_dir, recorded_stage, record)
     stage_exists = members_path.exists() or point_path.exists() or stage in manifest["stages"]
@@ -722,6 +1120,7 @@ def _stage_preflight(
         split_ids=split_ids,
         eval_years=eval_years,
         classical_seed=classical_seed,
+        expected_coverage=expected_coverage,
     )
     units = _expected_fit_units(models, feature_sets, len(split_ids))
     return PaperStageResult(
@@ -801,6 +1200,9 @@ def _run_paper_stage(
         raise DataContractError("paper OOF publication requires all four immutable folds")
     split_ids = tuple(fold.split_id for fold in folds)
     eval_years = tuple(fold.eval_year for fold in folds)
+    expected_coverage = _expected_stage_coverage(
+        normalized_matrices[selected_features[0]], folds
+    )
     identity = _manifest_identity(
         profile=profile,
         hashes=hashes,
@@ -814,6 +1216,7 @@ def _run_paper_stage(
     cache = PredictionCache(Path(cache_dir))
     predictions_dir = run / "predictions"
     with _publication_lock(predictions_dir):
+        _recover_publication(predictions_dir)
         preflight = _stage_preflight(
             run_dir=run,
             stage=stage,
@@ -823,6 +1226,7 @@ def _run_paper_stage(
             split_ids=split_ids,
             eval_years=eval_years,
             classical_seed=classical_seed,
+            expected_coverage=expected_coverage,
             profile=profile,
         )
         if isinstance(preflight, PaperStageResult):
@@ -903,9 +1307,11 @@ def _run_paper_stage(
             split_ids=split_ids,
             eval_years=eval_years,
             classical_seed=classical_seed,
+            expected_coverage=expected_coverage,
         )
         stage_record: dict[str, Any] = {
             "eval_years": list(eval_years),
+            "expected_coverage": expected_coverage,
             "split_ids": list(split_ids),
             "streams": _stream_records(
                 selected_models, selected_features, classical_seed

@@ -41,16 +41,22 @@ predictions/final_2024.parquet
 predictions/baseline_manifest.json
 ```
 
-The group publisher holds an advisory lock, fsyncs staged Parquet/JSON files,
-publishes the manifest last, and rolls back newly visible files after an injected
-boundary failure. On reuse, it reloads and semantically validates the complete
-publication before returning a cache hit.
+The group publisher holds an advisory lock and writes a canonical, fsynced
+transaction journal before replacing any staged Parquet/JSON file. Stage entry
+recovers a verified interrupted commit or rolls it back to the embedded prior
+manifest before making cache-hit decisions. Journal paths are restricted to exact
+basenames in the predictions directory. Ordinary failures roll back immediately;
+abrupt termination after members, point, or manifest replacement is recoverable.
+Prior completed stages are preserved, and unmanifested OOF/final products fail as
+orphans rather than being ignored.
 
 The manifest and stream metadata bind separate SHA-256 identities for raw data,
 experiment config, frozen model config, event registry, and holiday calendar. They
 also bind feature-column names/order, selected models/features, classical seed,
-five neural seeds, ensemble identity, profile, smoke overrides, folds, and output
-digests. Tests demonstrate fail-closed handling of:
+five neural seeds, ensemble identity, profile, smoke overrides, folds, exact
+matrix-derived prediction coverage, and output digests. Every member and point
+stream must match the complete `(origin, target_timestamp, horizon, split_id,
+observed_mw)` set. Tests demonstrate fail-closed handling of:
 
 - any one of the five changed input hashes;
 - partial public artifacts or a partial stream cache pair;
@@ -58,14 +64,19 @@ digests. Tests demonstrate fail-closed handling of:
 - a hash-rebound wrong model identity;
 - a hash-rebound changed neural seed set;
 - a changed/reordered feature schema;
-- an interrupted multi-file publication.
+- uniform missing, extra, duplicate, misaligned, or changed-observation coverage;
+- an interrupted multi-file publication or unsafe journal path.
 
 ## CLI and real-data path
 
 Both concrete CLI handlers validate the experiment, correction event registry,
 holiday calendar, and frozen model registry; audit the hourly source; independently
 construct the selected B0/B1 matrices; calculate all five input hashes; and invoke
-the shared cache/publication stage. No handler invokes the tuning boundary.
+the shared cache/publication stage. Paper CLI execution requires the exact
+2019-01-01 00:00 through 2024-10-31 23:00 range and 51,144 rows before feature
+construction; only the explicit smoke profile is relaxed. No handler invokes the
+tuning boundary. README commands declare repository-root execution and consistently
+use `uv run --project hqrc_v3 hqrc ...`.
 
 The opt-in real smoke audited the 51,144-row source and executed actual LightGBM-B1
 for OOF 2020 with three boosting rounds. It traversed the same loader, frozen
@@ -91,10 +102,34 @@ no fallback estimator was used.
 - Full Ruff: `All checks passed!` for `hqrc_v3/src` and `hqrc_v3/tests`.
 - `git diff --check`: clean.
 
+### Fix round 1
+
+- Fixed-bound RED: a shortened continuous source reached feature construction,
+  and the paper CLI passed `None` audit bounds. Exact paper bounds now fail before
+  features/publication; smoke remains explicitly relaxed.
+- Publication RED: all three abrupt replacement boundaries lacked a durable
+  journal, an interrupted rerun stranded partial files, orphan final products were
+  accepted during an OOF cache hit, and an unsafe journal was ignored. The final
+  tests also remove a required staged file and prove deterministic rollback plus
+  zero-refit republication from the immutable stream caches.
+- Coverage RED: the manifest lacked expected coverage; uniformly truncated and
+  changed-observation products could be rehashed into cache hits; changed supplied
+  targets and divergent B0/B1 origins were not rebound on reload.
+- README RED: commands mixed `uv run hqrc` and bare `hqrc` despite retaining paths
+  relative to the repository root.
+- Expanded focused suite: `47 passed` in 33.15 seconds.
+- Full fast suite: `340 passed, 5 deselected` in 40.19 seconds; only the existing
+  47 tiny-draw ArviZ/runtime warnings were emitted.
+- Real verification: the paper-stage LightGBM smoke passed (`1 passed` in 1.51
+  seconds), and the existing real-data smoke passed (`1 passed` in 1.29 seconds).
+- Full Ruff: `All checks passed!`; `git diff --check`: clean.
+
 ## Commits
 
 - `f857e04 feat(hqrc-v3): freeze paper baseline factories`
 - `4fad1ce feat(hqrc-v3): execute frozen paper baselines`
+- `c4a30ec docs(hqrc-v3): report Task 11 verification`
+- `fix(hqrc-v3): harden paper baseline execution` (fix round 1)
 
 The protected workspace-local `hqrc_v3/uv.lock` was not staged or modified and
 remains the only untracked path.

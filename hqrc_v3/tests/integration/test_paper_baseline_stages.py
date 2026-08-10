@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,7 @@ import polars as pl
 import pytest
 from hqrc_v3.baselines.config import MODEL_NAMES, PAPER_SEEDS, load_paper_baselines
 from hqrc_v3.baselines.paper import run_paper_final_stage, run_paper_oof_stage
-from hqrc_v3.contracts import ForecastMatrix
+from hqrc_v3.contracts import DataContractError, ForecastMatrix
 from hqrc_v3.features import feature_columns
 from hqrc_v3.oof import cache_key
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
@@ -30,6 +31,10 @@ HASHES = {
     "event_registry_sha256": "d" * 64,
     "holiday_calendar_sha256": "e" * 64,
 }
+
+
+class AbruptPublicationStop(BaseException):
+    """Simulate process death, which ordinary Exception cleanup cannot catch."""
 
 
 def _matrix(feature_set: str) -> ForecastMatrix:
@@ -57,6 +62,49 @@ def _matrix(feature_set: str) -> ForecastMatrix:
         history_columns=("load_mw",),
         future_columns=columns,
     )
+
+
+def _write_short_cli_source(tmp_path: Path) -> Path:
+    timestamps = pl.datetime_range(
+        pl.datetime(2019, 1, 1),
+        pl.datetime(2019, 1, 10, 23),
+        interval="1h",
+        eager=True,
+    )
+    source = tmp_path / "source.csv"
+    pl.DataFrame(
+        {
+            "일시": timestamps,
+            "hm": np.full(len(timestamps), 50.0),
+            "ta": np.full(len(timestamps), 15.0),
+            "power demand(MW)": np.full(len(timestamps), 100.0),
+        }
+    ).write_csv(source)
+    return source
+
+
+def _baseline_cli_arguments(source: Path, tmp_path: Path) -> list[str]:
+    return [
+        "generate-oof",
+        "--data",
+        str(source),
+        "--config",
+        str(PROJECT_ROOT / "configs/experiment.toml"),
+        "--frozen-model-config",
+        str(MODEL_CONFIG),
+        "--frozen-model-hash",
+        file_sha256(MODEL_CONFIG),
+        "--run-dir",
+        str(tmp_path / "run"),
+        "--cache-dir",
+        str(tmp_path / "cache"),
+        "--feature-set",
+        "all",
+        "--model",
+        "all",
+        "--seed",
+        "7",
+    ]
 
 
 @dataclass
@@ -127,6 +175,46 @@ def _rebind_artifact_hash(run: Path, *, stage: str, artifact: str, path: Path) -
         json.dumps(manifest, sort_keys=True, separators=(",", ":")),
         encoding="utf-8",
     )
+
+
+def _mutate_all_oof_coverage(run: Path, mutation: str) -> None:
+    paths = {
+        "members": run / "predictions/oof_members.parquet",
+        "point": run / "predictions/oof.parquet",
+    }
+    for artifact, path in paths.items():
+        frame = pl.read_parquet(path)
+        first_origin = frame["origin"].min()
+        if mutation == "missing":
+            changed = frame.filter(pl.col("origin") != first_origin)
+        elif mutation == "extra":
+            new_origin = datetime(2020, 1, 1)
+            extra = frame.filter(pl.col("origin") == first_origin).with_columns(
+                pl.lit(new_origin).cast(pl.Datetime("ns")).alias("origin"),
+                (
+                    pl.lit(new_origin).cast(pl.Datetime("ns"))
+                    + (pl.col("horizon") - 1) * pl.duration(hours=1)
+                ).alias("target_timestamp"),
+            )
+            changed = pl.concat((frame, extra), how="vertical_relaxed")
+        elif mutation == "duplicate":
+            duplicate = frame.filter(pl.col("origin") == first_origin)
+            changed = pl.concat((frame, duplicate), how="vertical")
+        elif mutation == "misaligned":
+            changed = frame.with_columns(
+                pl.when((pl.col("origin") == first_origin) & (pl.col("horizon") == 24))
+                .then(pl.col("target_timestamp") + pl.duration(minutes=30))
+                .otherwise(pl.col("target_timestamp"))
+                .alias("target_timestamp")
+            )
+        elif mutation == "observed":
+            changed = frame.with_columns(
+                (pl.col("observed_mw") + 0.25).alias("observed_mw")
+            )
+        else:  # pragma: no cover - test helper has a closed call set
+            raise AssertionError(mutation)
+        changed.write_parquet(path)
+        _rebind_artifact_hash(run, stage="oof", artifact=artifact, path=path)
 
 
 def test_oof_stage_publishes_exact_years_members_and_pointwise_means(tmp_path: Path) -> None:
@@ -244,6 +332,60 @@ def test_manifest_binds_inputs_models_seeds_feature_schemas_and_streams(tmp_path
     assert manifest["ensemble_seed"] == 0
     assert set(manifest["feature_schemas"]) == {"B0", "B1"}
     assert len(manifest["stages"]["oof"]["streams"]) == 10
+    assert manifest["stages"]["oof"]["expected_coverage"]["count"] == 5_952
+    assert len(manifest["stages"]["oof"]["expected_coverage"]["sha256"]) == 64
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing", "extra", "duplicate", "misaligned", "observed"]
+)
+def test_hash_rebound_uniform_coverage_tampering_never_becomes_a_cache_hit(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    _run_oof(tmp_path)
+    _mutate_all_oof_coverage(tmp_path, mutation)
+
+    with pytest.raises(
+        ArtifactMismatch, match="coverage|duplicate|target timestamp"
+    ):
+        _run_oof(tmp_path)
+
+
+def test_reload_recomputes_expected_coverage_from_the_supplied_matrix(tmp_path: Path) -> None:
+    _run_oof(tmp_path)
+    b0 = _matrix("B0")
+    b1 = _matrix("B1")
+    changed = {
+        "B0": replace(b0, target=b0.target + 1.0),
+        "B1": replace(b1, target=b1.target + 1.0),
+    }
+
+    with pytest.raises(ArtifactMismatch, match="expected coverage"):
+        run_paper_oof_stage(
+            matrices=changed,
+            config=load_paper_baselines(MODEL_CONFIG),
+            run_dir=tmp_path,
+            cache_dir=tmp_path / "stream-cache",
+            artifact_hashes=HASHES,
+            classical_seed=7,
+        )
+
+
+def test_reload_rejects_feature_matrix_with_different_coverage_keys(tmp_path: Path) -> None:
+    _run_oof(tmp_path)
+    b1 = _matrix("B1")
+    changed = replace(b1, origins=b1.origins + np.timedelta64(1, "h"))
+
+    with pytest.raises(ArtifactMismatch, match="coverage"):
+        run_paper_oof_stage(
+            matrices={"B0": _matrix("B0"), "B1": changed},
+            config=load_paper_baselines(MODEL_CONFIG),
+            run_dir=tmp_path,
+            cache_dir=tmp_path / "stream-cache",
+            artifact_hashes=HASHES,
+            classical_seed=7,
+        )
 
 
 @pytest.mark.parametrize("changed_hash", HASHES)
@@ -364,25 +506,162 @@ def test_failed_group_publication_leaves_no_partial_stage(
     assert not (tmp_path / "predictions/baseline_manifest.json").exists()
 
 
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "oof-members-published",
+        "oof-point-published",
+        "oof-manifest-published",
+    ],
+)
+def test_abrupt_publication_is_recovered_from_durable_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    def terminate_at(selected: str) -> None:
+        if selected == boundary:
+            raise AbruptPublicationStop(boundary)
+
+    monkeypatch.setattr(paper, "_publication_boundary", terminate_at)
+    with pytest.raises(AbruptPublicationStop, match=boundary):
+        _run_oof(tmp_path)
+    journal = tmp_path / "predictions/.baseline-transaction.json"
+    assert journal.is_file()
+    factories, builder = _recording_builder()
+    monkeypatch.setattr(paper, "_publication_boundary", lambda _: None)
+
+    recovered = _run_oof(tmp_path, factory_builder=builder)
+
+    assert recovered.fit_count == 0
+    assert recovered.cache_hit_count == 104
+    assert recovered.members_path.is_file()
+    assert recovered.point_path.is_file()
+    assert recovered.manifest_path.is_file()
+    assert not journal.exists()
+    assert all(factory.calls == [] for factory in factories.values())
+
+
+def test_unrecoverable_interrupted_transaction_rolls_back_and_republishes_from_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def terminate_after_members(boundary: str) -> None:
+        if boundary == "oof-members-published":
+            raise AbruptPublicationStop(boundary)
+
+    monkeypatch.setattr(paper, "_publication_boundary", terminate_after_members)
+    with pytest.raises(AbruptPublicationStop):
+        _run_oof(tmp_path)
+    journal_path = tmp_path / "predictions/.baseline-transaction.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    (journal_path.parent / journal["point"]["temp"]).unlink()
+    factories, builder = _recording_builder()
+    monkeypatch.setattr(paper, "_publication_boundary", lambda _: None)
+
+    recovered = _run_oof(tmp_path, factory_builder=builder)
+
+    assert recovered.fit_count == 0
+    assert recovered.cache_hit_count == 104
+    assert recovered.members_path.is_file()
+    assert recovered.point_path.is_file()
+    assert recovered.manifest_path.is_file()
+    assert not journal_path.exists()
+    assert all(factory.calls == [] for factory in factories.values())
+
+
+def test_abrupt_oof_recovery_preserves_a_completed_final_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, builder = _recording_builder()
+    final = run_paper_final_stage(
+        matrices={"B0": _matrix("B0"), "B1": _matrix("B1")},
+        config=load_paper_baselines(MODEL_CONFIG),
+        run_dir=tmp_path,
+        cache_dir=tmp_path / "stream-cache",
+        artifact_hashes=HASHES,
+        classical_seed=7,
+        factory_builder=builder,
+    )
+    final_hashes = (file_sha256(final.members_path), file_sha256(final.point_path))
+
+    def terminate_after_members(boundary: str) -> None:
+        if boundary == "oof-members-published":
+            raise AbruptPublicationStop(boundary)
+
+    monkeypatch.setattr(paper, "_publication_boundary", terminate_after_members)
+    with pytest.raises(AbruptPublicationStop):
+        _run_oof(tmp_path)
+    monkeypatch.setattr(paper, "_publication_boundary", lambda _: None)
+
+    _run_oof(tmp_path)
+
+    manifest = json.loads(final.manifest_path.read_text(encoding="utf-8"))
+    assert set(manifest["stages"]) == {"oof", "final"}
+    assert (file_sha256(final.members_path), file_sha256(final.point_path)) == final_hashes
+
+
+def test_orphan_final_products_are_not_ignored_by_oof_cache_hit(tmp_path: Path) -> None:
+    result = _run_oof(tmp_path)
+    predictions = tmp_path / "predictions"
+    (predictions / "final_2024_members.parquet").write_bytes(result.members_path.read_bytes())
+    (predictions / "final_2024.parquet").write_bytes(result.point_path.read_bytes())
+
+    with pytest.raises(ArtifactMismatch, match="orphan final"):
+        _run_oof(tmp_path)
+
+
+def test_publication_journal_rejects_path_traversal(tmp_path: Path) -> None:
+    predictions = tmp_path / "predictions"
+    predictions.mkdir()
+    intended_manifest = {
+        "schema_version": 1,
+        "profile": "paper",
+        "input_hashes": HASHES,
+        "models": list(MODEL_NAMES),
+        "feature_sets": ["B0", "B1"],
+        "classical_seed": 7,
+        "neural_seeds": list(PAPER_SEEDS),
+        "ensemble_seed": 0,
+        "feature_schemas": {},
+        "execution_overrides": {},
+        "stages": {},
+    }
+    journal = {
+        "schema_version": 1,
+        "stage": "oof",
+        "members": {
+            "temp": "../escape.parquet",
+            "final": "oof_members.parquet",
+            "sha256": "a" * 64,
+        },
+        "point": {
+            "temp": ".baseline.safe.point.parquet",
+            "final": "oof.parquet",
+            "sha256": "b" * 64,
+        },
+        "manifest": {
+            "temp": ".baseline.safe.manifest.json",
+            "final": "baseline_manifest.json",
+            "sha256": "c" * 64,
+        },
+        "intended_manifest": intended_manifest,
+        "prior_manifest": None,
+    }
+    (predictions / ".baseline-transaction.json").write_text(
+        json.dumps(journal, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+
+    with pytest.raises(ArtifactMismatch, match="unsafe.*journal path"):
+        _run_oof(tmp_path)
+
+
 def test_concrete_cli_loads_both_feature_matrices_and_hash_bound_inputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    timestamps = pl.datetime_range(
-        pl.datetime(2019, 1, 1),
-        pl.datetime(2019, 1, 10, 23),
-        interval="1h",
-        eager=True,
-    )
-    source = tmp_path / "source.csv"
-    pl.DataFrame(
-        {
-            "일시": timestamps,
-            "hm": np.full(len(timestamps), 50.0),
-            "ta": np.full(len(timestamps), 15.0),
-            "power demand(MW)": np.full(len(timestamps), 100.0),
-        }
-    ).write_csv(source)
+    source = _write_short_cli_source(tmp_path)
     captured: list[dict[str, object]] = []
 
     def record_stage(**kwargs: object) -> object:
@@ -391,29 +670,7 @@ def test_concrete_cli_loads_both_feature_matrices_and_hash_bound_inputs(
 
     monkeypatch.setattr(cli, "run_paper_oof_stage", record_stage)
 
-    result = cli.main(
-        [
-            "generate-oof",
-            "--data",
-            str(source),
-            "--config",
-            str(PROJECT_ROOT / "configs/experiment.toml"),
-            "--frozen-model-config",
-            str(MODEL_CONFIG),
-            "--frozen-model-hash",
-            file_sha256(MODEL_CONFIG),
-            "--run-dir",
-            str(tmp_path / "run"),
-            "--cache-dir",
-            str(tmp_path / "cache"),
-            "--feature-set",
-            "all",
-            "--model",
-            "all",
-            "--seed",
-            "7",
-        ]
-    )
+    result = cli.main([*_baseline_cli_arguments(source, tmp_path), "--profile", "smoke"])
 
     assert result == 0
     assert len(captured) == 1
@@ -430,3 +687,66 @@ def test_concrete_cli_loads_both_feature_matrices_and_hash_bound_inputs(
             PROJECT_ROOT / "configs/holiday_calendar.csv"
         ),
     }
+
+
+def test_paper_cli_rejects_short_source_before_feature_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = _write_short_cli_source(tmp_path)
+    feature_calls: list[object] = []
+    stage_calls: list[object] = []
+
+    def forbidden_features(*args: object, **kwargs: object) -> object:
+        feature_calls.append((args, kwargs))
+        raise AssertionError("feature construction must follow the fixed paper audit")
+
+    monkeypatch.setattr(cli, "attach_calendar_features", forbidden_features)
+    monkeypatch.setattr(cli, "run_paper_oof_stage", stage_calls.append)
+
+    assert cli.main(_baseline_cli_arguments(source, tmp_path)) == 2
+    assert feature_calls == []
+    assert stage_calls == []
+    assert "expected 51144 hourly rows" in capsys.readouterr().err
+
+
+def test_paper_cli_passes_exact_fixed_bounds_to_the_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _write_short_cli_source(tmp_path)
+    received: list[dict[str, object]] = []
+
+    def record_and_stop(frame: object, **expected: object) -> object:
+        del frame
+        received.append(expected)
+        raise DataContractError("audit boundary observed")
+
+    monkeypatch.setattr(cli, "audit_hourly_data", record_and_stop)
+
+    assert cli.main(_baseline_cli_arguments(source, tmp_path)) == 2
+    assert received == [
+        {
+            "expected_start": datetime(2019, 1, 1),
+            "expected_end": datetime(2024, 10, 31, 23),
+            "expected_rows": 51_144,
+        }
+    ]
+
+
+def test_readme_hqrc_commands_are_executable_from_the_repository_root() -> None:
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "Run these commands from the repository root" in readme
+    for command in (
+        "generate-oof",
+        "fit-final-baselines",
+        "audit-data",
+        "diagnose-ar",
+        "approve-ar-calibration",
+        "report",
+    ):
+        assert f"uv run --project hqrc_v3 hqrc {command}" in readme
+    assert "uv run hqrc " not in readme
+    assert "\nhqrc " not in readme

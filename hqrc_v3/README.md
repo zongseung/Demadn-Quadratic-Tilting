@@ -7,13 +7,13 @@ path and no model substitution. XGBoost, LightGBM, and SVR fit 24 independent
 horizon estimators; both neural models jointly predict all 24 hours from observed
 history and known future covariates only.
 
-For a paper baseline run, calculate the model-config digest and run both stages with
-all models and both feature sets:
+Run these commands from the repository root. For a paper baseline run, calculate
+the model-config digest and run both stages with all models and both feature sets:
 
 ```text
 MODEL_SHA256=<sha256 of hqrc_v3/configs/model_spaces.toml>
 
-uv run hqrc generate-oof \
+uv run --project hqrc_v3 hqrc generate-oof \
   --data power_demand_final.csv \
   --config hqrc_v3/configs/experiment.toml \
   --frozen-model-config hqrc_v3/configs/model_spaces.toml \
@@ -24,7 +24,7 @@ uv run hqrc generate-oof \
   --cache-dir runs/RUN_ID/prediction-stream-cache \
   --model all --feature-set all --seed 7 --profile paper
 
-uv run hqrc fit-final-baselines \
+uv run --project hqrc_v3 hqrc fit-final-baselines \
   --data power_demand_final.csv \
   --config hqrc_v3/configs/experiment.toml \
   --frozen-model-config hqrc_v3/configs/model_spaces.toml \
@@ -63,7 +63,7 @@ schema, altered seed/model identity, or tampered publication fails closed.
 The opt-in real smoke uses the same LightGBM-B1 stage with a reduced round cap:
 
 ```text
-uv run hqrc generate-oof \
+uv run --project hqrc_v3 hqrc generate-oof \
   --data power_demand_final.csv \
   --config hqrc_v3/configs/experiment.toml \
   --frozen-model-config hqrc_v3/configs/model_spaces.toml \
@@ -81,10 +81,10 @@ and round overrides.
 Other concrete operator stages are:
 
 ```text
-hqrc audit-data --data power_demand_final.csv --fixed-bounds
-hqrc diagnose-ar --residuals runs/RUN_ID/inputs/standardized_residuals.parquet --output runs/RUN_ID/ar_diagnostics/proposed.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256 --through 2023
-hqrc approve-ar-calibration --proposal runs/RUN_ID/ar_diagnostics/proposed.json --output runs/RUN_ID/ar_diagnostics/approved.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256
-hqrc report --run-dir runs/RUN_ID --profile smoke
+uv run --project hqrc_v3 hqrc audit-data --data power_demand_final.csv --fixed-bounds
+uv run --project hqrc_v3 hqrc diagnose-ar --residuals runs/RUN_ID/inputs/standardized_residuals.parquet --output runs/RUN_ID/ar_diagnostics/proposed.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256 --through 2023
+uv run --project hqrc_v3 hqrc approve-ar-calibration --proposal runs/RUN_ID/ar_diagnostics/proposed.json --output runs/RUN_ID/ar_diagnostics/approved.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256
+uv run --project hqrc_v3 hqrc report --run-dir runs/RUN_ID --profile smoke
 ```
 
 Before `report`, the run must contain the strict version-2 reporting manifest and
@@ -94,5 +94,6 @@ event metrics, and sampler benchmark. Reporting reloads every digest and diagnos
 gate before writing `COMPLETE`. Only a full `paper` run satisfying posterior
 diagnostics may populate manuscript numbers.
 
-Run fast contracts with `pytest -m "not slow"`; real-data and sampler checks are
-opt-in under `pytest -m slow`.
+Run fast contracts from the repository root with
+`uv run --project hqrc_v3 pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests -m "not slow"`;
+real-data and sampler checks are opt-in under `pytest -m slow`.

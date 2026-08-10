@@ -91,12 +91,16 @@ def _paper_stage_inputs(arguments: argparse.Namespace) -> dict[str, object]:
         model_path,
         expected_sha256=arguments.frozen_model_hash,
     )
-    audited = audit_hourly_data(
-        read_hourly_data(data_path),
-        expected_start=None,
-        expected_end=None,
-        expected_rows=None,
+    paper_bounds = (
+        {
+            "expected_start": datetime.fromisoformat(_EXPECTED_START),
+            "expected_end": datetime.fromisoformat(_EXPECTED_END),
+            "expected_rows": _EXPECTED_ROWS,
+        }
+        if arguments.profile == "paper"
+        else {"expected_start": None, "expected_end": None, "expected_rows": None}
     )
+    audited = audit_hourly_data(read_hourly_data(data_path), **paper_bounds)
     featured = attach_calendar_features(audited, calendar)
     selected_features = (
         ("B0", "B1") if arguments.feature_set == "all" else (arguments.feature_set,)
