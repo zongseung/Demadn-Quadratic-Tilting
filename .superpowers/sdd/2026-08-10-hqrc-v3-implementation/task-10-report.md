@@ -24,6 +24,19 @@ and RSS/ESS/posterior-distance benchmarks; measured Arrow zero-copy and
 parallel-vs-serial measurements; and serialized HQRCData/frozen-model loaders for
 the correction, ablation, and sampler CLI routes.
 
+## Adapter tranche foundation (still incomplete)
+
+- Added `hqrc_v3.bayes.artifacts`: atomic, versioned NPZ plus strict JSON metadata
+  for `HQRCData`.  Its file digest, metadata digest, exact array names, JSON-safe
+  settings, occurrence IDs, `allow_pickle=False`, and reconstruction through
+  `HQRCData` prevent detached or tampered worker input.
+- `diagnose-ar` now compares the supplied residual SHA-256 to the bytes it reads and
+  rejects residual split rows later than its explicit `--through` boundary.
+
+This is only the safe-input foundation.  It does not yet provide the required
+process-isolated sampler worker, measured Arrow/parallel benchmarks, or concrete
+correction/ablation/benchmark CLI execution.
+
 ## Delivered
 
 - Added fail-closed report validation with manifest hash checks, approved-AR and

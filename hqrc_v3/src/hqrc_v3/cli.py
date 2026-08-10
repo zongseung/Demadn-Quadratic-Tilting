@@ -21,6 +21,7 @@ from hqrc_v3.diagnostics.ar import (
     diagnose_event_residuals,
     write_ar_diagnostics,
 )
+from hqrc_v3.provenance import file_sha256
 
 StageHandler = Callable[[argparse.Namespace], object]
 _EXPECTED_START = "2019-01-01T00:00:00"
@@ -65,8 +66,13 @@ def fit_final_baselines_handler(arguments: argparse.Namespace) -> object:
 
 
 def diagnose_ar_handler(arguments: argparse.Namespace) -> object:
-    residuals = pl.read_parquet(arguments.residuals)
+    residual_path = Path(arguments.residuals)
+    if file_sha256(residual_path) != arguments.residual_sha256:
+        raise StageInputError("diagnose-ar residual-sha256 does not match the residual artifact")
+    residuals = pl.read_parquet(residual_path)
     diagnostics = diagnose_event_residuals(residuals)
+    if any(split.split("-", 1)[-1] > str(arguments.through) for split in residuals["split_id"]):
+        raise StageInputError("diagnose-ar residuals include rows later than --through")
     calibration = calibrate_beta_prior(
         np.asarray([item.phi for item in diagnostics]),
         event_ids=tuple(item.occurrence_id for item in diagnostics),
