@@ -98,3 +98,20 @@ The pre-existing untracked `hqrc_v3/uv.lock` was not edited or staged.
 
 Verification: focused predictive/inference/variant tests passed with `20 passed`; full
 HQRC v3 regression passed with `216 passed`; Ruff and diff checks passed.
+
+## Fix round 3: opaque H0 provenance boundary
+
+- `NonEventBlockPool` is now a factory-only opaque object with no instance buffer,
+  digest, shape, or writable metadata.  Its C-contiguous owned read-only blocks,
+  shape, and keyed MAC live in a private weak registry; H0 resolves and validates
+  that state immediately before bootstrap. The public accessor supplies a detached
+  read-only copy. This blocks ordinary clone, dataclass replacement, metadata, and
+  name-mangled-buffer substitution attempts. The documented residual boundary is
+  deliberate Python-level monkeypatching of this module's private registry/key.
+- LOEO regression coverage rejects a valid approved artifact whose generic event ids
+  do not equal the exact nine training occurrence ids. H4 missing/shifted positions,
+  H5 float keys, and event-block HAC re-studentization each have direct tests.
+
+Verification: focused review tests passed with `17 passed`; full HQRC v3 regression
+passed with `221 passed`; Ruff and diff checks passed. Existing tiny-sampler ArviZ
+warnings remain expected.

@@ -1,3 +1,5 @@
+import copy
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -92,6 +94,24 @@ def test_h0_uses_only_complete_non_event_block_pool(tiny_variant_context):
     assert result["target_timestamp"].to_list() == _timestamps()
 
 
+def test_h0_pool_rejects_clone_and_public_tamper_attempts(tiny_variant_context):
+    pool = tiny_variant_context.non_event_pool
+    assert not hasattr(pool, "digest") and not hasattr(pool, "shape")
+    with pytest.raises(AttributeError):
+        pool.digest = "forged"
+    with pytest.raises(AttributeError):
+        pool._NonEventBlockPool__blocks = np.zeros((1, 24))
+    with pytest.raises(Exception, match="authentic"):
+        run_variant("H0", replace(tiny_variant_context, non_event_pool=copy.copy(pool)))
+
+
+def test_h4_requires_explicit_unshifted_training_day_positions(tiny_variant_context):
+    with pytest.raises(ValueError, match="day_positions"):
+        run_variant("H4", replace(tiny_variant_context, day_positions=None))
+    with pytest.raises(ValueError, match="day_effect"):
+        run_variant("H4", replace(tiny_variant_context, day_positions=np.array([1])))
+
+
 def test_h5_rejects_heldout_occurrence_in_training(tiny_variant_context):
     training = tiny_variant_context.similar_day_training.with_columns(
         pl.lit("seollal-2024").alias("occurrence_id")
@@ -101,6 +121,16 @@ def test_h5_rejects_heldout_occurrence_in_training(tiny_variant_context):
     )
     with pytest.raises(SimilarDayError, match="exclude"):
         same_holiday_profile(training, target, held_out_occurrence_id="seollal-2024")
+
+
+def test_h5_rejects_numerically_integral_float_keys(tiny_variant_context):
+    target = pl.DataFrame(
+        {"holiday_type": [0] * 24, "relative_day": [0.0] * 24, "hour": np.arange(24, dtype=float)}
+    )
+    with pytest.raises(SimilarDayError, match="integer dtypes"):
+        same_holiday_profile(
+            tiny_variant_context.similar_day_training, target, held_out_occurrence_id="seollal-2024"
+        )
 
 
 @pytest.fixture
@@ -188,3 +218,18 @@ def test_loeo_excludes_heldout_event_from_fit_and_ar_calibration(tmp_path):
         assert held_out not in ar_events
         assert set(fit_events) == set(ar_events)
         assert causal is False
+
+
+def test_loeo_rejects_valid_but_wrong_event_id_calibration(tmp_path, approved_calibration):
+    ids = [f"{holiday}-{year}" for holiday in ("seollal", "chuseok") for year in range(2020, 2025)]
+    frames = {
+        event_id: pl.DataFrame({"target_timestamp": [datetime(2024, 1, 1)]}) for event_id in ids
+    }
+
+    class WrongArtifactBackend(_RecordingBackend):
+        def load_approved_fold_calibration(self, held_out, ar_events):
+            self.calls.append([held_out, (), tuple(ar_events), None])
+            return approved_calibration
+
+    with pytest.raises(ValueError, match="event ids"):
+        run_event_loeo(frames, WrongArtifactBackend(tmp_path))

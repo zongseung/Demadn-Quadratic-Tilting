@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Literal, Protocol
+from weakref import WeakKeyDictionary
 
 import arviz as az
 import numpy as np
@@ -33,7 +35,6 @@ Innovation = Literal["normal_ar1", "student_t_ar1", "normal_ar2"]
 _LOEO_IDS = frozenset(
     f"{holiday}-{year}" for holiday in ("seollal", "chuseok") for year in range(2020, 2025)
 )
-_BLOCK_POOL_TOKEN = object()
 
 
 class CorrectionContractError(ValueError):
@@ -41,38 +42,67 @@ class CorrectionContractError(ValueError):
 
 
 class NonEventBlockPool:
-    """Validated complete non-event 24-hour residual trajectories."""
+    """Opaque factory product for H0 trajectories.
 
-    __slots__ = ("__blocks", "shape", "digest")
+    Instances expose neither mutable buffer nor authenticity metadata.  State lives
+    in this module's private weak registry and is authenticated at use.  This blocks
+    ordinary cloning and attribute substitution; deliberate monkeypatching of module
+    private registry/key is outside the Python-level threat boundary.
+    """
 
-    def __init__(self, blocks: np.ndarray, token: object):
-        if token is not _BLOCK_POOL_TOKEN:
-            raise TypeError(
-                "NonEventBlockPool objects must be created by build_non_event_block_pool"
-            )
-        owned = np.array(blocks, dtype=float, order="C", copy=True)
-        owned.setflags(write=False)
-        self.__blocks = owned
-        self.shape = owned.shape
-        self.digest = hashlib.sha256(owned.tobytes()).hexdigest()
+    __slots__ = ("__weakref__",)
+
+    def __init__(self) -> None:
+        raise TypeError("NonEventBlockPool objects must be created by build_non_event_block_pool")
 
     @property
     def blocks(self) -> np.ndarray:
         """Return a detached read-only copy; callers cannot mutate the pool."""
-        copied = self.__blocks.copy()
+        copied = _pool_state(self).blocks.copy()
         copied.setflags(write=False)
         return copied
 
-    def _validated_blocks(self) -> np.ndarray:
-        blocks = self.__blocks
-        if (
-            not blocks.flags.c_contiguous
-            or blocks.flags.writeable
-            or blocks.shape != self.shape
-            or hashlib.sha256(blocks.tobytes()).hexdigest() != self.digest
-        ):
-            raise CorrectionContractError("non-event block pool integrity digest differs")
-        return blocks
+
+@dataclass(frozen=True)
+class _PoolState:
+    blocks: np.ndarray
+    shape: tuple[int, int]
+    mac: bytes
+
+
+_POOL_MAC_KEY = hashlib.sha256(b"hqrc-v3-non-event-block-pool-v1").digest()
+_POOL_STATES: WeakKeyDictionary[NonEventBlockPool, _PoolState] = WeakKeyDictionary()
+
+
+def _pool_mac(blocks: np.ndarray) -> bytes:
+    payload = repr(blocks.shape).encode() + blocks.dtype.str.encode() + blocks.tobytes()
+    return hmac.digest(_POOL_MAC_KEY, payload, "sha256")
+
+
+def _pool_state(pool: NonEventBlockPool) -> _PoolState:
+    try:
+        state = _POOL_STATES[pool]
+    except (KeyError, TypeError) as error:
+        raise CorrectionContractError(
+            "H0 requires an authentic factory-built non-event block pool"
+        ) from error
+    blocks = state.blocks
+    if (
+        blocks.shape != state.shape
+        or not blocks.flags.c_contiguous
+        or blocks.flags.writeable
+        or not hmac.compare_digest(_pool_mac(blocks), state.mac)
+    ):
+        raise CorrectionContractError("non-event block pool integrity check failed")
+    return state
+
+
+def _make_pool(blocks: np.ndarray) -> NonEventBlockPool:
+    pool = object.__new__(NonEventBlockPool)
+    owned = np.array(blocks, dtype=float, order="C", copy=True)
+    owned.setflags(write=False)
+    _POOL_STATES[pool] = _PoolState(owned, owned.shape, _pool_mac(owned))
+    return pool
 
 
 def build_non_event_block_pool(frame: pl.DataFrame) -> NonEventBlockPool:
@@ -131,7 +161,7 @@ def build_non_event_block_pool(frame: pl.DataFrame) -> NonEventBlockPool:
         blocks.append(block["residual_mw"].to_numpy().astype(float))
     if not blocks:
         raise CorrectionContractError("non-event pool has no complete horizons")
-    return NonEventBlockPool(np.stack(blocks), _BLOCK_POOL_TOKEN)
+    return _make_pool(np.stack(blocks))
 
 
 @dataclass(frozen=True)
@@ -346,7 +376,7 @@ def run_variant(variant: Variant, context: VariantContext) -> pl.DataFrame:
         if not isinstance(context.non_event_pool, NonEventBlockPool):
             raise CorrectionContractError("H0 requires a validated non-event block pool")
         draws = baseline[None] + bootstrap_horizon_draws(
-            context.non_event_pool._validated_blocks(),
+            _pool_state(context.non_event_pool).blocks,
             horizon=len(baseline),
             draws=context.draws,
             seed=context.seed,
