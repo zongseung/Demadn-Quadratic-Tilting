@@ -115,6 +115,7 @@ hqrc_v3/
 ├── configs/
 │   ├── experiment.toml
 │   ├── events.csv
+│   ├── holiday_calendar.csv
 │   └── model_spaces.toml
 ├── src/hqrc_v3/
 │   ├── cli.py
@@ -200,7 +201,7 @@ B0 특징 행렬에 holiday 이름, holiday flag, event-relative time, 이벤트
 
 ## 6. 이벤트 계약
 
-`configs/events.csv`는 occurrence id, holiday type, central date, official sequence start/end, pandemic flag를 가진다. 2020--2024 설날과 추석 총 10개 occurrence를 다음과 같이 명시한다. 날짜 범위는 현재 자료의 휴일 라벨과 대체공휴일을 포함한 공식 연휴 범위를 교차 확인한 값이다.
+`configs/events.csv`는 occurrence id, holiday type, central date, official sequence start/end, pandemic flag를 가진다. 2020--2024 설날과 추석 총 10개 correction/evaluation occurrence를 다음과 같이 명시한다. 날짜 범위는 현재 자료의 휴일 라벨과 대체공휴일을 포함한 공식 연휴 범위를 교차 확인한 값이다.
 
 | occurrence | type | central | official start | official end | restriction flag |
 |---|---|---|---|---|---:|
@@ -227,6 +228,8 @@ B0 특징 행렬에 holiday 이름, holiday flag, event-relative time, 이벤트
 - pandemic flag가 실행 중 파생되지 않고 versioned input으로 고정됨
 
 팬데믹 효과 `Delta_h`는 본 모델에 유지하되, 처리 이벤트가 네 개뿐이라는 약한 식별성을 posterior와 민감도 표에 명시한다. pandemic covariate 제거 모델도 민감도 분석으로 제공한다.
+
+B1의 signed distance와 sequence-position 특징은 baseline 학습 첫해인 2019에도 필요하다. 따라서 `configs/holiday_calendar.csv`는 위 10개 occurrence에 2019 설날(central 2019-02-05, official 2019-02-04--2019-02-06)과 2019 추석(central 2019-09-13, official 2019-09-12--2019-09-14)을 추가한 12개 달력 occurrence를 가진다. 이 파일은 B1 특징 생성에만 사용하며, 2019 occurrence는 OOF residual, HQRC pooling, LOEO 이벤트 수에 포함하지 않는다.
 
 ## 7. 베이스라인 및 OOF 잔차
 
