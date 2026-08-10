@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -30,15 +31,117 @@ def _prediction_frame(
     )
 
 
-def _concurrent_write(cache_root: str, barrier, hashes: dict[str, str], result_queue) -> None:
-    cache = PredictionCache(Path(cache_root))
-    barrier.wait(timeout=5)
+class _GatedPredictionCache(PredictionCache):
+    """Test-only cache that stops the first writer after its absent-cache observation."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        writer: str,
+        first_absent,
+        second_absent,
+        release_first,
+    ) -> None:
+        super().__init__(root)
+        self.writer = writer
+        self.first_absent = first_absent
+        self.second_absent = second_absent
+        self.release_first = release_first
+
+    def _read_unlocked(self, key: str, expected_hashes):
+        frame = super()._read_unlocked(key, expected_hashes)
+        if frame is not None:
+            return frame
+        if self.writer == "first":
+            self.first_absent.set()
+            if not self.release_first.wait(timeout=5):
+                raise RuntimeError("test did not release the first writer")
+        else:
+            self.second_absent.set()
+        return frame
+
+
+class _UnserializedGatedPredictionCache(_GatedPredictionCache):
+    """Test-only control that removes the production per-key serialized boundary."""
+
+    @contextmanager
+    def _lock(self, key: str, *, exclusive: bool):
+        yield
+
+
+def _concurrent_write(
+    cache_type,
+    cache_root: str,
+    writer: str,
+    first_absent,
+    second_absent,
+    release_first,
+    hashes: dict[str, str],
+    result_queue,
+) -> None:
+    cache = cache_type(
+        Path(cache_root),
+        writer=writer,
+        first_absent=first_absent,
+        second_absent=second_absent,
+        release_first=release_first,
+    )
     try:
         cache.write("concurrent", _prediction_frame(), hashes=hashes)
     except ArtifactMismatch:
         result_queue.put(("mismatch", hashes["config"]))
     else:
         result_queue.put(("written", hashes["config"]))
+
+
+def _force_publication_race(tmp_path, cache_type, *, second_must_observe_absence: bool):
+    context = multiprocessing.get_context("spawn")
+    first_absent = context.Event()
+    second_absent = context.Event()
+    release_first = context.Event()
+    result_queue = context.Queue()
+    first_hashes = {"config": "a", "data": "d"}
+    second_hashes = {"config": "b", "data": "d"}
+    first = context.Process(
+        target=_concurrent_write,
+        args=(
+            cache_type,
+            str(tmp_path),
+            "first",
+            first_absent,
+            second_absent,
+            release_first,
+            first_hashes,
+            result_queue,
+        ),
+    )
+    second = context.Process(
+        target=_concurrent_write,
+        args=(
+            cache_type,
+            str(tmp_path),
+            "second",
+            first_absent,
+            second_absent,
+            release_first,
+            second_hashes,
+            result_queue,
+        ),
+    )
+    first.start()
+    assert first_absent.wait(timeout=5)
+    second.start()
+    if second_must_observe_absence:
+        assert second_absent.wait(timeout=5)
+    else:
+        assert not second_absent.wait(timeout=0.2)
+    release_first.set()
+    for process in (first, second):
+        process.join(timeout=10)
+        assert process.exitcode == 0
+    outcomes = {result_queue.get(timeout=2), result_queue.get(timeout=2)}
+    return outcomes, first_hashes, second_hashes
 
 
 def test_cache_refuses_different_config_hash(tmp_path):
@@ -96,28 +199,22 @@ def test_cache_uses_prediction_validation_for_writes(tmp_path):
 
 
 def test_concurrent_writes_with_different_hashes_leave_one_immutable_winner(tmp_path):
-    context = multiprocessing.get_context("spawn")
-    barrier = context.Barrier(2)
-    result_queue = context.Queue()
-    first_hashes = {"config": "a", "data": "d"}
-    second_hashes = {"config": "b", "data": "d"}
-    processes = [
-        context.Process(
-            target=_concurrent_write, args=(str(tmp_path), barrier, hashes, result_queue)
-        )
-        for hashes in (first_hashes, second_hashes)
-    ]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=10)
-        assert process.exitcode == 0
-    outcomes = {result_queue.get(timeout=2), result_queue.get(timeout=2)}
+    outcomes, first_hashes, second_hashes = _force_publication_race(
+        tmp_path, _GatedPredictionCache, second_must_observe_absence=False
+    )
 
     assert {status for status, _ in outcomes} == {"written", "mismatch"}
     winning_config = next(config for status, config in outcomes if status == "written")
     winning_hashes = first_hashes if winning_config == "a" else second_hashes
     assert PredictionCache(tmp_path).read("concurrent", expected_hashes=winning_hashes) is not None
+
+
+def test_controlled_gate_exposes_the_former_check_then_act_race(tmp_path):
+    outcomes, _, _ = _force_publication_race(
+        tmp_path, _UnserializedGatedPredictionCache, second_must_observe_absence=True
+    )
+
+    assert outcomes == {("written", "a"), ("written", "b")}
 
 
 def test_failed_second_publication_removes_its_partial_artifact_and_can_retry(
