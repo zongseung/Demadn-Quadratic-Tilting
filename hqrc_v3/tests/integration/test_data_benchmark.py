@@ -9,6 +9,7 @@ from pathlib import Path
 import hqrc_v3.evaluation.data_benchmark_worker as data_benchmark_worker
 import polars as pl
 import pytest
+from hqrc_v3.bayes.benchmark import SamplerWorkerError, load_sampler_benchmark
 from hqrc_v3.evaluation.data_benchmark import (
     DataBenchmarkError,
     benchmark_polars_data,
@@ -313,3 +314,15 @@ def test_orchestrator_revalidates_sampler_schema_digest_and_bound_hash(tmp_path)
             worker_directory=tmp_path / "worker-results",
             timeout_seconds=5,
         )
+
+
+def test_production_sampler_loader_rejects_boolean_version_after_redigest(tmp_path):
+    sampler = _sampler_benchmark(tmp_path)
+    payload = json.loads(sampler.read_bytes())
+    payload.pop("benchmark_digest")
+    payload["schema_version"] = True
+    payload["benchmark_digest"] = _digest(payload)
+    sampler.write_text(_canonical(payload) + "\n")
+
+    with pytest.raises(SamplerWorkerError, match="benchmark version"):
+        load_sampler_benchmark(sampler)

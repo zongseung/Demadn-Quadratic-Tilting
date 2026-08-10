@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -7,6 +9,8 @@ from pathlib import Path
 import pytest
 from hqrc_v3.bayes.benchmark import (
     SamplerWorkerError,
+    load_sampler_request,
+    load_sampler_result,
     maximum_posterior_mean_distance,
     run_sampler_worker,
     write_sampler_request,
@@ -14,6 +18,14 @@ from hqrc_v3.bayes.benchmark import (
 from hqrc_v3.provenance import file_sha256
 
 FAKE = Path(__file__).parents[1] / "fixtures" / "fake_sampler_worker.py"
+
+
+def _canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def _digest(value):
+    return hashlib.sha256(_canonical(value)).hexdigest()
 
 
 def _request(tmp_path, *, backend="pymc"):
@@ -54,6 +66,38 @@ def test_parent_launches_separate_worker_and_verifies_pid_and_digest(tmp_path):
     assert result.pid != os.getpid()
     assert result.request_digest
     assert result.min_bulk_ess_per_second == pytest.approx(50.0)
+
+
+def test_sampler_request_rejects_boolean_version_after_redigest(tmp_path):
+    request = _request(tmp_path)
+    payload = json.loads(request.read_bytes())
+    payload.pop("request_digest")
+    payload["schema_version"] = True
+    payload["request_digest"] = _digest(payload)
+    request.write_bytes(_canonical(payload) + b"\n")
+
+    with pytest.raises(SamplerWorkerError, match="request version"):
+        load_sampler_request(request)
+
+
+def test_sampler_result_rejects_boolean_version_after_redigest(tmp_path):
+    request_path = _request(tmp_path)
+    request = load_sampler_request(request_path)
+    result_path = tmp_path / "result.json"
+    run_sampler_worker(
+        request_path,
+        result_path,
+        timeout_seconds=5,
+        worker_command=(sys.executable, str(FAKE), "ok"),
+    )
+    payload = json.loads(result_path.read_bytes())
+    payload.pop("result_digest")
+    payload["schema_version"] = True
+    payload["result_digest"] = _digest(payload)
+    result_path.write_bytes(_canonical(payload) + b"\n")
+
+    with pytest.raises(SamplerWorkerError, match="result version"):
+        load_sampler_result(result_path, request=request)
 
 
 @pytest.mark.parametrize(

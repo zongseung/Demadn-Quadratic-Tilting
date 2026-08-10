@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import tempfile
 import uuid
 from hashlib import sha256
@@ -132,6 +133,42 @@ def _generation_directory(destination: Path) -> Path:
     return destination.with_name(f".{destination.stem}.generations")
 
 
+def _prepare_generation_namespace(destination: Path) -> Path:
+    parent = destination.parent
+    namespace = _generation_directory(destination)
+    try:
+        initial = namespace.lstat()
+    except FileNotFoundError:
+        try:
+            os.mkdir(namespace, mode=0o700)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise HQRCArtifactError("HQRC generation namespace cannot be created") from error
+        try:
+            initial = namespace.lstat()
+        except OSError as error:
+            raise HQRCArtifactError("HQRC generation namespace is unavailable") from error
+    except OSError as error:
+        raise HQRCArtifactError("HQRC generation namespace is unavailable") from error
+    if stat.S_ISLNK(initial.st_mode) or not stat.S_ISDIR(initial.st_mode):
+        raise HQRCArtifactError("HQRC generation namespace must be a real directory")
+    try:
+        expected = parent.resolve(strict=True) / namespace.name
+        resolved = namespace.resolve(strict=True)
+        confirmed = namespace.lstat()
+    except OSError as error:
+        raise HQRCArtifactError("HQRC generation namespace cannot be resolved") from error
+    if (
+        resolved != expected
+        or stat.S_ISLNK(confirmed.st_mode)
+        or not stat.S_ISDIR(confirmed.st_mode)
+        or (confirmed.st_dev, confirmed.st_ino) != (initial.st_dev, initial.st_ino)
+    ):
+        raise HQRCArtifactError("HQRC generation namespace escapes its parent")
+    return namespace
+
+
 def _pointer_path(destination: Path) -> Path:
     return destination.with_name(f"{destination.stem}.current.json")
 
@@ -151,8 +188,7 @@ def write_hqrc_data(
     if destination.suffix != ".npz":
         raise HQRCArtifactError("HQRC data artifact must use .npz")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    generation_directory = _generation_directory(destination)
-    generation_directory.mkdir(exist_ok=True)
+    generation_directory = _prepare_generation_namespace(destination)
     generation = uuid.uuid4().hex
     generation_npz = generation_directory / f"{generation}.npz"
     generation_metadata = generation_directory / f"{generation}.json"

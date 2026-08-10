@@ -64,6 +64,63 @@ def test_hqrc_data_artifact_rejects_unknown_npz_array(tmp_path):
         load_hqrc_data(npz, metadata)
 
 
+def test_immutable_generation_rejects_boolean_version_after_redigest(tmp_path):
+    npz, metadata = write_hqrc_data(tmp_path / "hqrc.npz", _data(), settings={})
+    payload = json.loads(metadata.read_bytes())
+    payload.pop("artifact_sha256")
+    payload["schema_version"] = True
+    payload["artifact_sha256"] = hashlib.sha256(_canonical(payload)).hexdigest()
+    metadata.write_bytes(_canonical(payload) + b"\n")
+
+    with pytest.raises(HQRCArtifactError, match="metadata version"):
+        load_hqrc_data(npz, metadata)
+
+
+def test_writer_rejects_generation_namespace_symlink_without_touching_outside(tmp_path):
+    parent = tmp_path / "artifacts"
+    outside = tmp_path / "outside"
+    parent.mkdir()
+    outside.mkdir()
+    (parent / "sentinel.txt").write_bytes(b"parent")
+    (outside / "sentinel.txt").write_bytes(b"outside")
+    destination = parent / "hqrc.npz"
+    namespace = parent / ".hqrc.generations"
+    namespace.symlink_to(outside, target_is_directory=True)
+    parent_before = sorted(path.name for path in parent.iterdir())
+    outside_before = {
+        path.name: path.read_bytes() for path in outside.iterdir() if path.is_file()
+    }
+
+    with pytest.raises(HQRCArtifactError, match="generation namespace"):
+        write_hqrc_data(destination, _data(), settings={})
+
+    assert sorted(path.name for path in parent.iterdir()) == parent_before
+    assert {
+        path.name: path.read_bytes() for path in outside.iterdir() if path.is_file()
+    } == outside_before
+    assert namespace.is_symlink()
+
+
+def test_writer_rejects_regular_file_generation_namespace_without_mutation(tmp_path):
+    parent = tmp_path / "artifacts"
+    parent.mkdir()
+    (parent / "sentinel.txt").write_bytes(b"parent")
+    destination = parent / "hqrc.npz"
+    namespace = parent / ".hqrc.generations"
+    namespace.write_bytes(b"not-a-directory")
+    parent_before = {
+        path.name: path.read_bytes() for path in parent.iterdir() if path.is_file()
+    }
+
+    with pytest.raises(HQRCArtifactError, match="generation namespace"):
+        write_hqrc_data(destination, _data(), settings={})
+
+    assert {
+        path.name: path.read_bytes() for path in parent.iterdir() if path.is_file()
+    } == parent_before
+    assert sorted(path.name for path in parent.iterdir()) == sorted(parent_before)
+
+
 def test_returned_generation_tuple_stays_valid_after_current_pointer_advances(tmp_path):
     destination = tmp_path / "hqrc.npz"
     first_npz, first_metadata = write_hqrc_data(

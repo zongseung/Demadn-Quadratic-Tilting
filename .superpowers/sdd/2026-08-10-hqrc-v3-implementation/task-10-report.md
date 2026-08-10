@@ -168,6 +168,31 @@ unwired in this tranche.
   non-slow suite passed (`272 passed, 4 deselected`), and the real sampler child-process
   smoke passed (`1 passed`). Repository-wide Ruff and `git diff --check` were clean.
 
+## Fix round 4: exact versions and writer namespace containment
+
+- Every schema boundary in the HQRC artifact and sampler workflow now requires an exact
+  runtime `int` before comparing its version. Canonical, re-digested
+  `schema_version: true` regressions cover the logical current pointer, direct immutable
+  generation metadata, sampler request and result loaders, the shared production
+  benchmark loader, production reporting, and the separately versioned legacy-smoke
+  reporting path.
+- `write_hqrc_data()` now prepares its generation namespace before UUID, temporary-file,
+  or generation publication. It uses `lstat()` to reject symlinks and non-directories;
+  if absent, it performs a race-safe `mkdir`, tolerates a competing creator only long
+  enough to revalidate, resolves the namespace against the exact expected parent, and
+  confirms the same real directory inode before returning it to the writer.
+- Writer-side regressions pre-create both a namespace symlink to an outside directory
+  and a regular-file namespace. The former initially allowed a complete generation to
+  be written outside, while the latter leaked a raw `FileExistsError`; after the fix,
+  both raise `HQRCArtifactError` and byte/name snapshots prove the outside and parent
+  directories remain unchanged.
+- RED: the two namespace regressions failed as intended (`2 failed`); the original
+  Boolean equality defect was also reproduced with canonical re-digested pointer and
+  production benchmark artifacts before exact-type validation.
+- GREEN: the focused artifact/sampler/data/report suite passed (`55 passed`), the full
+  non-slow suite passed (`279 passed, 4 deselected`), and the real sampler child-process
+  smoke passed (`1 passed`). Repository-wide Ruff and `git diff --check` were clean.
+
 Baseline/correction CLI wiring remains outside this fix round and was not changed.
 
 ## Delivered

@@ -139,6 +139,20 @@ def test_report_rejects_noncanonical_sampler_json_even_after_manifest_rebind(tmp
     assert not (run / "COMPLETE").exists()
 
 
+def test_report_rejects_boolean_legacy_sampler_version_after_redigest(tmp_path):
+    run = _ready_run(tmp_path)
+    sampler = run / "benchmarks/samplers.json"
+    payload = json.loads(sampler.read_bytes())
+    payload.pop("benchmark_digest")
+    payload["schema_version"] = True
+    payload["benchmark_digest"] = hashlib.sha256(_canonical(payload)).hexdigest()
+    _replace_sampler_and_rebind_manifest(run, _canonical(payload) + b"\n")
+
+    with pytest.raises(ReportContractError, match="legacy sampler benchmark.*invalid"):
+        build_report(run)
+    assert not (run / "COMPLETE").exists()
+
+
 def test_report_accepts_process_orchestrator_sampler_artifact(tmp_path):
     run = _ready_run(tmp_path)
     artifact = _write_production_sampler_benchmark(run, tmp_path)
