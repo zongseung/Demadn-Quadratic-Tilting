@@ -169,3 +169,25 @@ class ForecastMatrix:
             future=self.future[indices],
             target=self.target[indices],
         )
+
+
+def validate_forecast_feature_columns(matrix: ForecastMatrix) -> None:
+    """Require immutable, width-aligned, unambiguous feature names for model inputs."""
+
+    for stream, columns, width in (
+        ("history", matrix.history_columns, matrix.history.shape[2]),
+        ("future", matrix.future_columns, matrix.future.shape[2]),
+    ):
+        if not isinstance(columns, tuple):
+            raise DataContractError(f"ForecastMatrix {stream} feature columns must be a tuple")
+        if len(columns) != width:
+            raise DataContractError(
+                f"ForecastMatrix {stream} feature columns must match feature width"
+            )
+        if (
+            any(not isinstance(column, str) or not column.strip() for column in columns)
+            or len(set(columns)) != len(columns)
+        ):
+            raise DataContractError(
+                "ForecastMatrix feature column names must be nonblank and unique"
+            )

@@ -17,7 +17,11 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from hqrc_v3.contracts import DataContractError, ForecastMatrix
+from hqrc_v3.contracts import (
+    DataContractError,
+    ForecastMatrix,
+    validate_forecast_feature_columns,
+)
 
 _MODEL_NAMES = ("lstm", "transformer")
 _HISTORY_HOURS = 168
@@ -153,6 +157,8 @@ class FittedTorchBaseline:
     target_scaler: Standardizer
     history_shape: tuple[int, int]
     future_width: int
+    history_columns: tuple[str, ...]
+    future_columns: tuple[str, ...]
     epochs_completed: int
     best_validation_loss: float | None
 
@@ -164,6 +170,13 @@ class FittedTorchBaseline:
         ):
             raise DataContractError(
                 "prediction matrix feature shape does not match the fitted baseline"
+            )
+        if (
+            batch.history_columns != self.history_columns
+            or batch.future_columns != self.future_columns
+        ):
+            raise DataContractError(
+                "prediction matrix feature columns/order do not match the fitted baseline"
             )
         history = self.history_scaler.transform(batch.history).astype(np.float32)
         future = self.future_scaler.transform(batch.future).astype(np.float32)
@@ -198,7 +211,7 @@ class TorchBaselineFactory:
         _validate_matrix(train)
         if validation is not None:
             _validate_matrix(validation)
-            _require_matching_widths(train, validation)
+            _require_matching_schema(train, validation)
         return _fit_one(self.name, train, validation, self.config, normalized_seed)
 
 
@@ -294,6 +307,8 @@ def _fit_one(
         target_scaler=target_scaler,
         history_shape=train.history.shape[1:],
         future_width=train.future.shape[2],
+        history_columns=tuple(train.history_columns),
+        future_columns=tuple(train.future_columns),
         epochs_completed=epochs_completed,
         best_validation_loss=best_loss,
     )
@@ -406,11 +421,7 @@ def _validate_matrix(matrix: ForecastMatrix) -> None:
         raise DataContractError("sequence baselines require exactly 24 future horizons")
     if matrix.history.shape[2] <= 0 or matrix.future.shape[2] <= 0:
         raise DataContractError("ForecastMatrix feature widths must be positive")
-    if (
-        len(matrix.history_columns) != matrix.history.shape[2]
-        or len(matrix.future_columns) != matrix.future.shape[2]
-    ):
-        raise DataContractError("ForecastMatrix feature columns must match feature widths")
+    validate_forecast_feature_columns(matrix)
     if matrix.origins.shape != (count,) or matrix.target_times.shape != matrix.target.shape:
         raise DataContractError("ForecastMatrix origins and target times must align with samples")
     for values, description in (
@@ -422,12 +433,19 @@ def _validate_matrix(matrix: ForecastMatrix) -> None:
             raise DataContractError(f"ForecastMatrix {description} must be finite")
 
 
-def _require_matching_widths(train: ForecastMatrix, validation: ForecastMatrix) -> None:
+def _require_matching_schema(train: ForecastMatrix, validation: ForecastMatrix) -> None:
     if (
         train.history.shape[1:] != validation.history.shape[1:]
         or train.future.shape[2] != validation.future.shape[2]
     ):
         raise DataContractError("validation matrix feature shape must match the training matrix")
+    if (
+        train.history_columns != validation.history_columns
+        or train.future_columns != validation.future_columns
+    ):
+        raise DataContractError(
+            "validation matrix feature columns/order must match the training matrix"
+        )
 
 
 def _require_seed(seed: int) -> int:

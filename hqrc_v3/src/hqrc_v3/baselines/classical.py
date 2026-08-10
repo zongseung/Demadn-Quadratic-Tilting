@@ -11,7 +11,12 @@ from typing import Any
 import numpy as np
 import polars as pl
 
-from hqrc_v3.contracts import DataContractError, ForecastMatrix, validate_prediction_frame
+from hqrc_v3.contracts import (
+    DataContractError,
+    ForecastMatrix,
+    validate_forecast_feature_columns,
+    validate_prediction_frame,
+)
 from hqrc_v3.splits import AnnualFold
 
 _MODEL_NAMES = ("xgboost", "lightgbm", "svr")
@@ -72,6 +77,7 @@ def _flatten_history(matrix: ForecastMatrix) -> np.ndarray:
         raise DataContractError("classical baselines require exactly 168 history hours")
     if matrix.future.shape[1] != 24 or matrix.target.shape[1] != 24:
         raise DataContractError("classical baselines require exactly 24 future horizons")
+    validate_forecast_feature_columns(matrix)
     return matrix.history.reshape(matrix.history.shape[0], -1)
 
 
@@ -136,6 +142,8 @@ class HorizonRegressor:
     estimators: tuple[Any, ...]
     history_shape: tuple[int, int]
     future_width: int
+    history_columns: tuple[str, ...]
+    future_columns: tuple[str, ...]
 
     def predict(self, batch: ForecastMatrix) -> np.ndarray:
         if len(self.estimators) != 24:
@@ -147,6 +155,13 @@ class HorizonRegressor:
         ):
             raise DataContractError(
                 "prediction matrix feature shape does not match the fitted baseline"
+            )
+        if (
+            batch.history_columns != self.history_columns
+            or batch.future_columns != self.future_columns
+        ):
+            raise DataContractError(
+                "prediction matrix feature columns/order do not match the fitted baseline"
             )
         prediction = np.empty((batch.target.shape[0], 24), dtype=float)
         for horizon, estimator in enumerate(self.estimators):
@@ -198,6 +213,8 @@ class ClassicalBaseline:
             estimators=tuple(estimators),
             history_shape=train.history.shape[1:],
             future_width=train.future.shape[2],
+            history_columns=tuple(train.history_columns),
+            future_columns=tuple(train.future_columns),
         )
 
 

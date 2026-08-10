@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 
 import hqrc_v3.baselines.sequence as sequence
 import numpy as np
 import pytest
 import torch
 from hqrc_v3.baselines.sequence import SequenceTrainingConfig, fit_seed_ensemble
+from hqrc_v3.contracts import DataContractError
 
 
 @pytest.fixture
@@ -68,6 +70,20 @@ def test_seed_ensemble_retains_member_predictions_and_mean_identity(tiny_forecas
         member_predictions.mean(axis=0),
         ensemble.predict(tiny_forecast_matrix.take(np.arange(16, 24))),
     )
+
+
+def test_seed_ensemble_rejects_reordered_feature_columns(tiny_forecast_matrix):
+    train = tiny_forecast_matrix.take(np.arange(16))
+    ensemble = fit_seed_ensemble("lstm", train, None, _config(epochs=1))
+    batch = tiny_forecast_matrix.take(np.arange(16, 24))
+    reordered = replace(
+        batch,
+        future=batch.future[:, :, ::-1],
+        future_columns=batch.future_columns[::-1],
+    )
+
+    with pytest.raises(DataContractError, match="feature columns/order"):
+        ensemble.predict_members(reordered)
 
 
 def test_validation_restores_best_state_and_no_validation_runs_fixed_epochs(

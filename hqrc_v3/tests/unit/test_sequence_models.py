@@ -115,3 +115,66 @@ def test_sequence_fitted_predict_requires_fitted_feature_width(tiny_forecast_mat
 
     with pytest.raises(DataContractError, match="feature shape"):
         fitted.predict(malformed)
+
+
+@pytest.mark.parametrize("stream", ["history", "future"])
+def test_sequence_fit_rejects_reordered_validation_feature_columns(
+    tiny_forecast_matrix, stream
+):
+    train = tiny_forecast_matrix.take(np.arange(16))
+    validation = tiny_forecast_matrix.take(np.arange(16, 24))
+    if stream == "history":
+        validation = replace(
+            validation,
+            history=validation.history[:, :, ::-1],
+            history_columns=validation.history_columns[::-1],
+        )
+    else:
+        validation = replace(
+            validation,
+            future=validation.future[:, :, ::-1],
+            future_columns=validation.future_columns[::-1],
+        )
+    config = SequenceTrainingConfig(
+        hidden_size=8, layers=1, heads=2, dropout=0.0, epochs=1, batch_size=8, seeds=(3,)
+    )
+
+    with pytest.raises(DataContractError, match="feature columns/order"):
+        TorchBaselineFactory("lstm", config).fit(train, validation, seed=3)
+
+
+@pytest.mark.parametrize("stream", ["history", "future"])
+def test_sequence_predict_rejects_reordered_feature_columns(tiny_forecast_matrix, stream):
+    train = tiny_forecast_matrix.take(np.arange(16))
+    batch = tiny_forecast_matrix.take(np.arange(16, 24))
+    config = SequenceTrainingConfig(
+        hidden_size=8, layers=1, heads=2, dropout=0.0, epochs=1, batch_size=8, seeds=(3,)
+    )
+    fitted = TorchBaselineFactory("lstm", config).fit(train, validation=None, seed=3)
+    if stream == "history":
+        batch = replace(
+            batch,
+            history=batch.history[:, :, ::-1],
+            history_columns=batch.history_columns[::-1],
+        )
+    else:
+        batch = replace(
+            batch,
+            future=batch.future[:, :, ::-1],
+            future_columns=batch.future_columns[::-1],
+        )
+
+    with pytest.raises(DataContractError, match="feature columns/order"):
+        fitted.predict(batch)
+
+
+@pytest.mark.parametrize("columns", [("load", "load"), ("load", " ")])
+def test_sequence_fit_rejects_duplicate_or_blank_feature_columns(
+    tiny_forecast_matrix, columns
+):
+    malformed = replace(tiny_forecast_matrix, history_columns=columns)
+
+    with pytest.raises(DataContractError, match="feature column names"):
+        TorchBaselineFactory("lstm", SequenceTrainingConfig(epochs=1)).fit(
+            malformed, validation=None, seed=3
+        )

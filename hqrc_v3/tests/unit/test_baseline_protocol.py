@@ -13,7 +13,7 @@ from hqrc_v3.baselines.classical import (
     predictions_to_frame,
     select_fixed_baseline_config,
 )
-from hqrc_v3.contracts import ForecastMatrix
+from hqrc_v3.contracts import DataContractError, ForecastMatrix
 from hqrc_v3.splits import AnnualFold
 
 
@@ -183,12 +183,51 @@ def test_horizon_regressor_uses_only_its_matching_future_covariates(tiny_forecas
         estimators=estimators,
         history_shape=(168, 2),
         future_width=2,
+        history_columns=batch.history_columns,
+        future_columns=batch.future_columns,
     )
 
     fitted.predict(batch)
 
     for horizon, estimator in enumerate(estimators):
         np.testing.assert_array_equal(estimator.inputs[0][:, -2:], batch.future[:, horizon, :])
+
+
+@pytest.mark.parametrize("stream", ["history", "future"])
+def test_horizon_regressor_rejects_reordered_feature_columns(
+    tiny_forecast_matrix, stream
+):
+    fitted = make_classical_baseline("svr", {"C": 1.0}).fit(
+        tiny_forecast_matrix.take(np.arange(20)), validation=None, seed=7
+    )
+    batch = tiny_forecast_matrix.take(np.arange(20, 24))
+    if stream == "history":
+        batch = replace(
+            batch,
+            history=batch.history[:, :, ::-1],
+            history_columns=batch.history_columns[::-1],
+        )
+    else:
+        batch = replace(
+            batch,
+            future=batch.future[:, :, ::-1],
+            future_columns=batch.future_columns[::-1],
+        )
+
+    with pytest.raises(DataContractError, match="feature columns/order"):
+        fitted.predict(batch)
+
+
+def test_classical_fit_rejects_duplicate_feature_columns(tiny_forecast_matrix):
+    malformed = replace(
+        tiny_forecast_matrix,
+        future_columns=("hour", "hour"),
+    )
+
+    with pytest.raises(DataContractError, match="feature column names"):
+        make_classical_baseline("svr", {"C": 1.0}).fit(
+            malformed, validation=None, seed=7
+        )
 
 
 @pytest.mark.parametrize(
