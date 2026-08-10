@@ -44,3 +44,37 @@ inference.
 - this report
 
 The pre-existing untracked `hqrc_v3/uv.lock` was not edited or staged.
+
+## Fix round 1: predictive and evaluation contracts
+
+- Posterior predictive construction now selects exactly one common posterior row per
+  draw.  All required posterior variables are flattened and must have identical sample
+  counts; coefficients, `gamma`, AR parameters, and sensitivity parameters consume that
+  same index vector.  Full partial pooling uses the model's stacked
+  `between_cholesky` and `L_h @ epsilon`; diagonal pooling uses `between_scale`.
+- Added faithful normal AR(1), Student-t AR(1), and stationary stable normal AR(2)
+  simulators.  Variant contexts declare their innovation family and fail when any
+  required posterior parameter is absent.
+- H0 accepts only a tokenized pool built from complete non-event residual horizons;
+  each draw joins 24-hour blocks and truncates to the exact event horizon.  Contexts
+  now require a unique chronological hourly timestamp grid whose tau/hour positions
+  agree with those timestamps.
+- H5 accepts only validated same-holiday training DataFrames with an explicit held-out
+  id.  It rejects held-out rows, incomplete daily profiles, noninteger day positions,
+  and zero LS profile denominators.
+- LOEO accepts exactly the registered ten 2020--2024 Seollal/Chuseok frames, has no
+  atomic fallback, reloads every supplied calibration through
+  `require_approved_calibration`, and requires exact ordered input/output timestamp
+  equality.
+- CRPS now uses the sorted empirical identity, avoiding quadratic draw tensors.
+  Aggregate and timestamp frames emit all 19 .05--.95 pinball levels plus their mean.
+  HAC-DM now calculates its p-value from deterministic whole-event block bootstrap
+  draws and records the draw count and event resampling unit.
+
+### Verification
+
+- Characterization RED: the prior focused suite failed with the old raw H0 block,
+  short timestamp, and atomic-LOEO fixtures after the contracts were tightened.
+- GREEN: expanded focused suite passed with `23 passed`.
+- Full HQRC v3 regression: `215 passed`; existing tiny-draw ArviZ warnings remain
+  expected. Ruff and diff checks passed.

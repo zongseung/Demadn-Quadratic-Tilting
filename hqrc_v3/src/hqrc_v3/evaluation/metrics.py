@@ -68,12 +68,15 @@ def point_metric_frame(event_id: str, observed: np.ndarray, point: np.ndarray) -
 
 
 def empirical_crps(observed: np.ndarray, draws: np.ndarray) -> np.ndarray:
-    """Compute empirical CRPS independently at each timestamp."""
+    """Compute empirical CRPS in O(S log S), avoiding an S-by-S draw tensor."""
 
     actual, _ = _aligned(observed, observed)
     sample = _draws(actual, draws)
     first = np.abs(sample - actual[None, :]).mean(axis=0)
-    second = np.abs(sample[:, None, :] - sample[None, :, :]).mean(axis=(0, 1))
+    count = sample.shape[0]
+    sorted_sample = np.sort(sample, axis=0)
+    weights = (2 * np.arange(1, count + 1) - count - 1)[:, None]
+    second = 2.0 * (weights * sorted_sample).sum(axis=0) / count**2
     return first - 0.5 * second
 
 
@@ -86,22 +89,25 @@ def probabilistic_metric_frame(
         raise MetricContractError("event_id must be a nonblank string")
     actual, _ = _aligned(observed, observed)
     sample = _draws(actual, draws)
-    quantiles = np.quantile(sample, [0.05, 0.25, 0.75, 0.95], axis=0)
+    levels = np.round(np.arange(0.05, 1.0, 0.05), 2)
+    quantiles = np.quantile(sample, levels, axis=0)
 
     def pinball(level: float, estimate: np.ndarray) -> float:
         difference = actual - estimate
         return float(np.mean(np.maximum(level * difference, (level - 1.0) * difference)))
 
-    return pl.DataFrame(
-        {
-            "event_id": [event_id],
-            "crps": [float(empirical_crps(actual, sample).mean())],
-            "pinball_05": [pinball(0.05, quantiles[0])],
-            "pinball_95": [pinball(0.95, quantiles[3])],
-            "coverage_50": [float(((actual >= quantiles[1]) & (actual <= quantiles[2])).mean())],
-            "coverage_90": [float(((actual >= quantiles[0]) & (actual <= quantiles[3])).mean())],
-        }
-    )
+    values: dict[str, list[float | str]] = {
+        "event_id": [event_id],
+        "crps": [float(empirical_crps(actual, sample).mean())],
+        "coverage_50": [float(((actual >= quantiles[4]) & (actual <= quantiles[14])).mean())],
+        "coverage_90": [float(((actual >= quantiles[0]) & (actual <= quantiles[18])).mean())],
+    }
+    losses = []
+    for index, level in enumerate(levels):
+        values[f"pinball_{int(level * 100):02d}"] = [pinball(float(level), quantiles[index])]
+        losses.append(values[f"pinball_{int(level * 100):02d}"][0])
+    values["pinball_mean"] = [float(np.mean(losses))]
+    return pl.DataFrame(values)
 
 
 def event_metric_frame(
@@ -121,24 +127,26 @@ def event_metric_frame(
     if len(timestamp_values) != actual.size:
         raise MetricContractError("timestamps must align with event observations")
     crps = empirical_crps(actual, sample)
-    quantiles = np.quantile(sample, [0.05, 0.25, 0.75, 0.95], axis=0)
+    levels = np.round(np.arange(0.05, 1.0, 0.05), 2)
+    quantiles = np.quantile(sample, levels, axis=0)
     error = forecast - actual
-    return pl.DataFrame(
-        {
-            "event_id": [event_id] * actual.size,
-            "target_timestamp": timestamp_values,
-            "observed_mw": actual,
-            "point_forecast_mw": forecast,
-            "absolute_error": np.abs(error),
-            "squared_error": error**2,
-            "crps": crps,
-            "pinball_05": np.maximum(
-                0.05 * (actual - quantiles[0]), -0.95 * (actual - quantiles[0])
-            ),
-            "pinball_95": np.maximum(
-                0.95 * (actual - quantiles[3]), -0.05 * (actual - quantiles[3])
-            ),
-            "covered_50": (actual >= quantiles[1]) & (actual <= quantiles[2]),
-            "covered_90": (actual >= quantiles[0]) & (actual <= quantiles[3]),
-        }
-    )
+    values: dict[str, object] = {
+        "event_id": [event_id] * actual.size,
+        "target_timestamp": timestamp_values,
+        "observed_mw": actual,
+        "point_forecast_mw": forecast,
+        "absolute_error": np.abs(error),
+        "squared_error": error**2,
+        "crps": crps,
+        "covered_50": (actual >= quantiles[4]) & (actual <= quantiles[14]),
+        "covered_90": (actual >= quantiles[0]) & (actual <= quantiles[18]),
+    }
+    pinballs = []
+    for index, level in enumerate(levels):
+        value = np.maximum(
+            level * (actual - quantiles[index]), (level - 1.0) * (actual - quantiles[index])
+        )
+        values[f"pinball_{int(level * 100):02d}"] = value
+        pinballs.append(value)
+    values["pinball_mean"] = np.mean(np.stack(pinballs), axis=0)
+    return pl.DataFrame(values)

@@ -38,6 +38,8 @@ class HACDMResult:
     bandwidth: int
     event_block_seed: int
     n_hours: int
+    bootstrap_draws: int
+    resampled_units: str
 
 
 def _finite_vector(value: object, *, name: str) -> np.ndarray:
@@ -120,8 +122,9 @@ def hac_dm_test(
     event_ids: Sequence[str],
     bandwidth: int,
     event_block_seed: int,
+    bootstrap_draws: int = 2_000,
 ) -> HACDMResult:
-    """Secondary hourly Diebold--Mariano diagnostic with reported HAC/block settings."""
+    """Secondary HAC-DM with an actual deterministic whole-event block bootstrap p-value."""
 
     reference = _finite_vector(reference_loss, name="reference_loss")
     candidate = _finite_vector(candidate_loss, name="candidate_loss")
@@ -131,6 +134,14 @@ def hac_dm_test(
         raise InferenceContractError("bandwidth must be a non-negative integer")
     if not isinstance(event_block_seed, int) or isinstance(event_block_seed, bool):
         raise InferenceContractError("event_block_seed must be an integer")
+    if (
+        not isinstance(bootstrap_draws, int)
+        or isinstance(bootstrap_draws, bool)
+        or bootstrap_draws <= 0
+    ):
+        raise InferenceContractError("bootstrap_draws must be a positive integer")
+    if any(not isinstance(event_id, str) or not event_id.strip() for event_id in event_ids):
+        raise InferenceContractError("event_ids must be nonblank strings")
     differential = reference - candidate
     centered = differential - differential.mean()
     long_run = float(np.mean(centered**2))
@@ -146,5 +157,24 @@ def hac_dm_test(
         p_value = 1.0 if statistic == 0.0 else 0.0
     else:
         statistic = float(math.sqrt(differential.size) * differential.mean() / math.sqrt(long_run))
-        p_value = float(2.0 * stats.norm.sf(abs(statistic)))
-    return HACDMResult(statistic, p_value, bandwidth, event_block_seed, int(differential.size))
+        blocks = [
+            centered[np.asarray(event_ids) == event_id] for event_id in dict.fromkeys(event_ids)
+        ]
+        rng = np.random.default_rng(event_block_seed)
+        bootstrap = np.empty(bootstrap_draws)
+        for draw in range(bootstrap_draws):
+            chosen = rng.integers(0, len(blocks), size=len(blocks))
+            resampled = np.concatenate([blocks[index] for index in chosen])
+            bootstrap[draw] = math.sqrt(resampled.size) * resampled.mean() / math.sqrt(long_run)
+        p_value = float(
+            (1 + np.count_nonzero(np.abs(bootstrap) >= abs(statistic))) / (bootstrap_draws + 1)
+        )
+    return HACDMResult(
+        statistic,
+        p_value,
+        bandwidth,
+        event_block_seed,
+        int(differential.size),
+        bootstrap_draws,
+        "event",
+    )

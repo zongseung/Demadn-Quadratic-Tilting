@@ -51,9 +51,10 @@ class HQRCData:
         count = arrays["observations"].size
         if count == 0 or any(array.size != count for array in arrays.values()):
             raise ValueError("HQRCData inputs must be aligned non-empty arrays")
-        if not np.isfinite(arrays["observations"].astype(float)).all() or not np.isfinite(
-            arrays["tau_days"].astype(float)
-        ).all():
+        if (
+            not np.isfinite(arrays["observations"].astype(float)).all()
+            or not np.isfinite(arrays["tau_days"].astype(float)).all()
+        ):
             raise ValueError("HQRC observations and tau_days must be finite")
         for name in ("occurrence_index", "holiday_type_index", "hour", "restriction"):
             array = arrays[name]
@@ -173,21 +174,14 @@ def stationary_ar1_logp_numpy(segments: Sequence[np.ndarray], phi: float, sigma:
             (values[0] / stationary_sd) ** 2 + math.log(2 * math.pi * stationary_sd**2)
         )
         innovation = values[1:] - phi * values[:-1]
-        total += float(
-            -0.5 * np.sum((innovation / sigma) ** 2 + math.log(2 * math.pi * sigma**2))
-        )
+        total += float(-0.5 * np.sum((innovation / sigma) ** 2 + math.log(2 * math.pi * sigma**2)))
     return total
 
 
 def _validate_calibration(calibration: ApprovedARCalibration) -> ApprovedARCalibration:
     trusted = require_approved_calibration(calibration)
     values = trusted.calibration
-    if (
-        not math.isfinite(values.a)
-        or not math.isfinite(values.b)
-        or values.a <= 1
-        or values.b <= 1
-    ):
+    if not math.isfinite(values.a) or not math.isfinite(values.b) or values.a <= 1 or values.b <= 1:
         raise ValueError("ARCalibration Beta parameters must be finite and greater than one")
     return trusted
 
@@ -261,6 +255,7 @@ def _occurrence_coefficients(
         )
         cholesky.append(chol)
         scales.append(stds)
+    pm.Deterministic("between_cholesky", pt.stack(cholesky))
     pm.Deterministic("between_scale", pt.stack(scales))
     transformed = pt.stack(
         [pt.dot(cholesky[int(occurrence_type[index])], offset[index]) for index in range(count)]
@@ -282,9 +277,7 @@ def _ar_likelihood(
         phi2 = pacf[1]
         phi1 = pacf[0] * (1.0 - phi2)
         pm.Deterministic("ar2_phi", pt.stack((phi1, phi2)))
-        gamma0 = sigma**2 * (1.0 - phi2) / (
-            (1.0 + phi2) * ((1.0 - phi2) ** 2 - phi1**2)
-        )
+        gamma0 = sigma**2 * (1.0 - phi2) / ((1.0 + phi2) * ((1.0 - phi2) ** 2 - phi1**2))
         gamma1 = phi1 * gamma0 / (1.0 - phi2)
         covariance = pt.stack(((gamma0, gamma1), (gamma1, gamma0)))
         event_terms = []
@@ -296,12 +289,10 @@ def _ar_likelihood(
                 )
             else:
                 initial = pm.logp(pm.MvNormal.dist(mu=pt.zeros(2), cov=covariance), values[:2])
-                innovation_term = (
-                    pm.logp(
-                        pm.Normal.dist(mu=phi1 * values[1:-1] + phi2 * values[:-2], sigma=sigma),
-                        values[2:],
-                    ).sum()
-                )
+                innovation_term = pm.logp(
+                    pm.Normal.dist(mu=phi1 * values[1:-1] + phi2 * values[:-2], sigma=sigma),
+                    values[2:],
+                ).sum()
                 event_terms.append(initial + innovation_term)
         pointwise = pm.Deterministic("event_log_likelihood", pt.stack(event_terms))
         pm.Potential("event_reset_ar2", pointwise.sum())
@@ -313,11 +304,14 @@ def _ar_likelihood(
     if innovation == "student_t_ar1":
         nu_minus_two = pm.Exponential("nu_minus_two", lam=1.0 / 10.0)
         nu = pm.Deterministic("nu", nu_minus_two + 2.0)
+
         def distribution(mu, scale):
             return pm.StudentT.dist(nu=nu, mu=mu, sigma=scale)
     else:
+
         def distribution(mu, scale):
             return pm.Normal.dist(mu=mu, sigma=scale)
+
     event_terms = []
     for segment in data.segments:
         values = residual[segment]

@@ -12,6 +12,8 @@ from hqrc_v3.bayes.predictive import (
     corrected_predictive_draws,
     draw_new_event_correction,
     simulate_stationary_ar1,
+    simulate_stationary_ar2,
+    simulate_student_t_ar1,
 )
 from hqrc_v3.bayes.samplers import (
     SamplingDiagnostics,
@@ -32,6 +34,8 @@ __all__ = [
     "draw_new_event_correction",
     "sample_hqrc",
     "simulate_stationary_ar1",
+    "simulate_stationary_ar2",
+    "simulate_student_t_ar1",
     "stationary_ar1_logp_numpy",
     "validate_inference_data",
 ]

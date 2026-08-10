@@ -48,9 +48,10 @@ def validate_inference_data(idata: az.InferenceData, *, paper_profile: bool) -> 
         divergences = 0
     else:
         raw_diverging = np.asarray(idata.sample_stats["diverging"])
-        if raw_diverging.dtype.kind not in {"b", "i", "u"} or not np.isfinite(
-            raw_diverging.astype(float)
-        ).all():
+        if (
+            raw_diverging.dtype.kind not in {"b", "i", "u"}
+            or not np.isfinite(raw_diverging.astype(float)).all()
+        ):
             raise SamplingError("sample_stats.diverging must be finite boolean/integer diagnostics")
         divergences = int(raw_diverging.sum())
     diagnostics = SamplingDiagnostics(
@@ -139,28 +140,37 @@ def sample_hqrc(
             "hqrc_pymc_version": importlib.metadata.version("pymc"),
             "hqrc_arviz_version": importlib.metadata.version("arviz"),
             "hqrc_diagnostics_json": json.dumps(asdict(diagnostics), sort_keys=True),
-            "hqrc_sampler_json": json.dumps({
-                "draws": draws,
-                "tune": tune,
-                "chains": chains,
-                "seed": seed,
-                "target_accept": target_accept,
-                "paper_profile": paper_profile,
-            }, sort_keys=True),
-            "hqrc_model_json": json.dumps({
-                "variant": variant,
-                "pooling": pooling,
-                "options": asdict(options or HQRCModelOptions()),
-            }, sort_keys=True),
-            "hqrc_calibration_json": json.dumps({
-                "artifact_path": str(trusted_calibration.artifact_path),
-                "artifact_digest": trusted_calibration.artifact_digest,
-                "residual_sha256": trusted_calibration.residual_sha256,
-                "config_sha256": trusted_calibration.config_sha256,
-                "event_sha256": trusted_calibration.event_sha256,
-                "a": trusted_calibration.a,
-                "b": trusted_calibration.b,
-            }, sort_keys=True),
+            "hqrc_sampler_json": json.dumps(
+                {
+                    "draws": draws,
+                    "tune": tune,
+                    "chains": chains,
+                    "seed": seed,
+                    "target_accept": target_accept,
+                    "paper_profile": paper_profile,
+                },
+                sort_keys=True,
+            ),
+            "hqrc_model_json": json.dumps(
+                {
+                    "variant": variant,
+                    "pooling": pooling,
+                    "options": asdict(options or HQRCModelOptions()),
+                },
+                sort_keys=True,
+            ),
+            "hqrc_calibration_json": json.dumps(
+                {
+                    "artifact_path": str(trusted_calibration.artifact_path),
+                    "artifact_digest": trusted_calibration.artifact_digest,
+                    "residual_sha256": trusted_calibration.residual_sha256,
+                    "config_sha256": trusted_calibration.config_sha256,
+                    "event_sha256": trusted_calibration.event_sha256,
+                    "a": trusted_calibration.a,
+                    "b": trusted_calibration.b,
+                },
+                sort_keys=True,
+            ),
         }
     )
     if backend == "nutpie":

@@ -21,6 +21,28 @@ def test_probabilistic_metrics_are_empirical_and_have_requested_intervals():
 
     assert result["crps"].item() == 2.0 / 9.0
     assert set(result.columns) >= {"pinball_05", "pinball_95", "coverage_50", "coverage_90"}
+    assert (
+        len(
+            [
+                column
+                for column in result.columns
+                if column.startswith("pinball_") and column != "pinball_mean"
+            ]
+        )
+        == 19
+    )
+
+
+def test_sorted_empirical_crps_matches_bruteforce_without_quadratic_tensor():
+    rng = np.random.default_rng(4)
+    draws = rng.normal(size=(500, 3))
+    observed = np.array([0.1, -0.2, 0.3])
+    from hqrc_v3.evaluation.metrics import empirical_crps
+
+    expected = np.abs(draws - observed).mean(axis=0) - 0.5 * np.abs(
+        draws[:, None] - draws[None, :]
+    ).mean(axis=(0, 1))
+    np.testing.assert_allclose(empirical_crps(observed, draws), expected)
 
 
 def test_event_metric_frame_preserves_each_exact_timestamp():

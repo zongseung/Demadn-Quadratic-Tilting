@@ -6,6 +6,8 @@ from hqrc_v3.bayes.predictive import (
     corrected_predictive_draws,
     draw_new_event_correction,
     simulate_stationary_ar1,
+    simulate_stationary_ar2,
+    simulate_student_t_ar1,
 )
 
 
@@ -26,11 +28,11 @@ def test_predictive_draws_require_aligned_finite_trajectories():
 
 
 def test_h0_bootstrap_keeps_horizon_blocks_joint():
-    blocks = np.array([[1.0, 2.0], [10.0, 20.0]])
+    blocks = np.array([np.arange(24.0), np.arange(100.0, 124.0)])
     draws = baseline_bootstrap_draws(blocks, draws=20, seed=4)
 
-    assert draws.shape == (20, 2)
-    assert all(tuple(row) in {(1.0, 2.0), (10.0, 20.0)} for row in draws)
+    assert draws.shape == (20, 24)
+    assert all(tuple(row) in {tuple(blocks[0]), tuple(blocks[1])} for row in draws)
 
 
 def test_new_event_no_pooling_draws_training_coefficients_not_heldout():
@@ -53,3 +55,35 @@ def test_stationary_ar_is_joint_and_resets_at_event_start():
 
     assert draws.shape == (1, 4)
     assert np.isfinite(draws).all()
+
+
+def test_partial_pooling_uses_shared_posterior_row_and_full_covariance():
+    posterior = {
+        "mu": np.array([[[1.0, 1.0], [0.0, 0.0]], [[9.0, 9.0], [0.0, 0.0]]]),
+        "between_cholesky": np.array(
+            [
+                [[[0.0, 0.0], [0.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]]],
+                [[[0.0, 0.0], [0.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]]],
+            ]
+        ),
+    }
+    values = draw_new_event_correction(
+        posterior,
+        holiday_type=0,
+        pooling="partial",
+        draws=2,
+        seed=5,
+        sample_indices=np.array([0, 1]),
+    )
+    np.testing.assert_allclose(values, [[1.0, 1.0], [9.0, 9.0]])
+
+
+def test_student_t_and_stationary_ar2_sensitivity_draws_are_finite():
+    student = simulate_student_t_ar1(
+        phi=np.array([0.5]), sigma=np.array([1.0]), nu=np.array([5.0]), horizon=8, seed=2
+    )
+    ar2 = simulate_stationary_ar2(
+        ar2_phi=np.array([[0.4, 0.2]]), sigma=np.array([1.0]), horizon=8, seed=2
+    )
+    assert student.shape == ar2.shape == (1, 8)
+    assert np.isfinite(student).all() and np.isfinite(ar2).all()

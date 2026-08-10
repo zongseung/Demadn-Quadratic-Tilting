@@ -44,6 +44,7 @@ def same_holiday_profile(
     target: pl.DataFrame,
     *,
     value_column: str = "standardized_residual",
+    held_out_occurrence_id: str,
 ) -> np.ndarray:
     """Return an H5 correction with equal-occurrence normalized daily profiles.
 
@@ -52,15 +53,41 @@ def same_holiday_profile(
     level is fit from *training rows only*.  Target values never enter that scale.
     """
 
+    if not isinstance(held_out_occurrence_id, str) or not held_out_occurrence_id.strip():
+        raise SimilarDayError("H5 requires an explicit held-out occurrence id")
     if not isinstance(target, pl.DataFrame):
         raise SimilarDayError("target frame must be a Polars DataFrame")
     train = _finite_profile(training, value_column=value_column)
+    if held_out_occurrence_id in set(train["occurrence_id"].to_list()):
+        raise SimilarDayError("H5 training rows must exclude the held-out occurrence")
     required_target = {"holiday_type", "relative_day", "hour"}
     missing_target = sorted(required_target - set(target.columns))
     if missing_target or target.is_empty():
         raise SimilarDayError(f"target frame is missing required columns: {missing_target}")
     if any(target[column].null_count() for column in required_target):
         raise SimilarDayError("target frame must have complete holiday/day/hour keys")
+    for frame, label in ((train, "training"), (target, "target")):
+        if not frame["relative_day"].cast(pl.Int64, strict=True).equals(frame["relative_day"]):
+            raise SimilarDayError(f"H5 {label} relative_day must be integer-valued")
+    for occurrence in train["occurrence_id"].unique().to_list():
+        for day in (
+            train.filter(pl.col("occurrence_id") == occurrence)["relative_day"].unique().to_list()
+        ):
+            hours = (
+                train.filter(
+                    (pl.col("occurrence_id") == occurrence) & (pl.col("relative_day") == day)
+                )["hour"]
+                .sort()
+                .to_numpy()
+            )
+            if not np.array_equal(hours, np.arange(24)):
+                raise SimilarDayError(
+                    "each H5 training occurrence/day must contain hours 0 through 23"
+                )
+    for day in target["relative_day"].unique().to_list():
+        hours = target.filter(pl.col("relative_day") == day)["hour"].sort().to_numpy()
+        if not np.array_equal(hours, np.arange(24)):
+            raise SimilarDayError("each H5 target day must contain hours 0 through 23")
     holiday_types = target["holiday_type"].unique().to_list()
     if len(holiday_types) != 1:
         raise SimilarDayError("H5 target must contain one holiday type")
@@ -100,7 +127,10 @@ def same_holiday_profile(
             raw_values.extend(float(raw_by_hour[hour]) for hour in common_hours)
             profile_values.extend(mean_profile[hour] for hour in common_hours)
         design = np.asarray(profile_values, dtype=float)
-        scale = float(np.dot(design, raw_values) / np.dot(design, design))
+        denominator = float(np.dot(design, design))
+        if denominator <= np.finfo(float).eps:
+            raise SimilarDayError("H5 least-squares profile denominator is zero")
+        scale = float(np.dot(design, raw_values) / denominator)
         rows.extend(
             {"relative_day": int(day), "hour": int(hour), "correction": scale * mean_profile[hour]}
             for hour in common_hours

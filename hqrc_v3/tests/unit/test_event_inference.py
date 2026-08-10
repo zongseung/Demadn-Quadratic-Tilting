@@ -36,3 +36,5 @@ def test_hac_dm_reports_bandwidth_and_event_block_seed():
 
     assert result.bandwidth == 1
     assert result.event_block_seed == 17
+    assert result.resampled_units == "event"
+    assert result.bootstrap_draws == 2_000
