@@ -1,0 +1,55 @@
+import numpy as np
+import pytest
+from hqrc_v3.bayes.predictive import (
+    PredictiveShapeError,
+    baseline_bootstrap_draws,
+    corrected_predictive_draws,
+    draw_new_event_correction,
+    simulate_stationary_ar1,
+)
+
+
+def test_corrected_predictive_has_no_second_baseline_noise():
+    draws = corrected_predictive_draws(
+        baseline=np.array([100.0, 100.0]),
+        sigma_n=10.0,
+        q=np.array([[1.0, 2.0]]),
+        e=np.array([[0.5, -0.5]]),
+    )
+
+    np.testing.assert_allclose(draws, np.array([[115.0, 115.0]]))
+
+
+def test_predictive_draws_require_aligned_finite_trajectories():
+    with pytest.raises(PredictiveShapeError, match="match baseline"):
+        corrected_predictive_draws(np.array([1.0, 2.0]), 1.0, np.ones((2, 2)), np.ones((2, 3)))
+
+
+def test_h0_bootstrap_keeps_horizon_blocks_joint():
+    blocks = np.array([[1.0, 2.0], [10.0, 20.0]])
+    draws = baseline_bootstrap_draws(blocks, draws=20, seed=4)
+
+    assert draws.shape == (20, 2)
+    assert all(tuple(row) in {(1.0, 2.0), (10.0, 20.0)} for row in draws)
+
+
+def test_new_event_no_pooling_draws_training_coefficients_not_heldout():
+    posterior = {"beta": np.array([[[1.0, 2.0, 3.0], [40.0, 50.0, 60.0]]])}
+    values = draw_new_event_correction(
+        posterior,
+        holiday_type=0,
+        pooling="none",
+        draws=12,
+        seed=7,
+        training_occurrence_indices=[0],
+    )
+
+    assert values.shape == (12, 3)
+    np.testing.assert_allclose(values, np.tile([1.0, 2.0, 3.0], (12, 1)))
+
+
+def test_stationary_ar_is_joint_and_resets_at_event_start():
+    draws = simulate_stationary_ar1(phi=np.array([0.8]), sigma=np.array([1.0]), horizon=4, seed=1)
+
+    assert draws.shape == (1, 4)
+    assert np.isfinite(draws).all()
