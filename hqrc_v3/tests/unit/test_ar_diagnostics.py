@@ -34,6 +34,7 @@ def _residual_frame(*, events: int = 3, rows: int = 120) -> pl.DataFrame:
                     "model": "baseline",
                     "feature_set": "B1",
                     "seed": 17,
+                    "split_id": f"oof-{2020 + event_index}",
                 }
             )
     return pl.DataFrame(records)
@@ -65,6 +66,27 @@ def test_context_rejects_duplicate_gap_unsorted_nonfinite_and_mixed_rows():
                 .alias("standardized_residual")
             )
         )
+
+
+def test_context_allows_distinct_oof_splits_but_rejects_unknown_or_mixed_event_splits():
+    frame = _residual_frame(events=3)
+
+    context = validate_event_residual_context(frame)
+
+    assert context.split_ids == ("oof-2020", "oof-2021", "oof-2022")
+    with pytest.raises(ARCalibrationError, match="unknown split"):
+        validate_event_residual_context(frame.with_columns(pl.lit("oof-2025").alias("split_id")))
+    with pytest.raises(ARCalibrationError, match="one split"):
+        validate_event_residual_context(
+            frame.with_columns(
+                pl.when(pl.int_range(pl.len()) == 1)
+                .then(pl.lit("oof-2021"))
+                .otherwise(pl.col("split_id"))
+                .alias("split_id")
+            )
+        )
+    with pytest.raises(ARCalibrationError, match="integer"):
+        validate_event_residual_context(frame.with_columns(pl.lit(17.5).alias("seed")))
 
 
 def test_detrending_removes_each_event_quadratic_and_hour_harmonics_independently():
@@ -118,7 +140,14 @@ def test_diagnostics_save_exact_48_lag_arrays_and_safe_ljung_box_lag():
         assert len(diagnostic.innovation_acf) == len(diagnostic.innovation_pacf) == 48
         assert diagnostic.ljung_box_lag == 24
         assert np.isfinite(np.asarray(diagnostic.raw_acf)).all()
-        assert np.isfinite(diagnostic.bartlett_95)
+        assert len(diagnostic.raw_acf_lower) == len(diagnostic.raw_acf_upper) == 48
+        assert len(diagnostic.detrended_acf_lower) == len(diagnostic.detrended_acf_upper) == 48
+        assert len(diagnostic.innovation_acf_lower) == len(diagnostic.innovation_acf_upper) == 48
+        assert all(
+            lower < 0 < upper
+            for lower, upper in zip(diagnostic.raw_acf_lower, diagnostic.raw_acf_upper)
+        )
+        assert diagnostic.pacf_reference_half_width > 0
 
 
 def test_beta_calibration_is_finite_capped_and_order_invariant():

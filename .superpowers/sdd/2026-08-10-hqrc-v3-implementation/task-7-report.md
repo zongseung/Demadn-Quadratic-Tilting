@@ -29,3 +29,10 @@ CLI commands for diagnosis and explicit approval.
 - Task 7 unit/integration tests and CLI routing tests
 
 The pre-existing untracked `hqrc_v3/uv.lock` was not modified or staged.
+
+## Fix round 1
+
+- RED: `uv run pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests/unit/test_ar_diagnostics.py hqrc_v3/tests/integration/test_ar_artifact.py hqrc_v3/tests/integration/test_cli_oof.py -q` produced 11 expected failures before the hardening changes, covering multiple OOF split contexts, strict artifact content, and concurrent incompatible writers.
+- GREEN: the same focused command passed with `23 passed`; the complete suite passed with `152 passed`; Ruff and `git diff --check` were clean.
+- Added per-destination advisory locking for readers and writers, with the immutable overwrite decision re-checked under the exclusive lock and temporary-file cleanup on publication failure.
+- Approval and loading now require all three current provenance hashes. Artifacts record sorted split IDs, validate strict calibration provenance and moment-rule recomputation, and serialize lag-specific Bartlett ACF bounds separately from the PACF reference width.
