@@ -34,8 +34,8 @@ class SplitConfig:
     def __post_init__(self) -> None:
         if self.oof_years != (2020, 2021, 2022, 2023) or self.final_year != 2024:
             raise ConfigError("HQRC v3 requires OOF 2020-2023 and final year 2024")
-        if self.first_train_year >= self.oof_years[0]:
-            raise ConfigError("first_train_year must precede the first OOF year")
+        if self.first_train_year != 2019:
+            raise ConfigError("HQRC v3 requires first_train_year to be 2019")
 
 
 @dataclass(frozen=True)

@@ -10,6 +10,9 @@ from typing import Literal, cast
 
 HolidayType = Literal["seollal", "chuseok"]
 _HOLIDAY_TYPES = frozenset(("seollal", "chuseok"))
+_RESTRICTED_OCCURRENCE_IDS = frozenset(
+    ("chuseok-2020", "seollal-2021", "chuseok-2021", "seollal-2022")
+)
 _REQUIRED_COLUMNS = frozenset(
     (
         "occurrence_id",
@@ -96,6 +99,12 @@ def _validate_events(events: tuple[EventOccurrence, ...]) -> tuple[EventOccurren
     return events
 
 
+def _validate_restriction_mapping(events: tuple[EventOccurrence, ...]) -> None:
+    restricted_ids = {event.occurrence_id for event in events if event.restriction == 1}
+    if restricted_ids != _RESTRICTED_OCCURRENCE_IDS:
+        raise EventRegistryError("restriction mapping does not match the HQRC v3 contract")
+
+
 def _load_events(path: Path) -> tuple[EventOccurrence, ...]:
     try:
         with path.open(newline="", encoding="utf-8") as registry_file:
@@ -119,6 +128,7 @@ def load_event_registry(path: Path) -> tuple[EventOccurrence, ...]:
         raise EventRegistryError(
             "correction registry must contain one event per type for 2020-2024"
         )
+    _validate_restriction_mapping(events)
     return events
 
 
@@ -129,4 +139,5 @@ def load_holiday_calendar(path: Path) -> tuple[EventOccurrence, ...]:
     years = {event.central_date.year for event in events}
     if years != {2019, 2020, 2021, 2022, 2023, 2024} or len(events) != 12:
         raise EventRegistryError("feature calendar must contain one event per type for 2019-2024")
+    _validate_restriction_mapping(events)
     return events

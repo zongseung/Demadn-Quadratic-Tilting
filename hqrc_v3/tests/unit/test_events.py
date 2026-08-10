@@ -1,7 +1,8 @@
 from collections import Counter
 from pathlib import Path
 
-from hqrc_v3.events import load_event_registry, load_holiday_calendar
+import pytest
+from hqrc_v3.events import EventRegistryError, load_event_registry, load_holiday_calendar
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -36,3 +37,27 @@ def test_feature_calendar_includes_2019_but_correction_registry_does_not():
         "chuseok-2021",
         "seollal-2022",
     }
+
+
+@pytest.mark.parametrize(
+    ("source_name", "loader"),
+    (("events.csv", load_event_registry), ("holiday_calendar.csv", load_holiday_calendar)),
+)
+def test_registry_rejects_wrong_but_binary_restriction_mapping(tmp_path, source_name, loader):
+    source = PROJECT_ROOT / "configs" / source_name
+    mutated_registry = tmp_path / source_name
+    mutated_registry.write_text(
+        source.read_text(encoding="utf-8")
+        .replace(
+            "seollal-2020,seollal,2020-01-25,2020-01-24,2020-01-27,0",
+            "seollal-2020,seollal,2020-01-25,2020-01-24,2020-01-27,1",
+        )
+        .replace(
+            "chuseok-2020,chuseok,2020-10-01,2020-09-30,2020-10-02,1",
+            "chuseok-2020,chuseok,2020-10-01,2020-09-30,2020-10-02,0",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(EventRegistryError, match="restriction mapping"):
+        loader(mutated_registry)
