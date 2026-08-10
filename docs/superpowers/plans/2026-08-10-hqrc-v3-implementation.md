@@ -1000,6 +1000,106 @@ git add hqrc_v3
 git commit -m "feat(hqrc-v3): complete reproducible experiment workflow"
 ```
 
+### Task 11: Frozen paper baselines and concrete OOF/final execution
+
+**Files:**
+- Modify: `hqrc_v3/configs/model_spaces.toml`
+- Create: `hqrc_v3/src/hqrc_v3/baselines/config.py`
+- Modify: `hqrc_v3/src/hqrc_v3/baselines/classical.py`
+- Modify: `hqrc_v3/src/hqrc_v3/baselines/sequence.py`
+- Modify: `hqrc_v3/src/hqrc_v3/oof.py`
+- Create: `hqrc_v3/src/hqrc_v3/baselines/paper.py`
+- Modify: `hqrc_v3/src/hqrc_v3/cli.py`
+- Modify: `hqrc_v3/README.md`
+- Create: `hqrc_v3/tests/unit/test_paper_baseline_config.py`
+- Create: `hqrc_v3/tests/integration/test_paper_baseline_stages.py`
+- Create: `hqrc_v3/tests/slow/test_real_paper_baseline_stage.py`
+
+**Interfaces:**
+- Consumes: the immutable experiment/event/calendar files, the real hourly source, and a hash-verified `model_spaces.toml`.
+- Produces: `PaperBaselineConfig`, `load_paper_baselines`, `make_paper_factory`, `run_paper_oof_stage`, `run_paper_final_stage`, concrete `generate-oof`/`fit-final-baselines` handlers, member-level neural predictions, and five-seed ensemble predictions.
+
+- [ ] **Step 1: Write exact-config, validation-tail, ensemble, artifact, and CLI tests**
+
+The frozen registry must contain only the five manuscript baselines:
+
+```python
+assert tuple(config.models) == (
+    "xgboost", "lightgbm", "svr", "seq2seq_lstm", "transformer"
+)
+assert config.seq2seq_lstm.layers == 2
+assert config.transformer.layers == 1
+assert config.seq2seq_lstm.seeds == config.transformer.seeds == (11, 23, 37, 41, 53)
+assert config.validation_days == 61
+```
+
+XGBoost, LightGBM, and SVR must remain 24 independent direct-horizon estimators. Seq2Seq-LSTM and Transformer must jointly output 24 hours and receive no target-demand decoder input. The last 61 complete daily samples inside each pre-evaluation training range form an internal, chronological early-stopping partition; evaluation-year samples must never enter it. This is training control, not per-fold model selection. All declared parameters remain identical across four OOF fits and the final fit.
+
+Tests must prove that:
+
+- the versioned config and its SHA-256 select the same five immutable factories;
+- XGBoost/LightGBM use their internal validation tail for early stopping while never accepting an evaluation-year row;
+- SVR keeps the declared RBF `C`, `epsilon`, and `gamma` values;
+- LSTM has two recurrent layers, Transformer has one encoder and one decoder layer, both have hidden size 64/dropout 0.1/learning rate `1e-3`/batch 64/max 60 epochs;
+- each neural stage retains all five member frames and creates a pointwise arithmetic-mean ensemble frame under one unambiguous ensemble identity;
+- B0 and B1 are independently constructed and cached;
+- OOF output contains exactly 2020--2023 and final output exactly 2024;
+- a hash mismatch, partial output, wrong model name, changed seed set, or changed feature schema fails closed;
+- rerunning a completed stream is a cache hit and does not fit again.
+
+- [ ] **Step 2: Run focused tests and verify RED**
+
+Run: `uv run pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests/unit/test_paper_baseline_config.py hqrc_v3/tests/integration/test_paper_baseline_stages.py -q`
+
+Expected: imports or concrete CLI execution fail because the frozen registry and stages do not exist.
+
+- [ ] **Step 3: Freeze the manuscript model definitions**
+
+Use the manuscript/previously versioned baseline values, without a search stage:
+
+- XGBoost: squared-error objective, RMSE evaluation, `n_estimators=600`, learning rate `0.03`, depth 6, minimum child weight 3, row subsample 0.9, column subsample 0.8, L2 1, histogram trees, early stopping 35 rounds.
+- LightGBM: regression objective, `n_estimators=800`, learning rate `0.025`, 31 leaves, minimum child samples 20, row subsample 0.9 with frequency 1, column subsample 0.8, L2 1, early stopping 35 rounds.
+- SVR: RBF kernel, `C=10`, `epsilon=0.05`, `gamma="scale"`, cache size 512 MB.
+- Seq2Seq-LSTM: two layers, hidden size 64, dropout 0.1, learning rate `1e-3`, batch 64, at most 60 epochs, patience 8, seeds 11/23/37/41/53.
+- Transformer: hidden size 64, four heads, one encoder and one decoder layer, dropout 0.1, learning rate `1e-3`, batch 64, at most 60 epochs, patience 8, the same five seeds.
+
+Outer orchestration may parallelize independent model/feature/seed streams, but every estimator/torch member must use one internal CPU thread so worker count is explicit and oversubscription is prevented. Do not introduce a Rust baseline implementation; Rust remains eligible only after the measured 20% bottleneck gate.
+
+- [ ] **Step 4: Implement immutable stage publication and real CLI handlers**
+
+`generate-oof` and `fit-final-baselines` must load and audit the source, load the holiday calendar, build the selected B0/B1 matrix, verify the frozen config hash, instantiate the requested manuscript model, execute the exact folds, and atomically publish validated Parquet plus JSON provenance. Add an all-model operator that resumes stream by stream, preserves individual neural seed predictions, and publishes ensemble OOF/final files only after all required streams validate.
+
+The final products are:
+
+```text
+predictions/oof_members.parquet
+predictions/oof.parquet
+predictions/final_2024_members.parquet
+predictions/final_2024.parquet
+predictions/baseline_manifest.json
+```
+
+`oof.parquet` and `final_2024.parquet` contain one prediction per model/B0-or-B1/timestamp: classical streams directly and neural streams as the exact five-seed mean. Member files retain every seed. Publication must bind raw-data, experiment, model-config, event-registry, and holiday-calendar hashes. No command may invoke tuning.
+
+- [ ] **Step 5: Verify focused, full-fast, lint, and real one-stream smoke**
+
+Run: `uv run pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests/unit/test_paper_baseline_config.py hqrc_v3/tests/integration/test_paper_baseline_stages.py -q`
+
+Run: `uv run pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests -m "not slow" -q`
+
+Run: `uv run ruff check --config hqrc_v3/pyproject.toml hqrc_v3/src hqrc_v3/tests`
+
+Run: `uv run pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests/slow/test_real_paper_baseline_stage.py -m slow -q`
+
+The slow test may use one real LightGBM-B1 OOF fold with reduced rounds under an explicitly non-paper smoke profile; it must traverse the same loader/factory/publication code. It must not silently substitute another model.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add hqrc_v3 docs/superpowers/plans/2026-08-10-hqrc-v3-implementation.md
+git commit -m "feat(hqrc-v3): execute frozen paper baselines"
+```
+
 ## Final Verification
 
 - [ ] Run: `uv run pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests -m "not slow" -q`
