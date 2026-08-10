@@ -194,14 +194,21 @@ def test_horizon_regressor_uses_only_its_matching_future_covariates(tiny_forecas
 
 
 @pytest.mark.parametrize("stream", ["history", "future"])
-def test_horizon_regressor_rejects_reordered_feature_columns(
-    tiny_forecast_matrix, stream
+@pytest.mark.parametrize("change", ["reordered", "renamed"])
+def test_horizon_regressor_rejects_changed_feature_columns(
+    tiny_forecast_matrix, stream, change
 ):
     fitted = make_classical_baseline("svr", {"C": 1.0}).fit(
         tiny_forecast_matrix.take(np.arange(20)), validation=None, seed=7
     )
     batch = tiny_forecast_matrix.take(np.arange(20, 24))
-    if stream == "history":
+    if change == "renamed":
+        columns = getattr(batch, f"{stream}_columns")
+        batch = replace(
+            batch,
+            **{f"{stream}_columns": (f"renamed_{columns[0]}", *columns[1:])},
+        )
+    elif stream == "history":
         batch = replace(
             batch,
             history=batch.history[:, :, ::-1],

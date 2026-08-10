@@ -11,7 +11,7 @@ from hqrc_v3.baselines.sequence import (
     TimeSeriesTransformer,
     TorchBaselineFactory,
 )
-from hqrc_v3.contracts import DataContractError
+from hqrc_v3.contracts import DataContractError, validate_forecast_feature_columns
 
 
 @pytest.fixture
@@ -33,6 +33,20 @@ def tiny_forecast_matrix():
     target = sample[:, 0, 0, None] + hour[:, :, 0] + 0.5
     return ForecastMatrix(
         origins, target_times, history, future, target, ("load", "temperature"), ("hour", "weather")
+    )
+
+
+def _change_feature_schema(matrix, stream, change):
+    values = getattr(matrix, stream)
+    columns = getattr(matrix, f"{stream}_columns")
+    if change == "reordered":
+        return replace(
+            matrix,
+            **{stream: values[:, :, ::-1], f"{stream}_columns": columns[::-1]},
+        )
+    return replace(
+        matrix,
+        **{f"{stream}_columns": (f"renamed_{columns[0]}", *columns[1:])},
     )
 
 
@@ -117,24 +131,14 @@ def test_sequence_fitted_predict_requires_fitted_feature_width(tiny_forecast_mat
         fitted.predict(malformed)
 
 
+@pytest.mark.parametrize("change", ["reordered", "renamed"])
 @pytest.mark.parametrize("stream", ["history", "future"])
-def test_sequence_fit_rejects_reordered_validation_feature_columns(
-    tiny_forecast_matrix, stream
+def test_sequence_fit_rejects_changed_validation_feature_columns(
+    tiny_forecast_matrix, stream, change
 ):
     train = tiny_forecast_matrix.take(np.arange(16))
     validation = tiny_forecast_matrix.take(np.arange(16, 24))
-    if stream == "history":
-        validation = replace(
-            validation,
-            history=validation.history[:, :, ::-1],
-            history_columns=validation.history_columns[::-1],
-        )
-    else:
-        validation = replace(
-            validation,
-            future=validation.future[:, :, ::-1],
-            future_columns=validation.future_columns[::-1],
-        )
+    validation = _change_feature_schema(validation, stream, change)
     config = SequenceTrainingConfig(
         hidden_size=8, layers=1, heads=2, dropout=0.0, epochs=1, batch_size=8, seeds=(3,)
     )
@@ -143,26 +147,18 @@ def test_sequence_fit_rejects_reordered_validation_feature_columns(
         TorchBaselineFactory("lstm", config).fit(train, validation, seed=3)
 
 
+@pytest.mark.parametrize("change", ["reordered", "renamed"])
 @pytest.mark.parametrize("stream", ["history", "future"])
-def test_sequence_predict_rejects_reordered_feature_columns(tiny_forecast_matrix, stream):
+def test_sequence_predict_rejects_changed_feature_columns(
+    tiny_forecast_matrix, stream, change
+):
     train = tiny_forecast_matrix.take(np.arange(16))
     batch = tiny_forecast_matrix.take(np.arange(16, 24))
     config = SequenceTrainingConfig(
         hidden_size=8, layers=1, heads=2, dropout=0.0, epochs=1, batch_size=8, seeds=(3,)
     )
     fitted = TorchBaselineFactory("lstm", config).fit(train, validation=None, seed=3)
-    if stream == "history":
-        batch = replace(
-            batch,
-            history=batch.history[:, :, ::-1],
-            history_columns=batch.history_columns[::-1],
-        )
-    else:
-        batch = replace(
-            batch,
-            future=batch.future[:, :, ::-1],
-            future_columns=batch.future_columns[::-1],
-        )
+    batch = _change_feature_schema(batch, stream, change)
 
     with pytest.raises(DataContractError, match="feature columns/order"):
         fitted.predict(batch)
@@ -178,3 +174,14 @@ def test_sequence_fit_rejects_duplicate_or_blank_feature_columns(
         TorchBaselineFactory("lstm", SequenceTrainingConfig(epochs=1)).fit(
             malformed, validation=None, seed=3
         )
+
+
+@pytest.mark.parametrize("stream", ["history", "future"])
+def test_shared_feature_validator_rejects_non_tuple_column_collections(
+    tiny_forecast_matrix, stream
+):
+    columns = list(getattr(tiny_forecast_matrix, f"{stream}_columns"))
+    malformed = replace(tiny_forecast_matrix, **{f"{stream}_columns": columns})
+
+    with pytest.raises(DataContractError, match=f"{stream} feature columns must be a tuple"):
+        validate_forecast_feature_columns(malformed)

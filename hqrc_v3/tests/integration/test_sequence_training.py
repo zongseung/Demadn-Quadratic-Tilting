@@ -72,7 +72,9 @@ def test_seed_ensemble_retains_member_predictions_and_mean_identity(tiny_forecas
     )
 
 
-def test_seed_ensemble_rejects_reordered_feature_columns(tiny_forecast_matrix):
+def test_seed_ensemble_prediction_apis_reject_reordered_feature_columns(
+    tiny_forecast_matrix,
+):
     train = tiny_forecast_matrix.take(np.arange(16))
     ensemble = fit_seed_ensemble("lstm", train, None, _config(epochs=1))
     batch = tiny_forecast_matrix.take(np.arange(16, 24))
@@ -84,6 +86,8 @@ def test_seed_ensemble_rejects_reordered_feature_columns(tiny_forecast_matrix):
 
     with pytest.raises(DataContractError, match="feature columns/order"):
         ensemble.predict_members(reordered)
+    with pytest.raises(DataContractError, match="feature columns/order"):
+        ensemble.predict(reordered)
 
 
 def test_validation_restores_best_state_and_no_validation_runs_fixed_epochs(
