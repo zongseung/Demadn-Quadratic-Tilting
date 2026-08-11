@@ -213,3 +213,11 @@ entries are a known generation subset and contain no `COMPLETE` marker. `COMPLET
 entry, any symlink/unsafe entry, or a current-pointer reference now fails closed and preserves the
 tree byte-for-byte. Direct RED covered unknown and symlink entries on an unreferenced completed
 generation; GREEN: `33 passed in 2.81s`. Prior crash-retry tests remain in the focused suite.
+
+## Fix round 3 verification follow-up
+
+Only the three reported E501 expressions were mechanically wrapped. Focused verification remained
+`33 passed in 2.89s`; full Ruff and `git diff --check` passed; protected lock SHA remains
+`f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`.
+Controller full non-slow verification passed: `507 passed, 8 deselected, 77 warnings in 79.86s`,
+exit 0.
