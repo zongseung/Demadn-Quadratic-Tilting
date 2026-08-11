@@ -8,8 +8,10 @@ import polars as pl
 import pytest
 
 import hqrc_v3.residual_stage as residual_stage
-from hqrc_v3.baselines.config import MODEL_NAMES, PAPER_SEEDS
+from hqrc_v3.baselines.config import MODEL_NAMES, PAPER_SEEDS, load_paper_baselines
+from hqrc_v3.baselines.paper import prediction_coverage_record
 from hqrc_v3.events import EventOccurrence
+from hqrc_v3.features import feature_columns, history_columns
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
 from hqrc_v3.residual_stage import (
     STANDARDIZED_RESIDUAL_COLUMNS,
@@ -187,41 +189,106 @@ def _full_year_prediction_frame(
     )
 
 
+def _source_arguments(config: Path, events: Path) -> dict[str, Path]:
+    return {
+        "data_path": config,
+        "config_path": config,
+        "model_config_path": config.parent / "model_spaces.toml",
+        "event_registry_path": events,
+        "holiday_calendar_path": config.parent / "holiday_calendar.csv",
+        "temporary_holiday_availability_path": (
+            config.parent / "temporary_holiday_availability.csv"
+        ),
+    }
+
+
+def _prepare(
+    run: Path, config: Path, events: Path, *, profile: str = "smoke"
+) -> residual_stage.StandardizedResidualArtifact:
+    return prepare_standardized_residual_artifact(
+        run_dir=run,
+        **_source_arguments(config, events),
+        profile=profile,
+    )
+
+
+def _population(model: str) -> list[dict[str, object]]:
+    one_day = {
+        "count": 1,
+        "start": "2019-01-01T00:00:00",
+        "end": "2019-01-01T00:00:00",
+        "unit": "daily-sample",
+    }
+    one_hour = {
+        "count": 1,
+        "start": "2019-01-01T00:00:00",
+        "end": "2019-01-01T00:00:00",
+        "unit": "unique-hour",
+    }
+    scalers = (
+        {"target": one_hour, "weather": one_hour, "calendar": one_hour}
+        if model in {"seq2seq_lstm", "transformer"}
+        else {"x": one_day, "target": one_hour}
+    )
+    return [
+        {
+            "model": model,
+            "feature_set": "B1",
+            "split_id": "oof-2020",
+            "scalers": scalers,
+        }
+    ]
+
+
 def _write_smoke_baseline_publication(run: Path, config: Path, events: Path) -> None:
     predictions = run / "predictions"
     predictions.mkdir(parents=True)
     point_path = predictions / "oof.parquet"
-    _full_year_prediction_frame(year=2020).write_parquet(point_path)
+    point_frame = _full_year_prediction_frame(year=2020)
+    point_frame.write_parquet(point_path)
+    member_path = predictions / "oof_members.parquet"
+    pl.DataFrame(schema=point_frame.schema).select(point_frame.columns).write_parquet(
+        member_path
+    )
+    sources = _source_arguments(config, events)
+    baseline_config = load_paper_baselines(sources["model_config_path"])
     manifest = {
         "schema_version": 2,
         "profile": "smoke",
         "input_hashes": {
-            "data_sha256": "a" * 64,
+            "data_sha256": file_sha256(sources["data_path"]),
             "experiment_sha256": file_sha256(config),
-            "model_config_sha256": "b" * 64,
+            "model_config_sha256": file_sha256(sources["model_config_path"]),
             "event_registry_sha256": file_sha256(events),
-            "holiday_calendar_sha256": "c" * 64,
-            "temporary_holiday_availability_sha256": "d" * 64,
+            "holiday_calendar_sha256": file_sha256(sources["holiday_calendar_path"]),
+            "temporary_holiday_availability_sha256": file_sha256(
+                sources["temporary_holiday_availability_path"]
+            ),
         },
         "models": ["lightgbm"],
         "feature_sets": ["B1"],
         "classical_seed": 7,
         "neural_seeds": list(PAPER_SEEDS),
         "ensemble_seed": 0,
-        "feature_schemas": {},
-        "preprocessing": {},
+        "feature_schemas": {
+            "B1": {
+                "history": list(history_columns("B1")),
+                "future": list(feature_columns("B1")),
+            }
+        },
+        "preprocessing": baseline_config.preprocessing.to_manifest(),
         "execution_overrides": {"boosting_rounds": 3},
         "stages": {
             "oof": {
                 "eval_years": [2020],
-                "expected_coverage": {"count": 366 * 24, "sha256": "c" * 64},
-                "preprocessing_populations": [],
+                "expected_coverage": prediction_coverage_record(point_frame),
+                "preprocessing_populations": _population("lightgbm"),
                 "split_ids": ["oof-2020"],
                 "streams": [{"model": "lightgbm", "feature_set": "B1", "seeds": [7]}],
                 "artifacts": {
                     "members": {
                         "path": "predictions/oof_members.parquet",
-                        "sha256": "e" * 64,
+                        "sha256": file_sha256(member_path),
                     },
                     "point": {
                         "path": "predictions/oof.parquet",
@@ -236,6 +303,53 @@ def _write_smoke_baseline_publication(run: Path, config: Path, events: Path) -> 
     )
 
 
+def _rewrite_manifest(path: Path, mutate) -> dict[str, object]:
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    mutate(manifest)
+    path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+    return manifest
+
+
+def _write_neural_smoke_baseline_publication(run: Path, config: Path, events: Path) -> None:
+    _write_smoke_baseline_publication(run, config, events)
+    predictions = run / "predictions"
+    point_path = predictions / "oof.parquet"
+    point = _full_year_prediction_frame(
+        year=2020, model="transformer", feature_set="B1", seed=0
+    )
+    point.write_parquet(point_path)
+    member_path = predictions / "oof_members.parquet"
+    members = pl.concat(
+        [
+            _full_year_prediction_frame(
+                year=2020,
+                model="transformer",
+                feature_set="B1",
+                seed=seed,
+            )
+            for seed in PAPER_SEEDS
+        ]
+    )
+    members.write_parquet(member_path)
+    manifest_path = predictions / "baseline_manifest.json"
+
+    def update(manifest: dict[str, object]) -> None:
+        manifest["models"] = ["transformer"]
+        manifest["stages"]["oof"]["preprocessing_populations"] = _population(
+            "transformer"
+        )
+        stage = manifest["stages"]["oof"]
+        stage["streams"] = [
+            {"model": "transformer", "feature_set": "B1", "seeds": list(PAPER_SEEDS)}
+        ]
+        stage["artifacts"]["point"]["sha256"] = file_sha256(point_path)
+        stage["artifacts"]["members"]["sha256"] = file_sha256(member_path)
+
+    _rewrite_manifest(manifest_path, update)
+
+
 def test_prepare_artifact_is_hash_bound_atomic_and_reusable(tmp_path: Path):
     project = Path(__file__).resolve().parents[2]
     config = project / "configs/experiment.toml"
@@ -243,12 +357,7 @@ def test_prepare_artifact_is_hash_bound_atomic_and_reusable(tmp_path: Path):
     run = tmp_path / "run"
     _write_smoke_baseline_publication(run, config, events)
 
-    first = prepare_standardized_residual_artifact(
-        run_dir=run,
-        config_path=config,
-        event_registry_path=events,
-        profile="smoke",
-    )
+    first = _prepare(run, config, events)
     artifact_sha = file_sha256(first.residual_path)
     first_manifest = load_standardized_residual_manifest(
         first.manifest_path,
@@ -282,12 +391,7 @@ def test_prepare_artifact_is_hash_bound_atomic_and_reusable(tmp_path: Path):
         }
     ]
 
-    second = prepare_standardized_residual_artifact(
-        run_dir=run,
-        config_path=config,
-        event_registry_path=events,
-        profile="smoke",
-    )
+    second = _prepare(run, config, events)
     assert second.reused is True
     assert file_sha256(second.residual_path) == artifact_sha
 
@@ -300,12 +404,7 @@ def test_prepare_artifact_is_hash_bound_atomic_and_reusable(tmp_path: Path):
     )
     changed.write_parquet(point)
     with pytest.raises(ArtifactMismatch, match="prediction"):
-        prepare_standardized_residual_artifact(
-            run_dir=run,
-            config_path=config,
-            event_registry_path=events,
-            profile="smoke",
-        )
+        _prepare(run, config, events)
     assert file_sha256(first.residual_path) == artifact_sha
 
 
@@ -329,24 +428,127 @@ def test_prepare_recovers_an_interrupted_first_publication(
 
     monkeypatch.setattr(residual_stage.os, "replace", fail_manifest_replace)
     with pytest.raises(OSError, match="injected"):
-        prepare_standardized_residual_artifact(
-            run_dir=run,
-            config_path=config,
-            event_registry_path=events,
-            profile="smoke",
-        )
+        _prepare(run, config, events)
     assert (run / "inputs/standardized_residuals.parquet").is_file()
     assert not (run / "inputs/standardized_residuals_manifest.json").exists()
 
     monkeypatch.setattr(residual_stage.os, "replace", original_replace)
-    recovered = prepare_standardized_residual_artifact(
-        run_dir=run,
-        config_path=config,
-        event_registry_path=events,
-        profile="smoke",
-    )
+    recovered = _prepare(run, config, events)
     assert recovered.reused is False
     assert recovered.manifest_path.is_file()
+
+
+def test_prepare_rejects_tampered_neural_seed_contract(tmp_path: Path):
+    project = Path(__file__).resolve().parents[2]
+    config = project / "configs/experiment.toml"
+    events = project / "configs/events.csv"
+    run = tmp_path / "run"
+    _write_smoke_baseline_publication(run, config, events)
+    manifest_path = run / "predictions/baseline_manifest.json"
+    _rewrite_manifest(manifest_path, lambda manifest: manifest.__setitem__("neural_seeds", [1]))
+
+    with pytest.raises(ArtifactMismatch, match="neural seed"):
+        _prepare(run, config, events)
+
+
+def test_prepare_rejects_neural_point_that_is_not_exact_member_mean(tmp_path: Path):
+    project = Path(__file__).resolve().parents[2]
+    config = project / "configs/experiment.toml"
+    events = project / "configs/events.csv"
+    run = tmp_path / "run"
+    _write_neural_smoke_baseline_publication(run, config, events)
+    member_path = run / "predictions/oof_members.parquet"
+    changed = pl.read_parquet(member_path).with_columns(
+        pl.when(pl.arange(0, pl.len()) == 0)
+        .then(pl.col("predicted_mw") + 5.0)
+        .otherwise(pl.col("predicted_mw"))
+        .alias("predicted_mw")
+    )
+    changed.write_parquet(member_path)
+    manifest_path = run / "predictions/baseline_manifest.json"
+
+    def rehash(manifest: dict[str, object]) -> None:
+        manifest["stages"]["oof"]["artifacts"]["members"]["sha256"] = file_sha256(
+            member_path
+        )
+
+    _rewrite_manifest(manifest_path, rehash)
+
+    with pytest.raises(ArtifactMismatch, match="five-seed mean"):
+        _prepare(run, config, events)
+
+
+def test_residual_manifest_survives_legitimate_final_stage_append(tmp_path: Path):
+    project = Path(__file__).resolve().parents[2]
+    config = project / "configs/experiment.toml"
+    events = project / "configs/events.csv"
+    run = tmp_path / "run"
+    _write_smoke_baseline_publication(run, config, events)
+    prepared = _prepare(run, config, events)
+    baseline_manifest = run / "predictions/baseline_manifest.json"
+    _rewrite_manifest(
+        baseline_manifest,
+        lambda manifest: manifest["stages"].__setitem__("final", {"legitimate": "append"}),
+    )
+
+    reloaded = load_standardized_residual_manifest(
+        prepared.manifest_path,
+        run_dir=run,
+        config_sha256=file_sha256(config),
+        event_sha256=file_sha256(events),
+    )
+    assert reloaded["outputs"]["standardized_residuals"]["rows"] == 264
+
+
+def test_diagnostic_context_rejects_fake_2024_occurrence_labeled_as_oof_2023():
+    project = Path(__file__).resolve().parents[2]
+    events = residual_stage.load_event_registry(project / "configs/events.csv")
+    frames: list[pl.DataFrame] = []
+    for year in range(2020, 2024):
+        year_events = [event for event in events if event.central_date.year == year]
+        event_days = sorted(
+            {
+                event.window_start + timedelta(days=offset)
+                for event in year_events
+                for offset in range((event.window_end - event.window_start).days + 1)
+            }
+        )
+        non_event_day = date(year, 7, 1)
+        frames.append(
+            _daily_predictions(
+                [*event_days, non_event_day],
+                split_id=f"oof-{year}",
+                residual_by_day={
+                    **{day: 10.0 for day in event_days},
+                    non_event_day: 2.0,
+                },
+            )
+        )
+    frame = build_standardized_residuals(pl.concat(frames), events).frame
+    fake = frame.with_columns(
+        pl.when(pl.col("occurrence_id") == "chuseok-2023")
+        .then(pl.lit("fake-2024"))
+        .otherwise(pl.col("occurrence_id"))
+        .alias("occurrence_id")
+    )
+    context_record = {
+        "model": "lightgbm",
+        "feature_set": "B1",
+        "seed": 7,
+        "split_ids": [f"oof-{year}" for year in range(2020, 2024)],
+        "occurrence_ids": sorted(fake["occurrence_id"].unique().to_list()),
+    }
+
+    with pytest.raises(ArtifactMismatch, match="occurrence"):
+        residual_stage.select_diagnostic_residual_context(
+            fake,
+            {"profile": "paper", "contexts": [context_record]},
+            events=events,
+            model="lightgbm",
+            feature_set="B1",
+            seed=None,
+            through=2023,
+        )
 
 
 def test_paper_profile_requires_all_five_models_and_both_feature_sets(tmp_path: Path):
@@ -357,12 +559,7 @@ def test_paper_profile_requires_all_five_models_and_both_feature_sets(tmp_path: 
     _write_smoke_baseline_publication(run, config, events)
 
     with pytest.raises(ArtifactMismatch, match="profile"):
-        prepare_standardized_residual_artifact(
-            run_dir=run,
-            config_path=config,
-            event_registry_path=events,
-            profile="paper",
-        )
+        _prepare(run, config, events, profile="paper")
     assert tuple(MODEL_NAMES) == (
         "xgboost",
         "lightgbm",

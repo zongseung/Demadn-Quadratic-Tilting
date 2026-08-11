@@ -820,6 +820,37 @@ def _validate_published_frames(
         raise ArtifactMismatch("classical-only publication must have no member rows")
 
 
+def prediction_coverage_record(frame: pl.DataFrame) -> dict[str, object]:
+    """Return the canonical coverage identity used by baseline publications."""
+
+    return _coverage_record(frame.select(_COVERAGE_COLUMNS))
+
+
+def validate_published_prediction_frames(
+    members: pl.DataFrame,
+    point: pl.DataFrame,
+    *,
+    models: tuple[str, ...],
+    feature_sets: tuple[FeatureSet, ...],
+    split_ids: tuple[str, ...],
+    eval_years: tuple[int, ...],
+    classical_seed: int,
+    expected_coverage: Mapping[str, object],
+) -> None:
+    """Apply the baseline publisher's exact point/member semantic checks."""
+
+    _validate_published_frames(
+        members,
+        point,
+        models=models,
+        feature_sets=feature_sets,
+        split_ids=split_ids,
+        eval_years=eval_years,
+        classical_seed=classical_seed,
+        expected_coverage=expected_coverage,
+    )
+
+
 def _read_parquet(path: Path, *, description: str) -> pl.DataFrame:
     try:
         return pl.read_parquet(path)
@@ -1698,6 +1729,8 @@ __all__ = [
     "ENSEMBLE_SEED",
     "PaperStageResult",
     "make_paper_factory",
+    "prediction_coverage_record",
     "run_paper_final_stage",
     "run_paper_oof_stage",
+    "validate_published_prediction_frames",
 ]

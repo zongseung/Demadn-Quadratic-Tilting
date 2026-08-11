@@ -32,7 +32,11 @@ from hqrc_v3.diagnostics.ar import (
 from hqrc_v3.events import load_event_registry, load_holiday_calendar
 from hqrc_v3.features import attach_calendar_features, build_daily_forecast_matrix
 from hqrc_v3.provenance import file_sha256
-from hqrc_v3.residual_stage import prepare_standardized_residual_artifact
+from hqrc_v3.residual_stage import (
+    load_standardized_residual_manifest,
+    prepare_standardized_residual_artifact,
+    select_diagnostic_residual_context,
+)
 
 StageHandler = Callable[[argparse.Namespace], object]
 _EXPECTED_START = "2019-01-01T00:00:00"
@@ -95,8 +99,14 @@ def prepare_residuals_handler(arguments: argparse.Namespace) -> object:
 
     return prepare_standardized_residual_artifact(
         run_dir=Path(arguments.run_dir),
+        data_path=Path(arguments.data),
         config_path=Path(arguments.config),
+        model_config_path=Path(arguments.frozen_model_config),
         event_registry_path=Path(arguments.event_registry),
+        holiday_calendar_path=Path(arguments.holiday_calendar),
+        temporary_holiday_availability_path=Path(
+            arguments.temporary_holiday_availability
+        ),
         profile=arguments.profile,
     )
 
@@ -179,22 +189,33 @@ def _paper_stage_inputs(arguments: argparse.Namespace) -> dict[str, object]:
 
 
 def diagnose_ar_handler(arguments: argparse.Namespace) -> object:
-    residual_path = Path(arguments.residuals)
-    if file_sha256(residual_path) != arguments.residual_sha256:
-        raise StageInputError("diagnose-ar residual-sha256 does not match the residual artifact")
-    residuals = pl.read_parquet(residual_path).filter(
-        (pl.col("model") == arguments.model)
-        & (pl.col("feature_set") == arguments.feature_set)
+    run_dir = Path(arguments.run_dir)
+    manifest_path = run_dir / "inputs/standardized_residuals_manifest.json"
+    if not manifest_path.is_file():
+        raise StageInputError(
+            "diagnose-ar requires the canonical standardized_residuals_manifest.json"
+        )
+    config_path = Path(arguments.config)
+    event_path = Path(arguments.event_registry)
+    config_sha = file_sha256(config_path)
+    event_sha = file_sha256(event_path)
+    manifest = load_standardized_residual_manifest(
+        manifest_path,
+        run_dir=run_dir,
+        config_sha256=config_sha,
+        event_sha256=event_sha,
     )
-    if arguments.seed is not None:
-        residuals = residuals.filter(pl.col("seed") == arguments.seed)
-    if residuals.is_empty():
-        raise StageInputError("diagnose-ar selectors match no standardized residual context")
-    if residuals["seed"].n_unique() != 1:
-        raise StageInputError("diagnose-ar context must resolve to exactly one point-stream seed")
+    residual_path = run_dir / manifest["outputs"]["standardized_residuals"]["path"]
+    residuals = select_diagnostic_residual_context(
+        pl.read_parquet(residual_path),
+        manifest,
+        events=load_event_registry(event_path),
+        model=arguments.model,
+        feature_set=arguments.feature_set,
+        seed=arguments.seed,
+        through=arguments.through,
+    )
     diagnostics = diagnose_event_residuals(residuals)
-    if any(split.split("-", 1)[-1] > str(arguments.through) for split in residuals["split_id"]):
-        raise StageInputError("diagnose-ar residuals include rows later than --through")
     calibration = calibrate_beta_prior(
         np.asarray([item.phi for item in diagnostics]),
         event_ids=tuple(item.occurrence_id for item in diagnostics),
@@ -203,9 +224,9 @@ def diagnose_ar_handler(arguments: argparse.Namespace) -> object:
         Path(arguments.output),
         diagnostics,
         calibration,
-        residual_sha256=arguments.residual_sha256,
-        config_sha256=arguments.config_sha256,
-        event_sha256=arguments.event_sha256,
+        residual_sha256=file_sha256(residual_path),
+        config_sha256=config_sha,
+        event_sha256=event_sha,
         context={
             "model": str(residuals["model"].item(0)),
             "feature_set": str(residuals["feature_set"].item(0)),
@@ -315,18 +336,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="standardize OOF event residuals with fold-local non-event scales",
     )
     residuals.add_argument("--run-dir", required=True, help="run root containing predictions/")
+    residuals.add_argument("--data", required=True, help="hourly source data path")
     residuals.add_argument("--config", required=True, help="experiment TOML path")
+    residuals.add_argument(
+        "--frozen-model-config", required=True, help="selected immutable model config"
+    )
     residuals.add_argument("--event-registry", required=True, help="fixed correction registry")
+    residuals.add_argument("--holiday-calendar", required=True, help="holiday feature calendar")
+    residuals.add_argument(
+        "--temporary-holiday-availability",
+        required=True,
+        help="versioned exceptional-holiday availability CSV",
+    )
     residuals.add_argument("--profile", choices=("paper", "smoke"), default="paper")
 
     diagnose = subcommands.add_parser(
         "diagnose-ar", help="generate an unapproved event-reset AR diagnostic proposal"
     )
-    diagnose.add_argument("--residuals", required=True, help="standardized event residual artifact")
+    diagnose.add_argument("--run-dir", required=True, help="canonical completed run root")
+    diagnose.add_argument("--config", required=True, help="experiment TOML path")
+    diagnose.add_argument("--event-registry", required=True, help="fixed correction registry")
     diagnose.add_argument("--output", required=True, help="unapproved AR diagnostic JSON path")
-    diagnose.add_argument("--residual-sha256", required=True, help="hash of the residual artifact")
-    diagnose.add_argument("--config-sha256", required=True, help="hash of the experiment config")
-    diagnose.add_argument("--event-sha256", required=True, help="hash of the event registry")
     diagnose.add_argument("--through", type=int, required=True, help="latest OOF year included")
     diagnose.add_argument("--model", choices=MODEL_NAMES, required=True)
     diagnose.add_argument("--feature-set", choices=("B0", "B1"), required=True)

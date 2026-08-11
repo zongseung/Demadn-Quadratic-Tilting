@@ -18,10 +18,18 @@ from typing import Any, Literal
 
 import polars as pl
 
-from hqrc_v3.baselines.config import MODEL_NAMES
-from hqrc_v3.baselines.paper import ENSEMBLE_SEED, PAPER_HASH_KEYS
+from hqrc_v3.baselines.config import MODEL_NAMES, PAPER_SEEDS, load_paper_baselines
+from hqrc_v3.baselines.paper import (
+    ENSEMBLE_SEED,
+    PAPER_HASH_KEYS,
+    validate_published_prediction_frames,
+)
+from hqrc_v3.baselines.preprocessing import validate_population_contract
+from hqrc_v3.config import load_config
 from hqrc_v3.contracts import PREDICTION_COLUMNS, DataContractError, validate_prediction_frame
-from hqrc_v3.events import EventOccurrence, load_event_registry
+from hqrc_v3.data import load_temporary_holiday_availability
+from hqrc_v3.events import EventOccurrence, load_event_registry, load_holiday_calendar
+from hqrc_v3.features import feature_columns, history_columns
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
 from hqrc_v3.residuals import compute_fold_scale, standardize_event_residuals
 from hqrc_v3.splits import expanding_oof_folds, fold_for_split_id, is_oof_split_id
@@ -46,8 +54,8 @@ STANDARDIZED_RESIDUAL_COLUMNS = (
     "restriction",
 )
 
-_SCHEMA_VERSION = 1
-_SCHEMA_KIND = "hqrc-v3.standardized-residuals.v1"
+_SCHEMA_VERSION = 2
+_SCHEMA_KIND = "hqrc-v3.standardized-residuals.v2"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _BASELINE_KEYS = {
     "schema_version",
@@ -80,7 +88,17 @@ _MANIFEST_KEYS = {
     "contexts",
     "manifest_sha256",
 }
-_INPUT_KEYS = {"oof_predictions", "baseline_manifest", "experiment_config", "event_registry"}
+_INPUT_KEYS = {
+    "baseline_oof_semantics",
+    "data",
+    "event_registry",
+    "experiment_config",
+    "holiday_calendar",
+    "model_config",
+    "oof_members",
+    "oof_predictions",
+    "temporary_holiday_availability",
+}
 _NEURAL_MODELS = frozenset(("seq2seq_lstm", "transformer"))
 _FEATURE_SETS = ("B0", "B1")
 
@@ -398,15 +416,127 @@ def _require_sha(value: object, description: str) -> str:
     return value
 
 
+def _source_identity(path: Path, description: str) -> dict[str, str]:
+    source = Path(path)
+    if not source.is_file() or source.is_symlink():
+        raise ArtifactMismatch(f"{description} source is missing or unsafe")
+    return {"path": source.resolve().as_posix(), "sha256": file_sha256(source)}
+
+
+def _baseline_oof_projection(manifest: Mapping[str, Any]) -> dict[str, object]:
+    """Return only immutable baseline identity plus the completed OOF stage."""
+
+    if (
+        set(manifest) != _BASELINE_KEYS
+        or type(manifest.get("schema_version")) is not int
+        or manifest.get("schema_version") != 2
+    ):
+        raise ArtifactMismatch("baseline manifest schema differs")
+    stages = manifest.get("stages")
+    if (
+        not isinstance(stages, dict)
+        or "oof" not in stages
+        or not set(stages).issubset({"oof", "final"})
+        or not isinstance(stages["oof"], dict)
+        or set(stages["oof"]) != _BASELINE_OOF_KEYS
+    ):
+        raise ArtifactMismatch("baseline manifest has no OOF stage")
+    return {
+        key: manifest[key]
+        for key in (
+            "schema_version",
+            "profile",
+            "input_hashes",
+            "models",
+            "feature_sets",
+            "classical_seed",
+            "neural_seeds",
+            "ensemble_seed",
+            "feature_schemas",
+            "preprocessing",
+            "execution_overrides",
+        )
+    } | {"oof": stages["oof"]}
+
+
+def _baseline_oof_digest(manifest: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json(_baseline_oof_projection(manifest))).hexdigest()
+
+
+def _validate_preprocessing_populations(
+    value: object,
+    *,
+    models: tuple[str, ...],
+    feature_sets: tuple[str, ...],
+    split_ids: tuple[str, ...],
+) -> None:
+    if not isinstance(value, list):
+        raise ArtifactMismatch("baseline preprocessing populations are invalid")
+    expected = {
+        (model, feature_set, split_id)
+        for model in models
+        for feature_set in feature_sets
+        for split_id in split_ids
+    }
+    actual: set[tuple[str, str, str]] = set()
+    for record in value:
+        if not isinstance(record, dict) or set(record) != {
+            "model",
+            "feature_set",
+            "split_id",
+            "scalers",
+        }:
+            raise ArtifactMismatch("baseline preprocessing population schema differs")
+        if (
+            not isinstance(record["model"], str)
+            or not isinstance(record["feature_set"], str)
+            or not isinstance(record["split_id"], str)
+        ):
+            raise ArtifactMismatch("baseline preprocessing population identity is invalid")
+        key = (record["model"], record["feature_set"], record["split_id"])
+        if key in actual:
+            raise ArtifactMismatch("baseline preprocessing populations contain duplicates")
+        actual.add(key)
+        try:
+            scalers = validate_population_contract(record["scalers"])
+        except (DataContractError, TypeError, ValueError) as error:
+            raise ArtifactMismatch(
+                f"baseline preprocessing population is invalid: {error}"
+            ) from error
+        expected_scalers = (
+            {"target", "weather", "calendar"}
+            if record["model"] in _NEURAL_MODELS
+            else {"x", "target"}
+        )
+        if set(scalers) != expected_scalers:
+            raise ArtifactMismatch("baseline preprocessing scaler identities differ")
+    if actual != expected:
+        raise ArtifactMismatch("baseline preprocessing population coverage differs")
+
+
+def _read_prediction_artifact(path: Path, description: str) -> pl.DataFrame:
+    if not path.is_file() or path.is_symlink():
+        raise ArtifactMismatch(f"{description} artifact is missing or unsafe")
+    try:
+        return pl.read_parquet(path)
+    except (OSError, pl.exceptions.PolarsError) as error:
+        raise ArtifactMismatch(f"{description} artifact is unreadable") from error
+
+
 def _load_baseline_source(
     *,
     run_dir: Path,
+    data_path: Path,
     config_path: Path,
+    model_config_path: Path,
     event_registry_path: Path,
+    holiday_calendar_path: Path,
+    temporary_holiday_availability_path: Path,
     profile: Literal["paper", "smoke"],
 ) -> tuple[pl.DataFrame, dict[str, Any], dict[str, dict[str, str]]]:
     manifest_path = run_dir / "predictions/baseline_manifest.json"
     point_path = run_dir / "predictions/oof.parquet"
+    members_path = run_dir / "predictions/oof_members.parquet"
     manifest = _read_canonical_json(manifest_path, "baseline manifest")
     if (
         set(manifest) != _BASELINE_KEYS
@@ -424,12 +554,38 @@ def _load_baseline_source(
         for value in input_hashes.values()
     ):
         raise ArtifactMismatch("baseline input hashes are invalid")
-    config_sha = file_sha256(config_path)
-    event_sha = file_sha256(event_registry_path)
-    if input_hashes.get("experiment_sha256") != config_sha:
-        raise ArtifactMismatch("experiment config differs from the baseline manifest")
-    if input_hashes.get("event_registry_sha256") != event_sha:
-        raise ArtifactMismatch("event registry differs from the baseline manifest")
+
+    source_paths = {
+        "data_sha256": (Path(data_path), "data"),
+        "experiment_sha256": (Path(config_path), "experiment config"),
+        "model_config_sha256": (Path(model_config_path), "model config"),
+        "event_registry_sha256": (Path(event_registry_path), "event registry"),
+        "holiday_calendar_sha256": (Path(holiday_calendar_path), "holiday calendar"),
+        "temporary_holiday_availability_sha256": (
+            Path(temporary_holiday_availability_path),
+            "temporary holiday availability",
+        ),
+    }
+    source_inputs: dict[str, dict[str, str]] = {}
+    source_names = {
+        "data_sha256": "data",
+        "experiment_sha256": "experiment_config",
+        "model_config_sha256": "model_config",
+        "event_registry_sha256": "event_registry",
+        "holiday_calendar_sha256": "holiday_calendar",
+        "temporary_holiday_availability_sha256": "temporary_holiday_availability",
+    }
+    for hash_name, (source_path, description) in source_paths.items():
+        identity = _source_identity(source_path, description)
+        if input_hashes.get(hash_name) != identity["sha256"]:
+            raise ArtifactMismatch(f"{description} differs from the baseline manifest")
+        source_inputs[source_names[hash_name]] = identity
+
+    load_config(Path(config_path))
+    baseline_config = load_paper_baselines(Path(model_config_path))
+    load_event_registry(Path(event_registry_path))
+    load_holiday_calendar(Path(holiday_calendar_path))
+    load_temporary_holiday_availability(Path(temporary_holiday_availability_path))
     models, feature_sets = manifest.get("models"), manifest.get("feature_sets")
     if (
         not isinstance(models, list)
@@ -450,6 +606,34 @@ def _load_baseline_source(
         tuple(models) != MODEL_NAMES or tuple(feature_sets) != _FEATURE_SETS
     ):
         raise ArtifactMismatch("paper residual preparation requires all five models and B0/B1")
+
+    if manifest.get("neural_seeds") != list(PAPER_SEEDS):
+        raise ArtifactMismatch("baseline neural seed contract differs")
+    if manifest.get("ensemble_seed") != ENSEMBLE_SEED:
+        raise ArtifactMismatch("baseline ensemble seed differs")
+    expected_schemas = {
+        feature_set: {
+            "history": list(history_columns(feature_set)),
+            "future": list(feature_columns(feature_set)),
+        }
+        for feature_set in feature_sets
+    }
+    if manifest.get("feature_schemas") != expected_schemas:
+        raise ArtifactMismatch("baseline feature schemas differ")
+    if manifest.get("preprocessing") != baseline_config.preprocessing.to_manifest():
+        raise ArtifactMismatch("baseline preprocessing contract differs")
+    execution_overrides = manifest.get("execution_overrides")
+    if profile == "paper":
+        if execution_overrides != {}:
+            raise ArtifactMismatch("paper baseline execution overrides differ")
+    elif execution_overrides != {} and (
+        not isinstance(execution_overrides, dict)
+        or set(execution_overrides) != {"boosting_rounds"}
+        or isinstance(execution_overrides["boosting_rounds"], bool)
+        or not isinstance(execution_overrides["boosting_rounds"], int)
+        or execution_overrides["boosting_rounds"] <= 0
+    ):
+        raise ArtifactMismatch("smoke baseline execution overrides are invalid")
     stages = manifest.get("stages")
     if not isinstance(stages, dict) or "oof" not in stages:
         raise ArtifactMismatch("baseline manifest has no OOF stage")
@@ -473,34 +657,65 @@ def _load_baseline_source(
     paper_splits = [fold.split_id for fold in expanding_oof_folds()]
     if profile == "paper" and split_ids != paper_splits:
         raise ArtifactMismatch("paper residual preparation requires all four OOF folds")
+    models_tuple = tuple(models)
+    feature_sets_tuple = tuple(feature_sets)
+    split_ids_tuple = tuple(split_ids)
+    expected_streams = [
+        {
+            "model": model,
+            "feature_set": feature_set,
+            "seeds": list(
+                PAPER_SEEDS
+                if model in _NEURAL_MODELS
+                else (manifest["classical_seed"],)
+            ),
+        }
+        for model in models_tuple
+        for feature_set in feature_sets_tuple
+    ]
+    if stage.get("streams") != expected_streams:
+        raise ArtifactMismatch("baseline OOF stream contract differs")
+    _validate_preprocessing_populations(
+        stage.get("preprocessing_populations"),
+        models=models_tuple,
+        feature_sets=feature_sets_tuple,
+        split_ids=split_ids_tuple,
+    )
     artifacts = stage.get("artifacts")
     if not isinstance(artifacts, dict) or set(artifacts) != {"members", "point"}:
         raise ArtifactMismatch("baseline OOF artifact schema differs")
-    point = artifacts["point"]
-    if (
-        not isinstance(point, dict)
-        or set(point) != {"path", "sha256"}
-        or point.get("path") != "predictions/oof.parquet"
-    ):
-        raise ArtifactMismatch("baseline OOF point artifact identity differs")
-    recorded_prediction_sha = _require_sha(point.get("sha256"), "OOF prediction")
-    if not point_path.is_file() or point_path.is_symlink():
-        raise ArtifactMismatch("OOF prediction artifact is missing or unsafe")
-    prediction_sha = file_sha256(point_path)
-    if prediction_sha != recorded_prediction_sha:
-        raise ArtifactMismatch("OOF prediction SHA-256 differs from the baseline manifest")
+    expected_artifacts = {
+        "members": (members_path, "predictions/oof_members.parquet"),
+        "point": (point_path, "predictions/oof.parquet"),
+    }
+    artifact_inputs: dict[str, dict[str, str]] = {}
+    loaded: dict[str, pl.DataFrame] = {}
+    for name, (path, relative) in expected_artifacts.items():
+        entry = artifacts[name]
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"path", "sha256"}
+            or entry.get("path") != relative
+        ):
+            raise ArtifactMismatch(f"baseline OOF {name} artifact identity differs")
+        recorded_sha = _require_sha(entry.get("sha256"), f"OOF {name}")
+        loaded[name] = _read_prediction_artifact(path, f"OOF {name}")
+        actual_sha = file_sha256(path)
+        if actual_sha != recorded_sha:
+            label = "point prediction" if name == "point" else "member prediction"
+            raise ArtifactMismatch(f"OOF {label} SHA-256 differs from the baseline manifest")
+        artifact_inputs[f"oof_{'predictions' if name == 'point' else 'members'}"] = {
+            "path": relative,
+            "sha256": actual_sha,
+        }
     try:
-        predictions = _validate_combined_predictions(pl.read_parquet(point_path))
-    except (OSError, pl.exceptions.PolarsError, DataContractError) as error:
+        predictions = _validate_combined_predictions(loaded["point"])
+    except (DataContractError, TypeError, ValueError) as error:
         raise ArtifactMismatch(f"OOF prediction artifact is invalid: {error}") from error
     classical_seed = manifest.get("classical_seed")
-    ensemble_seed = manifest.get("ensemble_seed")
     if (
         isinstance(classical_seed, bool)
         or not isinstance(classical_seed, int)
-        or isinstance(ensemble_seed, bool)
-        or not isinstance(ensemble_seed, int)
-        or ensemble_seed != ENSEMBLE_SEED
     ):
         raise ArtifactMismatch("baseline point-stream seeds are invalid")
     expected = {
@@ -522,17 +737,28 @@ def _load_baseline_source(
     if actual != expected:
         raise ArtifactMismatch("OOF point prediction contexts differ from the baseline manifest")
     _validate_exact_coverage(predictions, expected)
+    try:
+        validate_published_prediction_frames(
+            loaded["members"],
+            predictions,
+            models=models_tuple,
+            feature_sets=feature_sets_tuple,
+            split_ids=split_ids_tuple,
+            eval_years=tuple(eval_years),
+            classical_seed=classical_seed,
+            expected_coverage=stage.get("expected_coverage"),
+        )
+    except (ArtifactMismatch, DataContractError, TypeError, ValueError) as error:
+        if isinstance(error, ArtifactMismatch):
+            raise
+        raise ArtifactMismatch(f"baseline OOF publication is invalid: {error}") from error
     inputs = {
-        "oof_predictions": {
-            "path": "predictions/oof.parquet",
-            "sha256": prediction_sha,
-        },
-        "baseline_manifest": {
+        **source_inputs,
+        **artifact_inputs,
+        "baseline_oof_semantics": {
             "path": "predictions/baseline_manifest.json",
-            "sha256": file_sha256(manifest_path),
+            "sha256": _baseline_oof_digest(manifest),
         },
-        "experiment_config": {"path": config_path.as_posix(), "sha256": config_sha},
-        "event_registry": {"path": event_registry_path.as_posix(), "sha256": event_sha},
     }
     return predictions, manifest, inputs
 
@@ -777,6 +1003,8 @@ def load_standardized_residual_manifest(
         entry = inputs[name]
         if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
             raise ArtifactMismatch("standardized residual input identity is invalid")
+        if not isinstance(entry.get("path"), str) or not entry["path"]:
+            raise ArtifactMismatch("standardized residual input path is invalid")
         _require_sha(entry.get("sha256"), f"{name} input")
     if inputs["experiment_config"]["sha256"] != config_sha256:
         raise ArtifactMismatch("experiment config differs from the residual manifest")
@@ -784,12 +1012,19 @@ def load_standardized_residual_manifest(
         raise ArtifactMismatch("event registry differs from the residual manifest")
     for name, expected_path in (
         ("oof_predictions", "predictions/oof.parquet"),
-        ("baseline_manifest", "predictions/baseline_manifest.json"),
+        ("oof_members", "predictions/oof_members.parquet"),
     ):
         path = _safe_bound_path(Path(run_dir), inputs[name], expected=expected_path)
         if not path.is_file() or path.is_symlink() or file_sha256(path) != inputs[name]["sha256"]:
-            label = "prediction" if name == "oof_predictions" else "baseline manifest"
-            raise ArtifactMismatch(f"{label} input differs from the residual manifest")
+            raise ArtifactMismatch(f"{name} input differs from the residual manifest")
+    baseline_manifest_path = _safe_bound_path(
+        Path(run_dir),
+        inputs["baseline_oof_semantics"],
+        expected="predictions/baseline_manifest.json",
+    )
+    baseline_manifest = _read_canonical_json(baseline_manifest_path, "baseline manifest")
+    if _baseline_oof_digest(baseline_manifest) != inputs["baseline_oof_semantics"]["sha256"]:
+        raise ArtifactMismatch("baseline OOF semantics differ from the residual manifest")
     outputs = manifest.get("outputs")
     if not isinstance(outputs, dict) or set(outputs) != {"standardized_residuals"}:
         raise ArtifactMismatch("standardized residual output manifest differs")
@@ -852,8 +1087,12 @@ def _fsync_directory(path: Path) -> None:
 def prepare_standardized_residual_artifact(
     *,
     run_dir: Path,
+    data_path: Path,
     config_path: Path,
+    model_config_path: Path,
     event_registry_path: Path,
+    holiday_calendar_path: Path,
+    temporary_holiday_availability_path: Path,
     profile: Literal["paper", "smoke"] = "paper",
 ) -> StandardizedResidualArtifact:
     """Build or strictly reuse the canonical all-context OOF residual artifact."""
@@ -868,8 +1107,14 @@ def prepare_standardized_residual_artifact(
     with _publication_lock(inputs_dir):
         predictions, _, inputs = _load_baseline_source(
             run_dir=run,
+            data_path=Path(data_path),
             config_path=config,
+            model_config_path=Path(model_config_path),
             event_registry_path=event_path,
+            holiday_calendar_path=Path(holiday_calendar_path),
+            temporary_holiday_availability_path=Path(
+                temporary_holiday_availability_path
+            ),
             profile=profile,
         )
         config_sha = inputs["experiment_config"]["sha256"]
@@ -928,6 +1173,99 @@ def prepare_standardized_residual_artifact(
         )
 
 
+def select_diagnostic_residual_context(
+    frame: pl.DataFrame,
+    manifest: Mapping[str, Any],
+    *,
+    events: Sequence[EventOccurrence],
+    model: str,
+    feature_set: str,
+    seed: int | None,
+    through: int,
+) -> pl.DataFrame:
+    """Select one manifest-declared context and prove its registered event coverage."""
+
+    _validate_standardized_frame(frame)
+    if model not in MODEL_NAMES or feature_set not in _FEATURE_SETS:
+        raise ArtifactMismatch("diagnostic context selector is invalid")
+    if isinstance(through, bool) or not isinstance(through, int):
+        raise ArtifactMismatch("diagnostic through year must be an integer")
+    profile = manifest.get("profile")
+    if profile not in {"paper", "smoke"}:
+        raise ArtifactMismatch("diagnostic residual profile is invalid")
+    if profile == "paper" and through != 2023:
+        raise ArtifactMismatch("paper AR diagnostics must stop at OOF year 2023")
+    contexts = manifest.get("contexts")
+    if not isinstance(contexts, list):
+        raise ArtifactMismatch("diagnostic residual contexts are invalid")
+    matches = [
+        record
+        for record in contexts
+        if isinstance(record, dict)
+        and record.get("model") == model
+        and record.get("feature_set") == feature_set
+        and (seed is None or record.get("seed") == seed)
+    ]
+    if len(matches) != 1:
+        raise ArtifactMismatch("diagnostic selectors must match one manifest context")
+    record = matches[0]
+    selected_seed = record.get("seed")
+    if isinstance(selected_seed, bool) or not isinstance(selected_seed, int):
+        raise ArtifactMismatch("diagnostic context seed is invalid")
+    selected = frame.filter(
+        (pl.col("model") == model)
+        & (pl.col("feature_set") == feature_set)
+        & (pl.col("seed") == selected_seed)
+    ).sort("model", "feature_set", "seed", "target_timestamp")
+    if selected.is_empty():
+        raise ArtifactMismatch("manifest-declared diagnostic context is absent")
+
+    split_ids = record.get("split_ids")
+    if (
+        not isinstance(split_ids, list)
+        or not split_ids
+        or any(not isinstance(value, str) or not is_oof_split_id(value) for value in split_ids)
+    ):
+        raise ArtifactMismatch("diagnostic split identities are invalid")
+    split_years = [fold_for_split_id(value).eval_year for value in split_ids]
+    if split_ids != [f"oof-{year}" for year in split_years] or split_years != sorted(
+        set(split_years)
+    ):
+        raise ArtifactMismatch("diagnostic split identities are not canonical")
+    if max(split_years) != through or any(year > through for year in split_years):
+        raise ArtifactMismatch("diagnostic residuals do not match the numeric through year")
+    if profile == "paper" and split_ids != [f"oof-{year}" for year in range(2020, 2024)]:
+        raise ArtifactMismatch("paper diagnostics require exact OOF 2020-2023 splits")
+    if sorted(selected["split_id"].unique().to_list()) != split_ids:
+        raise ArtifactMismatch("diagnostic artifact splits differ from its manifest context")
+
+    lookup = _event_lookup(events).filter(pl.col("split_id").is_in(split_ids))
+    expected_occurrences = sorted(lookup["occurrence_id"].unique().to_list())
+    if record.get("occurrence_ids") != expected_occurrences:
+        raise ArtifactMismatch("diagnostic occurrence identities differ from the registry")
+    if sorted(selected["occurrence_id"].unique().to_list()) != expected_occurrences:
+        raise ArtifactMismatch("diagnostic occurrence coverage differs from the registry")
+    if profile == "paper" and (
+        len(expected_occurrences) != 8 or lookup.height != 1_032 or selected.height != 1_032
+    ):
+        raise ArtifactMismatch("paper diagnostic event-window coverage differs")
+
+    metadata = (
+        "target_timestamp",
+        "split_id",
+        "occurrence_id",
+        "holiday_type",
+        "tau_days",
+        "hour",
+        "restriction",
+    )
+    expected_metadata = lookup.select(metadata).sort("target_timestamp")
+    actual_metadata = selected.select(metadata).sort("target_timestamp")
+    if not actual_metadata.equals(expected_metadata):
+        raise ArtifactMismatch("diagnostic event timestamps or metadata differ from the registry")
+    return selected
+
+
 __all__ = [
     "FoldScaleSummary",
     "STANDARDIZED_RESIDUAL_COLUMNS",
@@ -936,4 +1274,5 @@ __all__ = [
     "build_standardized_residuals",
     "load_standardized_residual_manifest",
     "prepare_standardized_residual_artifact",
+    "select_diagnostic_residual_context",
 ]

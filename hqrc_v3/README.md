@@ -136,8 +136,12 @@ Convert the complete OOF point publication into HQRC training targets with:
 ```text
 uv run --project hqrc_v3 --locked hqrc prepare-residuals \
   --run-dir runs/RUN_ID \
+  --data power_demand_final.csv \
   --config hqrc_v3/configs/experiment.toml \
+  --frozen-model-config hqrc_v3/configs/model_spaces.toml \
   --event-registry hqrc_v3/configs/events.csv \
+  --holiday-calendar hqrc_v3/configs/holiday_calendar.csv \
+  --temporary-holiday-availability hqrc_v3/configs/temporary_holiday_availability.csv \
   --profile paper
 ```
 
@@ -175,8 +179,8 @@ Other concrete operator stages are:
 
 ```text
 uv run --project hqrc_v3 --locked hqrc audit-data --data power_demand_final.csv --fixed-bounds --temporary-holiday-availability hqrc_v3/configs/temporary_holiday_availability.csv
-uv run --project hqrc_v3 --locked hqrc prepare-residuals --run-dir runs/RUN_ID --config hqrc_v3/configs/experiment.toml --event-registry hqrc_v3/configs/events.csv --profile paper
-uv run --project hqrc_v3 --locked hqrc diagnose-ar --residuals runs/RUN_ID/inputs/standardized_residuals.parquet --output runs/RUN_ID/ar_diagnostics/lightgbm-B1-proposed.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256 --through 2023 --model lightgbm --feature-set B1
+uv run --project hqrc_v3 --locked hqrc prepare-residuals --run-dir runs/RUN_ID --data power_demand_final.csv --config hqrc_v3/configs/experiment.toml --frozen-model-config hqrc_v3/configs/model_spaces.toml --event-registry hqrc_v3/configs/events.csv --holiday-calendar hqrc_v3/configs/holiday_calendar.csv --temporary-holiday-availability hqrc_v3/configs/temporary_holiday_availability.csv --profile paper
+uv run --project hqrc_v3 --locked hqrc diagnose-ar --run-dir runs/RUN_ID --config hqrc_v3/configs/experiment.toml --event-registry hqrc_v3/configs/events.csv --output runs/RUN_ID/ar_diagnostics/lightgbm-B1-proposed.json --through 2023 --model lightgbm --feature-set B1
 uv run --project hqrc_v3 --locked hqrc approve-ar-calibration --proposal runs/RUN_ID/ar_diagnostics/lightgbm-B1-proposed.json --output runs/RUN_ID/ar_diagnostics/lightgbm-B1-approved.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256
 uv run --project hqrc_v3 --locked hqrc report --run-dir runs/RUN_ID --profile smoke
 ```
