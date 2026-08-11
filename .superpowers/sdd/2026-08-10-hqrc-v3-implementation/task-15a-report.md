@@ -133,3 +133,69 @@ The no-fit Task 14 adapter was rechecked against the existing temporary paper-pu
 and XGBoost-B1 approval. It retained the exact approved split context
 `oof-2020`--`oof-2023`, source profile `paper`, 1,032 training rows, 264 event rows, and scale
 `2290.0780128512224` MW. No original artifact or paper fit was touched.
+
+## Independent-review fix round 2 — pre-run reuse boundary
+
+Review finding: `validate_correction_source` called `run_paper_final_stage` before checking the
+canonical final member/point files and their publication namespace. A missing or invalid final
+publication could therefore enter a runner capable of cache reconstruction or fitting before the
+source gate rejected it.
+
+The amended test matrix removes, rehashes unreadable bytes into, replaces with a symlink, or
+supplies a wrong recorded hash for each final member/point file, and separately adds an unknown
+prediction-namespace entry. Every case requires zero baseline-runner calls. A valid publication
+must call the reuse runner exactly once, and a nonzero `fit_count` remains a hard failure.
+
+```text
+uv run --project hqrc_v3 --locked pytest -c hqrc_v3/pyproject.toml \
+  hqrc_v3/tests/unit/test_correction_source.py -q
+```
+
+Genuine RED: `9 failed, 22 passed in 1.05s`; every failure observed one runner call where zero was
+required. GREEN after moving canonical namespace, regular-file/no-symlink, manifest path/hash,
+and Parquet readability checks ahead of the runner: `31 passed in 1.07s`.
+
+The same complete baseline publication preflight runs again after the reuse call, and the
+canonical manifest must remain byte-semantically unchanged. This preserves the prior
+source-derived semantic checks while closing the pre-call mutation boundary.
+
+Fix commit: `7bddd76` (`fix(hqrc-v3): preflight correction reuse artifacts`).
+
+Final verification:
+
+- Task 14 approval/source/stage/CLI focused suite: `79 passed, 30 expected warnings in 4.38s`;
+- full non-slow suite:
+  `474 passed, 8 deselected, 77 existing tiny-draw warnings in 64.01s`;
+- full project Ruff: `All checks passed!`;
+- `git diff --check`: clean;
+- protected untracked `hqrc_v3/uv.lock` remains byte-identical at
+  `f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`.
+
+The focused command was:
+
+```text
+uv run --project hqrc_v3 --locked pytest -c hqrc_v3/pyproject.toml \
+  hqrc_v3/tests/integration/test_ar_artifact.py \
+  hqrc_v3/tests/unit/test_correction_source.py \
+  hqrc_v3/tests/unit/test_correction_stage.py \
+  hqrc_v3/tests/integration/test_cli_corrections.py -q
+```
+
+The full command was:
+
+```text
+uv run --project hqrc_v3 --locked pytest -c hqrc_v3/pyproject.toml \
+  hqrc_v3/tests -m "not slow" -q
+```
+
+A first direct sandbox-local full run reached `473 passed` but the one PyTensor compilation test
+could not access its existing user-level compile cache. The exact approved `uv --locked` rerun
+above passed all 474 selected tests; this was an execution-permission issue, not a test assertion
+or production-code failure.
+
+The existing `/tmp/hqrc-source-preflight.lKh7Yt` paper-publication copy was revalidated through
+the Task 14 adapter. Completion itself proves the public baseline runner returned
+`fit_count == 0`; it retained the exact XGBoost-B1 context with `oof-2020`--`oof-2023`, source
+profile `paper`, 1,032 training rows, 264 event rows, and scale `2290.0780128512224` MW. Only the
+temporary copy was passed as `run_dir`; no original paper artifact and no PyMC/paper fit was
+touched.
