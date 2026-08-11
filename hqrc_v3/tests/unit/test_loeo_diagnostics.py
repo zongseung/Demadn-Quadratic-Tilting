@@ -439,10 +439,18 @@ def test_completed_namespace_invalid_generation_is_preserved(
         target = tmp_path / "target"
         target.write_bytes(b"evidence")
         (published.generation_dir / "unexpected").symlink_to(target)
-    before = {path.relative_to(published.generation_dir): file_sha256(path) for path in published.generation_dir.rglob("*") if path.is_file() and not path.is_symlink()}
+    before = {
+        path.relative_to(published.generation_dir): file_sha256(path)
+        for path in published.generation_dir.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
     with pytest.raises(LOEOError, match="preserved"):
         publish_loeo_universe(source, CONTEXT, output_dir=output)
-    after = {path.relative_to(published.generation_dir): file_sha256(path) for path in published.generation_dir.rglob("*") if path.is_file() and not path.is_symlink()}
+    after = {
+        path.relative_to(published.generation_dir): file_sha256(path)
+        for path in published.generation_dir.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
     assert after == before
 
 

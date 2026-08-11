@@ -241,7 +241,9 @@ def _recover_publication_debris(
             raise LOEOError("LOEO generation namespace contains incompatible entries")
         digest = _recoverable_generation(entry, identity, source)
         if digest is None:
-            if entry.name == referenced_generation or not _is_removable_incomplete_generation(entry):
+            if entry.name == referenced_generation or not _is_removable_incomplete_generation(
+                entry
+            ):
                 raise LOEOError("LOEO completed generation is invalid and preserved")
             _remove_safe_tree(entry)
         else:
