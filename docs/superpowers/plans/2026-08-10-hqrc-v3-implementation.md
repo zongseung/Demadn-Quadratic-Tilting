@@ -1519,7 +1519,7 @@ that the causal-2024 inputs, hashes, predictions, namespace, and reuse behavior 
 Fail closed on source substitution, rehashed semantic mutation, symlinks, unknown entries, or a
 requested context not present in the validated paper publications.
 
-- [ ] **Step 2: Build the immutable ten-event universe and physical fold inputs**
+- [x] **Step 2: Build the immutable ten-event universe and physical fold inputs**
 
 Create `hqrc_v3/src/hqrc_v3/diagnostics/loeo.py` and unit tests. Construct exactly the registered
 Seollal/Chuseok 2020--2024 occurrences. Preserve the 2020--2023 fold-local standardization already
