@@ -146,3 +146,44 @@ env PYTHONPATH=/Users/ijongseung/Documents/GitHub/arima-type/Demadn-Quadratic-Ti
 ```
 
 No source artifacts, sampling, AR approval, or paper LOEO output was changed.
+
+## Fix round 2/5 — open review findings
+
+Open finding 1: `hqrc_v3/tests/unit/test_loeo_diagnostics.py:263-269` still checks exact
+preserved pre-2024 standardized values for only `seollal-2023`, and `:384-397` still tests
+held-out reinsertion with a stale hash rather than rehashing it to reach held-out semantic
+validation. The new rehashed-fold test at `:439-453` mutates only numeric values.
+
+Open finding 2: `hqrc_v3/src/hqrc_v3/diagnostics/loeo.py:160-194, 219-223, 694-698`: recovery
+conflates incomplete debris with a completed-but-invalid generation. A hash/source/manifest-invalid
+identity-named generation returns `None` and is recursively deleted, even when `current.json`
+already points to it, before normal fail-closed validation runs. Publication then fails with a
+dangling pointer and destroys evidence instead of refusing to overwrite an incompatible complete
+generation.
+
+Fixes:
+
+- Exact standardized-residual preservation is asserted for each of all eight 2020--2023
+  occurrences. Both 2024 event scale assertions remain. Held-out reinsertion now rehashes its
+  fold and all manifest/COMPLETE/current bindings before asserting the specific held-out semantic
+  rejection.
+- Recovery reads any current pointer before cleanup. A same-identity generation with the complete
+  namespace, or one named by `current.json`, is never removed when recovery validation fails; it
+  now raises `LOEOError` and preserves all bytes. Only incomplete, unreferenced, no-symlink
+  same-identity debris remains removable.
+
+Genuine RED:
+
+```text
+uv run pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests/unit/test_loeo_diagnostics.py -q
+2 failed, 29 passed
+```
+
+Both failures reproduced corrupted completed-generation destruction: without a pointer it was
+silently replaced, and with a pointer its tree was removed before rejection. GREEN:
+
+```text
+31 passed in 2.72s
+```
+
+No source artifact, AR proposal/approval, sampling, or paper LOEO output was changed.
