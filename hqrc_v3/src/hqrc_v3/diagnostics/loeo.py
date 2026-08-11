@@ -157,6 +157,22 @@ def _remove_safe_tree(path: Path) -> None:
     path.rmdir()
 
 
+def _is_removable_incomplete_generation(path: Path) -> bool:
+    """Only a known-only, no-COMPLETE, no-symlink generation is disposable debris."""
+
+    try:
+        _require_real_directory(path, "LOEO partial generation")
+        names = {child.name for child in path.iterdir()}
+        if "COMPLETE" in names or not names.issubset(_GENERATION_NAMESPACE):
+            return False
+        for child in path.rglob("*"):
+            if child.is_symlink():
+                return False
+        return True
+    except LOEOError:
+        return False
+
+
 def _recoverable_generation(path: Path, identity: str, source: Mapping[str, object]) -> str | None:
     """Return a complete generation's manifest digest only after structural/hash checks."""
 
@@ -225,8 +241,7 @@ def _recover_publication_debris(
             raise LOEOError("LOEO generation namespace contains incompatible entries")
         digest = _recoverable_generation(entry, identity, source)
         if digest is None:
-            complete = {child.name for child in entry.iterdir()} == _GENERATION_NAMESPACE
-            if complete or entry.name == referenced_generation:
+            if entry.name == referenced_generation or not _is_removable_incomplete_generation(entry):
                 raise LOEOError("LOEO completed generation is invalid and preserved")
             _remove_safe_tree(entry)
         else:

@@ -426,6 +426,26 @@ def test_completed_invalid_generation_is_preserved_on_recovery(
     assert after == before
 
 
+@pytest.mark.parametrize("mutation", ["unknown", "symlink"])
+def test_completed_namespace_invalid_generation_is_preserved(
+    source: ValidatedCorrectionSource, tmp_path: Path, mutation: str
+):
+    output = tmp_path / "loeo"
+    published = publish_loeo_universe(source, CONTEXT, output_dir=output)
+    (output / "current.json").unlink()
+    if mutation == "unknown":
+        (published.generation_dir / "unexpected").write_bytes(b"evidence")
+    else:
+        target = tmp_path / "target"
+        target.write_bytes(b"evidence")
+        (published.generation_dir / "unexpected").symlink_to(target)
+    before = {path.relative_to(published.generation_dir): file_sha256(path) for path in published.generation_dir.rglob("*") if path.is_file() and not path.is_symlink()}
+    with pytest.raises(LOEOError, match="preserved"):
+        publish_loeo_universe(source, CONTEXT, output_dir=output)
+    after = {path.relative_to(published.generation_dir): file_sha256(path) for path in published.generation_dir.rglob("*") if path.is_file() and not path.is_symlink()}
+    assert after == before
+
+
 def _canonical_write(path: Path, value: object) -> None:
     path.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
 
