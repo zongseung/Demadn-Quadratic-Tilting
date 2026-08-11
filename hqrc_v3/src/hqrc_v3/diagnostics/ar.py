@@ -112,6 +112,7 @@ class ApprovedARCalibration:
     """A calibration trusted only after digest and current-input hash validation."""
 
     calibration: ARCalibration
+    context: EventResidualContext
     artifact_path: Path
     residual_sha256: str
     config_sha256: str
@@ -141,6 +142,7 @@ def require_approved_calibration(value: object) -> ApprovedARCalibration:
     )
     if (
         reloaded.calibration != value.calibration
+        or reloaded.context != value.context
         or reloaded.artifact_digest != value.artifact_digest
         or reloaded.artifact_path != value.artifact_path
         or reloaded.residual_sha256 != value.residual_sha256
@@ -506,6 +508,21 @@ def _context_mapping(context: EventResidualContext | dict[str, Any]) -> dict[str
     return dict(sorted(value.items()))
 
 
+def _context_from_mapping(value: Any) -> EventResidualContext:
+    """Materialize only the already schema-validated immutable context payload."""
+
+    try:
+        normalized = _context_mapping(value)
+    except (ARCalibrationError, TypeError, ValueError) as error:
+        raise ArtifactMismatch("AR calibration context is invalid") from error
+    return EventResidualContext(
+        model=str(normalized["model"]),
+        feature_set=str(normalized["feature_set"]),
+        seed=int(normalized["seed"]),
+        split_ids=tuple(str(split_id) for split_id in normalized["split_ids"]),
+    )
+
+
 def _calibration_mapping(calibration: ARCalibration) -> dict[str, Any]:
     if not isinstance(calibration, ARCalibration):
         raise ARCalibrationError("calibration must be an ARCalibration")
@@ -834,8 +851,10 @@ def load_approved_calibration(
         current_event_sha256=current_event_sha256,
     )
     calibration = _calibration_from_mapping(payload.get("calibration"))
+    context = _context_from_mapping(payload.get("context"))
     return ApprovedARCalibration(
         calibration=calibration,
+        context=context,
         artifact_path=path,
         residual_sha256=current_residual_sha256,
         config_sha256=current_config_sha256,

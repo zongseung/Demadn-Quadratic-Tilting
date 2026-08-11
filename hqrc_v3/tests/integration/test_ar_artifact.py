@@ -4,15 +4,18 @@ import fcntl
 import json
 import multiprocessing
 import threading
+from dataclasses import replace
 from hashlib import sha256
 
 import pytest
 from hqrc_v3.diagnostics.ar import (
     ARCalibration,
     ARCalibrationError,
+    EventResidualContext,
     approve_calibration,
     calibrate_beta_prior,
     load_approved_calibration,
+    require_approved_calibration,
     write_ar_diagnostics,
 )
 from hqrc_v3.provenance import ArtifactMismatch
@@ -68,12 +71,47 @@ def test_json_round_trip_approval_and_unapproved_loader_rejection(tmp_path, cali
     assert loaded.residual_sha256 == "residual"
     assert loaded.config_sha256 == "config"
     assert loaded.event_sha256 == "events"
+    assert loaded.context == EventResidualContext(
+        model="baseline",
+        feature_set="B1",
+        seed=1,
+        split_ids=("oof-2020", "oof-2021", "oof-2022"),
+    )
     payload = json.loads(approved.read_text(encoding="utf-8"))
     assert payload["approved"] is True
     assert (
         payload["approved_proposal_digest"]
         == json.loads(proposed.read_text(encoding="utf-8"))["proposal_digest"]
     )
+
+
+def test_opaque_approval_revalidation_rejects_context_substitution(tmp_path, calibration):
+    proposed = _write(tmp_path, calibration)
+    approved_path = approve_calibration(
+        proposed,
+        tmp_path / "approved.json",
+        current_residual_sha256="residual",
+        current_config_sha256="config",
+        current_event_sha256="events",
+    )
+    approved = load_approved_calibration(
+        approved_path,
+        current_residual_sha256="residual",
+        current_config_sha256="config",
+        current_event_sha256="events",
+    )
+    substituted = replace(
+        approved,
+        context=EventResidualContext(
+            model="xgboost",
+            feature_set="B0",
+            seed=99,
+            split_ids=("oof-2020", "oof-2021", "oof-2022"),
+        ),
+    )
+
+    with pytest.raises(ArtifactMismatch, match="wrapper"):
+        require_approved_calibration(substituted)
 
 
 def test_approval_rejects_changed_hashes_tampering_and_incompatible_overwrite(

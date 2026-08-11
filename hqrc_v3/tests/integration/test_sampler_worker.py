@@ -15,6 +15,12 @@ from hqrc_v3.bayes.benchmark import (
     run_sampler_worker,
     write_sampler_request,
 )
+from hqrc_v3.diagnostics.ar import (
+    EventResidualContext,
+    approve_calibration,
+    calibrate_beta_prior,
+    write_ar_diagnostics,
+)
 from hqrc_v3.provenance import file_sha256
 
 FAKE = Path(__file__).parents[1] / "fixtures" / "fake_sampler_worker.py"
@@ -30,10 +36,26 @@ def _digest(value):
 
 def _request(tmp_path, *, backend="pymc"):
     files = {}
-    for name in ("data.npz", "data.json", "approved.json"):
+    for name in ("data.npz", "data.json"):
         path = tmp_path / name
         path.write_text(name)
         files[name] = path
+    proposal = write_ar_diagnostics(
+        tmp_path / "proposal.json",
+        (),
+        calibrate_beta_prior([0.2, 0.4], event_ids=("a", "b")),
+        residual_sha256="a" * 64,
+        config_sha256="b" * 64,
+        event_sha256="c" * 64,
+        context=EventResidualContext("lightgbm", "B1", 7, ("oof-2020",)),
+    )
+    files["approved.json"] = approve_calibration(
+        proposal,
+        tmp_path / "approved.json",
+        current_residual_sha256="a" * 64,
+        current_config_sha256="b" * 64,
+        current_event_sha256="c" * 64,
+    )
     return write_sampler_request(
         tmp_path / "request.json",
         hqrc_npz=files["data.npz"],
@@ -77,6 +99,18 @@ def test_sampler_request_rejects_boolean_version_after_redigest(tmp_path):
     request.write_bytes(_canonical(payload) + b"\n")
 
     with pytest.raises(SamplerWorkerError, match="request version"):
+        load_sampler_request(request)
+
+
+def test_sampler_request_rejects_approved_context_substitution_after_redigest(tmp_path):
+    request = _request(tmp_path)
+    payload = json.loads(request.read_bytes())
+    payload.pop("request_digest")
+    payload["approval"]["context"]["feature_set"] = "B0"
+    payload["request_digest"] = _digest(payload)
+    request.write_bytes(_canonical(payload) + b"\n")
+
+    with pytest.raises(SamplerWorkerError, match="approved context"):
         load_sampler_request(request)
 
 

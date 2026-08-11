@@ -15,6 +15,10 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
+from hqrc_v3.diagnostics.ar import (
+    ApprovedARCalibration,
+    load_approved_calibration,
+)
 from hqrc_v3.provenance import file_sha256
 
 _VERSION = 1
@@ -24,6 +28,7 @@ _REQUEST_KEYS = {
     "hashes",
     "model",
     "sampler",
+    "approval",
     "request_digest",
 }
 _RESULT_KEYS = {
@@ -114,6 +119,20 @@ def _sha(value: object, name: str) -> str:
     return value.lower()
 
 
+def _approval_binding(calibration: ApprovedARCalibration) -> dict[str, object]:
+    context = calibration.context
+    return {
+        "artifact_digest": calibration.artifact_digest,
+        "context": {
+            "model": context.model,
+            "feature_set": context.feature_set,
+            "seed": context.seed,
+            "split_ids": list(context.split_ids),
+        },
+        "event_ids": list(calibration.calibration.event_ids),
+    }
+
+
 def write_sampler_request(
     path: Path,
     *,
@@ -161,6 +180,12 @@ def write_sampler_request(
         raise SamplerWorkerError("sampler profile is invalid")
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise SamplerWorkerError("seed must be a non-negative integer")
+    trusted = load_approved_calibration(
+        input_paths["approved_ar"],
+        current_residual_sha256=residual_sha256,
+        current_config_sha256=config_sha256,
+        current_event_sha256=event_sha256,
+    )
     payload: dict[str, Any] = {
         "schema_version": _VERSION,
         "inputs": inputs,
@@ -170,6 +195,7 @@ def write_sampler_request(
             "event_sha256": _sha(event_sha256, "event_sha256"),
         },
         "model": {"variant": variant, "pooling": pooling, "options": dict(options)},
+        "approval": _approval_binding(trusted),
         "sampler": {
             "backend": backend,
             "seed": seed,
@@ -199,10 +225,7 @@ def load_sampler_request(path: Path) -> dict[str, Any]:
     if not isinstance(digest, str) or digest != _digest(payload):
         raise SamplerWorkerError("sampler request digest differs")
     payload["request_digest"] = digest
-    if (
-        type(payload.get("schema_version")) is not int
-        or payload["schema_version"] != _VERSION
-    ):
+    if type(payload.get("schema_version")) is not int or payload["schema_version"] != _VERSION:
         raise SamplerWorkerError("sampler request version differs")
     if not isinstance(payload.get("inputs"), dict) or set(payload["inputs"]) != {
         "hqrc_npz",
@@ -227,6 +250,14 @@ def load_sampler_request(path: Path) -> dict[str, Any]:
         raise SamplerWorkerError("sampler request provenance hashes differ")
     for name, value in hashes.items():
         _sha(value, name)
+    trusted = load_approved_calibration(
+        Path(payload["inputs"]["approved_ar"]["path"]),
+        current_residual_sha256=hashes["residual_sha256"],
+        current_config_sha256=hashes["config_sha256"],
+        current_event_sha256=hashes["event_sha256"],
+    )
+    if payload.get("approval") != _approval_binding(trusted):
+        raise SamplerWorkerError("sampler request approved context differs")
     model = payload.get("model")
     if not isinstance(model, dict) or set(model) != {"variant", "pooling", "options"}:
         raise SamplerWorkerError("sampler request model schema differs")
@@ -569,10 +600,7 @@ def _validate_benchmark_worker(value: object, *, backend: str) -> dict[str, Any]
         not isinstance(versions, dict)
         or not versions
         or any(
-            not isinstance(name, str)
-            or not name
-            or not isinstance(version, str)
-            or not version
+            not isinstance(name, str) or not name or not isinstance(version, str) or not version
             for name, version in versions.items()
         )
     ):
@@ -599,9 +627,7 @@ def _validate_posterior_audit(value: object) -> float:
                 for item in (left, right)
             ):
                 raise SamplerWorkerError("sampler benchmark posterior mean differs")
-            pooled = _finite_nonnegative(
-                row["pooled_sd"], "sampler benchmark pooled posterior SD"
-            )
+            pooled = _finite_nonnegative(row["pooled_sd"], "sampler benchmark pooled posterior SD")
             distance = _finite_nonnegative(
                 row["distance_sd"], "sampler benchmark posterior distance"
             )
@@ -648,16 +674,12 @@ def _validate_sampler_benchmark_payload(payload: dict[str, Any]) -> None:
     audited_maximum = _validate_posterior_audit(payload["posterior_audit"])
     if not math.isclose(maximum, audited_maximum, rel_tol=1e-12, abs_tol=1e-15):
         raise SamplerWorkerError("sampler benchmark maximum posterior distance differs")
-    expected = sampler_eligible_measurements(
-        pymc, nutpie_measurement, mean_distance_sd=maximum
-    )
+    expected = sampler_eligible_measurements(pymc, nutpie_measurement, mean_distance_sd=maximum)
     if eligible is not expected:
         raise SamplerWorkerError("sampler benchmark eligibility differs from its measurements")
 
 
-def load_sampler_benchmark(
-    path: Path, *, bound_sha256: str | None = None
-) -> dict[str, Any]:
+def load_sampler_benchmark(path: Path, *, bound_sha256: str | None = None) -> dict[str, Any]:
     """Load the canonical production benchmark and recompute every semantic decision."""
 
     artifact = Path(path)
@@ -700,8 +722,7 @@ def benchmark_sampler_processes(
         not set(worker_commands).issubset({"pymc", "nutpie"})
         or "pymc" not in worker_commands
         or any(
-            isinstance(command, (str, bytes)) or not command
-            for command in worker_commands.values()
+            isinstance(command, (str, bytes)) or not command for command in worker_commands.values()
         )
     ):
         raise SamplerWorkerError("worker command mapping is invalid")
@@ -717,9 +738,7 @@ def benchmark_sampler_processes(
             request,
             directory / f"{backend}-result.json",
             timeout_seconds=timeout_seconds,
-            worker_command=(
-                None if worker_commands is None else worker_commands.get(backend)
-            ),
+            worker_command=(None if worker_commands is None else worker_commands.get(backend)),
         )
     if "pymc" not in results:
         raise SamplerWorkerError("required PyMC worker did not run")

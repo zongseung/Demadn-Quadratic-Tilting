@@ -166,6 +166,7 @@ def sample_hqrc(
                     "residual_sha256": trusted_calibration.residual_sha256,
                     "config_sha256": trusted_calibration.config_sha256,
                     "event_sha256": trusted_calibration.event_sha256,
+                    "context": asdict(trusted_calibration.context),
                     "a": trusted_calibration.a,
                     "b": trusted_calibration.b,
                 },

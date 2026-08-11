@@ -59,6 +59,12 @@ def test_tiny_hqrc_sampling_returns_finite_posterior(tmp_path):
         json.loads(idata.attrs["hqrc_calibration_json"])["artifact_digest"]
         == calibration.artifact_digest
     )
+    assert json.loads(idata.attrs["hqrc_calibration_json"])["context"] == {
+        "feature_set": "B0",
+        "model": "model",
+        "seed": 5,
+        "split_ids": ["oof-2020"],
+    }
     netcdf_path = tmp_path / "posterior.nc"
     az.to_netcdf(idata, netcdf_path)
     round_trip = az.from_netcdf(netcdf_path)
