@@ -259,14 +259,12 @@ def test_publish_exact_universe_and_physical_folds(
     assert universe.select("occurrence_id").unique(maintain_order=True)[
         "occurrence_id"
     ].to_list() == list(published.occurrence_ids)
-    assert (
-        universe.filter(pl.col("occurrence_id") == "seollal-2023")[
-            "standardized_residual"
-        ].to_list()
-        == source.load_standardized_context(CONTEXT, through=2023)
-        .filter(pl.col("occurrence_id") == "seollal-2023")["standardized_residual"]
-        .to_list()
-    )
+    oof = source.load_standardized_context(CONTEXT, through=2023)
+    for occurrence_id in (event.occurrence_id for event in _events()[:8]):
+        assert (
+            universe.filter(pl.col("occurrence_id") == occurrence_id)["standardized_residual"].to_list()
+            == oof.filter(pl.col("occurrence_id") == occurrence_id)["standardized_residual"].to_list()
+        )
     for held_out in published.occurrence_ids:
         fold = load_loeo_fold(
             source, CONTEXT, output_dir=tmp_path / "loeo", held_out_occurrence_id=held_out
@@ -391,10 +389,29 @@ def test_loader_rechecks_physical_fold_and_rejects_held_out_reinsertion(
         pl.read_parquet(published.universe_path).filter(pl.col("occurrence_id") == held_out).head(1)
     )
     pl.concat([pl.read_parquet(path), row], how="vertical").write_parquet(path)
-    with pytest.raises(LOEOError, match="hash|held-out"):
+    manifest = json.loads(published.manifest_path.read_bytes())
+    manifest["folds"][held_out]["sha256"] = file_sha256(path)
+    _rehash_manifest(published, tmp_path / "loeo", manifest)
+    with pytest.raises(LOEOError, match="held-out rows"):
         load_loeo_fold(
             source, CONTEXT, output_dir=tmp_path / "loeo", held_out_occurrence_id=held_out
         )
+
+
+@pytest.mark.parametrize("with_pointer", [False, True])
+def test_completed_invalid_generation_is_preserved_on_recovery(
+    source: ValidatedCorrectionSource, tmp_path: Path, with_pointer: bool
+):
+    output = tmp_path / "loeo"
+    published = publish_loeo_universe(source, CONTEXT, output_dir=output)
+    if not with_pointer:
+        (output / "current.json").unlink()
+    published.universe_path.write_bytes(b"corrupt")
+    before = {path.relative_to(published.generation_dir): file_sha256(path) for path in published.generation_dir.rglob("*") if path.is_file()}
+    with pytest.raises(LOEOError):
+        publish_loeo_universe(source, CONTEXT, output_dir=output)
+    after = {path.relative_to(published.generation_dir): file_sha256(path) for path in published.generation_dir.rglob("*") if path.is_file()}
+    assert after == before
 
 
 def _canonical_write(path: Path, value: object) -> None:

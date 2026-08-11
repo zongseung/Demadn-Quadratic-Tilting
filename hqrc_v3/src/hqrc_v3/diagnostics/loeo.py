@@ -209,6 +209,13 @@ def _recover_publication_debris(
         generations.mkdir(mode=0o700)
         _fsync_directory(root)
     _require_real_directory(generations, "LOEO generation namespace")
+    referenced_generation: str | None = None
+    current = root / "current.json"
+    if current.exists():
+        pointer = _read_json(current, "LOEO current pointer")
+        candidate = pointer.get("generation")
+        if isinstance(candidate, str):
+            referenced_generation = candidate
     recovered: str | None = None
     for entry in tuple(generations.iterdir()):
         if entry.name.startswith(".staging-"):
@@ -218,6 +225,9 @@ def _recover_publication_debris(
             raise LOEOError("LOEO generation namespace contains incompatible entries")
         digest = _recoverable_generation(entry, identity, source)
         if digest is None:
+            complete = {child.name for child in entry.iterdir()} == _GENERATION_NAMESPACE
+            if complete or entry.name == referenced_generation:
+                raise LOEOError("LOEO completed generation is invalid and preserved")
             _remove_safe_tree(entry)
         else:
             recovered = digest
