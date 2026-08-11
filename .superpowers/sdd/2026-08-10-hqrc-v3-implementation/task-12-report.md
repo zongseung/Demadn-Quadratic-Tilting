@@ -133,3 +133,68 @@ or change those values.
 
 - `03d9b68 feat(hqrc-v3): enforce causal baseline preprocessing`
 - `docs(hqrc-v3): report Task 12 verification` (this report/ledger commit)
+
+## Fix round 1 — actual fitted preprocessing provenance
+
+Fresh review found one important provenance defect in the initial Task 12
+implementation. The paper stage reconstructed the expected scaler timestamp
+populations from the matrix and published those values as though they had been
+reported by the fitted adapters. Although each fitted preprocessor already held
+its actual population, OOF/final orchestration discarded it and prediction-cache
+metadata did not preserve it across a process restart.
+
+The fix makes the provenance path explicit and fail-closed:
+
+- `FittedBaseline` now requires `population_contract()`. Both the classical and
+  PyTorch fitted adapters delegate this method to their fitted train-only
+  preprocessors, and the returned count/start/end/unit schema is strictly
+  canonicalized.
+- OOF and final results carry the actual fitted population for every fold. Cache
+  hits restore that population without fitting, rather than deriving a
+  replacement from the input matrix.
+- prediction-cache metadata is now exact schema version 2. It binds artifact
+  hashes, actual population, and the Parquet SHA-256 under a combined entry
+  digest. Missing population fields, legacy metadata, metadata mutation, and a
+  rewritten Parquet file all fail closed.
+- the paper stage first requires all five neural seeds for a
+  model/feature/fold to report the same actual population, then compares that
+  agreed value with the independently matrix-derived expectation. Only the
+  verified actual value is persisted in the manifest. A publication interrupted
+  before completion can therefore be rebuilt from stream-cache entries while
+  retaining and rechecking fitted provenance.
+- a direct import of `hqrc_v3.oof` exposed a package initialization cycle; paper
+  orchestration exports are now loaded lazily, so the public OOF module is
+  independently importable.
+
+Genuine RED evidence was recorded before the production changes:
+
+1. `tests/unit/test_oof.py` produced `3 failed`: OOF/final results lacked actual
+   population fields and cache metadata lacked `population_contract`.
+2. The two new paper-stage regressions produced `2 failed`: neither a
+   deliberately misreporting adapter nor inconsistent neural-seed populations
+   were rejected.
+
+Final GREEN evidence for fix round 1:
+
+- amended cache/OOF suite: `32 passed in 1.19s`; after the final timestamp
+  validator hardening, the expanded preprocessing/cache/OOF set was
+  `38 passed in 1.20s`;
+- original Task 12 focused suite: `111 passed in 55.57s`, no warnings;
+- paper-stage integration suite: `52 passed in 54.46s`, no warnings;
+- full non-slow suite: `383 passed, 7 deselected, 47 warnings in 70.20s`;
+- real 51,144-row causal matrix/actual LightGBM smoke: `1 passed in 3.37s`.
+  The smoke deleted the completed publication and successfully rebuilt it from
+  the production stream cache, checking cache schema version 2, Parquet digest,
+  actual population equality, and the republished manifest;
+- full Ruff: `All checks passed!`; lock check resolved the unchanged 134-package
+  lock in 9 ms; staged and working-tree diff checks were clean.
+
+The 47 non-slow warnings are the same inherited tiny-draw ArviZ/runtime
+diagnostic warnings described above. They are unrelated to this baseline
+provenance fix and are explicitly deferred rather than hidden or repaired by
+changing unrelated Bayesian fixtures.
+
+The protected untracked `hqrc_v3/uv.lock` remains unstaged and byte-identical at
+SHA-256 `f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`.
+
+Implementation commit: `1594873 fix(hqrc-v3): bind fitted preprocessing provenance`.
