@@ -851,6 +851,91 @@ def validate_published_prediction_frames(
     )
 
 
+def derive_oof_source_truth(
+    *,
+    matrices: Mapping[str, ForecastMatrix],
+    config: PaperBaselineConfig,
+    models: tuple[str, ...],
+    feature_sets: tuple[FeatureSet, ...],
+    split_ids: tuple[str, ...],
+    eval_years: tuple[int, ...],
+) -> dict[str, object]:
+    """Derive canonical OOF coverage and scaler populations from source matrices."""
+
+    selected_models, selected_features = _require_stage_selection(
+        config=config,
+        models=models,
+        feature_sets=feature_sets,
+        profile="smoke",
+    )
+    normalized, _ = _matrix_contracts(matrices, selected_features)
+    allowed_folds = expanding_oof_folds()
+    folds = tuple(fold for fold in allowed_folds if fold.split_id in split_ids)
+    if tuple(fold.split_id for fold in folds) != split_ids or tuple(
+        fold.eval_year for fold in folds
+    ) != eval_years:
+        raise ArtifactMismatch("OOF source-truth split identities differ")
+    expected_coverage = _expected_stage_coverage(
+        normalized[selected_features[0]], folds
+    )
+    expected_populations = _expected_preprocessing_populations(
+        normalized[selected_features[0]],
+        folds,
+        models=selected_models,
+        feature_sets=selected_features,
+        validation_days=config.validation_days,
+    )
+    return {
+        "expected_coverage": expected_coverage,
+        "preprocessing_populations": expected_populations,
+    }
+
+
+def validate_oof_publication_against_source_matrices(
+    members: pl.DataFrame,
+    point: pl.DataFrame,
+    *,
+    stage_record: Mapping[str, object],
+    matrices: Mapping[str, ForecastMatrix],
+    config: PaperBaselineConfig,
+    models: tuple[str, ...],
+    feature_sets: tuple[FeatureSet, ...],
+    split_ids: tuple[str, ...],
+    eval_years: tuple[int, ...],
+    classical_seed: int,
+) -> None:
+    """Verify an OOF publication against truth reconstructed from source matrices."""
+
+    truth = derive_oof_source_truth(
+        matrices=matrices,
+        config=config,
+        models=models,
+        feature_sets=feature_sets,
+        split_ids=split_ids,
+        eval_years=eval_years,
+    )
+    expected_coverage = truth["expected_coverage"]
+    expected_populations = truth["preprocessing_populations"]
+    if stage_record.get("expected_coverage") != expected_coverage:
+        raise ArtifactMismatch(
+            "OOF expected coverage differs from source-derived observed targets"
+        )
+    if stage_record.get("preprocessing_populations") != expected_populations:
+        raise ArtifactMismatch(
+            "OOF preprocessing populations differ from source-derived populations"
+        )
+    _validate_published_frames(
+        members,
+        point,
+        models=models,
+        feature_sets=feature_sets,
+        split_ids=split_ids,
+        eval_years=eval_years,
+        classical_seed=classical_seed,
+        expected_coverage=expected_coverage,
+    )
+
+
 def _read_parquet(path: Path, *, description: str) -> pl.DataFrame:
     try:
         return pl.read_parquet(path)
@@ -1728,9 +1813,11 @@ __all__ = [
     "ClassicalBaseline",
     "ENSEMBLE_SEED",
     "PaperStageResult",
+    "derive_oof_source_truth",
     "make_paper_factory",
     "prediction_coverage_record",
     "run_paper_final_stage",
     "run_paper_oof_stage",
+    "validate_oof_publication_against_source_matrices",
     "validate_published_prediction_frames",
 ]

@@ -22,14 +22,28 @@ from hqrc_v3.baselines.config import MODEL_NAMES, PAPER_SEEDS, load_paper_baseli
 from hqrc_v3.baselines.paper import (
     ENSEMBLE_SEED,
     PAPER_HASH_KEYS,
-    validate_published_prediction_frames,
+    validate_oof_publication_against_source_matrices,
 )
 from hqrc_v3.baselines.preprocessing import validate_population_contract
 from hqrc_v3.config import load_config
 from hqrc_v3.contracts import PREDICTION_COLUMNS, DataContractError, validate_prediction_frame
-from hqrc_v3.data import load_temporary_holiday_availability
+from hqrc_v3.data import (
+    FIXED_END,
+    FIXED_PUBLIC_HOLIDAY_DATES,
+    FIXED_ROWS,
+    FIXED_START,
+    FIXED_SUBSTITUTE_OR_TEMPORARY_DATES,
+    audit_hourly_data,
+    load_temporary_holiday_availability,
+    read_hourly_data,
+)
 from hqrc_v3.events import EventOccurrence, load_event_registry, load_holiday_calendar
-from hqrc_v3.features import feature_columns, history_columns
+from hqrc_v3.features import (
+    attach_calendar_features,
+    build_daily_forecast_matrix,
+    feature_columns,
+    history_columns,
+)
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
 from hqrc_v3.residuals import compute_fold_scale, standardize_event_residuals
 from hqrc_v3.splits import expanding_oof_folds, fold_for_split_id, is_oof_split_id
@@ -584,8 +598,10 @@ def _load_baseline_source(
     load_config(Path(config_path))
     baseline_config = load_paper_baselines(Path(model_config_path))
     load_event_registry(Path(event_registry_path))
-    load_holiday_calendar(Path(holiday_calendar_path))
-    load_temporary_holiday_availability(Path(temporary_holiday_availability_path))
+    calendar = load_holiday_calendar(Path(holiday_calendar_path))
+    temporary_availability = load_temporary_holiday_availability(
+        Path(temporary_holiday_availability_path)
+    )
     models, feature_sets = manifest.get("models"), manifest.get("feature_sets")
     if (
         not isinstance(models, list)
@@ -738,15 +754,44 @@ def _load_baseline_source(
         raise ArtifactMismatch("OOF point prediction contexts differ from the baseline manifest")
     _validate_exact_coverage(predictions, expected)
     try:
-        validate_published_prediction_frames(
+        paper_bounds = (
+            {
+                "expected_start": FIXED_START,
+                "expected_end": FIXED_END,
+                "expected_rows": FIXED_ROWS,
+                "expected_public_holiday_dates": FIXED_PUBLIC_HOLIDAY_DATES,
+                "expected_substitute_or_temporary_dates": (
+                    FIXED_SUBSTITUTE_OR_TEMPORARY_DATES
+                ),
+                "temporary_holiday_availability": temporary_availability,
+            }
+            if profile == "paper"
+            else {
+                "expected_start": None,
+                "expected_end": None,
+                "expected_rows": None,
+                "temporary_holiday_availability": temporary_availability,
+            }
+        )
+        audited = audit_hourly_data(read_hourly_data(Path(data_path)), **paper_bounds)
+        featured = attach_calendar_features(audited, calendar)
+        matrices = {
+            feature_set: build_daily_forecast_matrix(
+                featured, feature_set=feature_set
+            )
+            for feature_set in feature_sets_tuple
+        }
+        validate_oof_publication_against_source_matrices(
             loaded["members"],
             predictions,
+            stage_record=stage,
+            matrices=matrices,
+            config=baseline_config,
             models=models_tuple,
             feature_sets=feature_sets_tuple,
             split_ids=split_ids_tuple,
             eval_years=tuple(eval_years),
             classical_seed=classical_seed,
-            expected_coverage=stage.get("expected_coverage"),
         )
     except (ArtifactMismatch, DataContractError, TypeError, ValueError) as error:
         if isinstance(error, ArtifactMismatch):

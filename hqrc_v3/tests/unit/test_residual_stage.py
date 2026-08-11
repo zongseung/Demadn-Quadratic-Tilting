@@ -9,9 +9,19 @@ import pytest
 
 import hqrc_v3.residual_stage as residual_stage
 from hqrc_v3.baselines.config import MODEL_NAMES, PAPER_SEEDS, load_paper_baselines
-from hqrc_v3.baselines.paper import prediction_coverage_record
-from hqrc_v3.events import EventOccurrence
-from hqrc_v3.features import feature_columns, history_columns
+from hqrc_v3.baselines.paper import derive_oof_source_truth, prediction_coverage_record
+from hqrc_v3.data import (
+    audit_hourly_data,
+    load_temporary_holiday_availability,
+    read_hourly_data,
+)
+from hqrc_v3.events import EventOccurrence, load_holiday_calendar
+from hqrc_v3.features import (
+    attach_calendar_features,
+    build_daily_forecast_matrix,
+    feature_columns,
+    history_columns,
+)
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
 from hqrc_v3.residual_stage import (
     STANDARDIZED_RESIDUAL_COLUMNS,
@@ -189,9 +199,36 @@ def _full_year_prediction_frame(
     )
 
 
-def _source_arguments(config: Path, events: Path) -> dict[str, Path]:
+def _write_smoke_source(run: Path) -> Path:
+    source = run / "source.csv"
+    if source.is_file():
+        return source
+    run.mkdir(parents=True, exist_ok=True)
+    timestamps = pl.datetime_range(
+        datetime(2019, 1, 1),
+        datetime(2020, 12, 31, 23),
+        interval="1h",
+        eager=True,
+        time_unit="ns",
+    )
+    pl.DataFrame({"일시": timestamps}).with_columns(
+        pl.lit(50.0).alias("hm"),
+        pl.lit(15.0).alias("ta"),
+        pl.lit(100.0).alias("power demand(MW)"),
+        pl.when(pl.col("일시").dt.date() == date(2020, 8, 17))
+        .then(pl.lit("Temporary Public Holiday"))
+        .otherwise(pl.lit(""))
+        .alias("holiday_name"),
+        (pl.col("일시").dt.date() == date(2020, 8, 17))
+        .cast(pl.Int8)
+        .alias("is_holiday_dummies"),
+    ).write_csv(source)
+    return source
+
+
+def _source_arguments(run: Path, config: Path, events: Path) -> dict[str, Path]:
     return {
-        "data_path": config,
+        "data_path": _write_smoke_source(run),
         "config_path": config,
         "model_config_path": config.parent / "model_spaces.toml",
         "event_registry_path": events,
@@ -207,37 +244,35 @@ def _prepare(
 ) -> residual_stage.StandardizedResidualArtifact:
     return prepare_standardized_residual_artifact(
         run_dir=run,
-        **_source_arguments(config, events),
+        **_source_arguments(run, config, events),
         profile=profile,
     )
 
 
-def _population(model: str) -> list[dict[str, object]]:
-    one_day = {
-        "count": 1,
-        "start": "2019-01-01T00:00:00",
-        "end": "2019-01-01T00:00:00",
-        "unit": "daily-sample",
-    }
-    one_hour = {
-        "count": 1,
-        "start": "2019-01-01T00:00:00",
-        "end": "2019-01-01T00:00:00",
-        "unit": "unique-hour",
-    }
-    scalers = (
-        {"target": one_hour, "weather": one_hour, "calendar": one_hour}
-        if model in {"seq2seq_lstm", "transformer"}
-        else {"x": one_day, "target": one_hour}
+def _source_truth(run: Path, config: Path, model: str) -> dict[str, object]:
+    sources = _source_arguments(run, config, config.parent / "events.csv")
+    availability = load_temporary_holiday_availability(
+        sources["temporary_holiday_availability_path"]
     )
-    return [
-        {
-            "model": model,
-            "feature_set": "B1",
-            "split_id": "oof-2020",
-            "scalers": scalers,
-        }
-    ]
+    audited = audit_hourly_data(
+        read_hourly_data(sources["data_path"]),
+        expected_start=None,
+        expected_end=None,
+        expected_rows=None,
+        temporary_holiday_availability=availability,
+    )
+    featured = attach_calendar_features(
+        audited, load_holiday_calendar(sources["holiday_calendar_path"])
+    )
+    matrix = build_daily_forecast_matrix(featured, feature_set="B1")
+    return derive_oof_source_truth(
+        matrices={"B1": matrix},
+        config=load_paper_baselines(sources["model_config_path"]),
+        models=(model,),
+        feature_sets=("B1",),
+        split_ids=("oof-2020",),
+        eval_years=(2020,),
+    )
 
 
 def _write_smoke_baseline_publication(run: Path, config: Path, events: Path) -> None:
@@ -250,8 +285,9 @@ def _write_smoke_baseline_publication(run: Path, config: Path, events: Path) -> 
     pl.DataFrame(schema=point_frame.schema).select(point_frame.columns).write_parquet(
         member_path
     )
-    sources = _source_arguments(config, events)
+    sources = _source_arguments(run, config, events)
     baseline_config = load_paper_baselines(sources["model_config_path"])
+    truth = _source_truth(run, config, "lightgbm")
     manifest = {
         "schema_version": 2,
         "profile": "smoke",
@@ -281,8 +317,8 @@ def _write_smoke_baseline_publication(run: Path, config: Path, events: Path) -> 
         "stages": {
             "oof": {
                 "eval_years": [2020],
-                "expected_coverage": prediction_coverage_record(point_frame),
-                "preprocessing_populations": _population("lightgbm"),
+                "expected_coverage": truth["expected_coverage"],
+                "preprocessing_populations": truth["preprocessing_populations"],
                 "split_ids": ["oof-2020"],
                 "streams": [{"model": "lightgbm", "feature_set": "B1", "seeds": [7]}],
                 "artifacts": {
@@ -337,9 +373,10 @@ def _write_neural_smoke_baseline_publication(run: Path, config: Path, events: Pa
 
     def update(manifest: dict[str, object]) -> None:
         manifest["models"] = ["transformer"]
-        manifest["stages"]["oof"]["preprocessing_populations"] = _population(
-            "transformer"
-        )
+        truth = _source_truth(run, config, "transformer")
+        manifest["stages"]["oof"]["preprocessing_populations"] = truth[
+            "preprocessing_populations"
+        ]
         stage = manifest["stages"]["oof"]
         stage["streams"] = [
             {"model": "transformer", "feature_set": "B1", "seeds": list(PAPER_SEEDS)}
@@ -475,6 +512,64 @@ def test_prepare_rejects_neural_point_that_is_not_exact_member_mean(tmp_path: Pa
     _rewrite_manifest(manifest_path, rehash)
 
     with pytest.raises(ArtifactMismatch, match="five-seed mean"):
+        _prepare(run, config, events)
+
+
+@pytest.mark.parametrize("tamper", ("count", "range"))
+def test_prepare_rejects_self_consistent_but_false_scaler_population(
+    tmp_path: Path, tamper: str
+):
+    project = Path(__file__).resolve().parents[2]
+    config = project / "configs/experiment.toml"
+    events = project / "configs/events.csv"
+    run = tmp_path / "run"
+    _write_smoke_baseline_publication(run, config, events)
+    manifest_path = run / "predictions/baseline_manifest.json"
+
+    def falsify_population(manifest: dict[str, object]) -> None:
+        target = manifest["stages"]["oof"]["preprocessing_populations"][0][
+            "scalers"
+        ]["target"]
+        if tamper == "count":
+            target["count"] += 24
+        else:
+            target["start"] = "2019-01-02T00:00:00"
+
+    _rewrite_manifest(manifest_path, falsify_population)
+
+    with pytest.raises(ArtifactMismatch, match="preprocessing population"):
+        _prepare(run, config, events)
+
+
+def test_prepare_rejects_rehashed_observed_values_that_disagree_with_raw_data(
+    tmp_path: Path,
+):
+    project = Path(__file__).resolve().parents[2]
+    config = project / "configs/experiment.toml"
+    events = project / "configs/events.csv"
+    run = tmp_path / "run"
+    _write_neural_smoke_baseline_publication(run, config, events)
+    point_path = run / "predictions/oof.parquet"
+    member_path = run / "predictions/oof_members.parquet"
+    point = pl.read_parquet(point_path).with_columns(
+        (pl.col("observed_mw") + 1_000.0).alias("observed_mw")
+    )
+    members = pl.read_parquet(member_path).with_columns(
+        (pl.col("observed_mw") + 1_000.0).alias("observed_mw")
+    )
+    point.write_parquet(point_path)
+    members.write_parquet(member_path)
+    manifest_path = run / "predictions/baseline_manifest.json"
+
+    def rebind_to_false_observations(manifest: dict[str, object]) -> None:
+        stage = manifest["stages"]["oof"]
+        stage["artifacts"]["point"]["sha256"] = file_sha256(point_path)
+        stage["artifacts"]["members"]["sha256"] = file_sha256(member_path)
+        stage["expected_coverage"] = prediction_coverage_record(point)
+
+    _rewrite_manifest(manifest_path, rebind_to_false_observations)
+
+    with pytest.raises(ArtifactMismatch, match="observed|source|coverage"):
         _prepare(run, config, events)
 
 
