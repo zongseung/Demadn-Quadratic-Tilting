@@ -4,10 +4,9 @@ import json
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import hqrc_v3.residual_stage as residual_stage
 import polars as pl
 import pytest
-
-import hqrc_v3.residual_stage as residual_stage
 from hqrc_v3.baselines.config import MODEL_NAMES, PAPER_SEEDS, load_paper_baselines
 from hqrc_v3.baselines.paper import derive_oof_source_truth, prediction_coverage_record
 from hqrc_v3.data import (

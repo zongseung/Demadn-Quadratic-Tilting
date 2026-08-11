@@ -16,6 +16,7 @@ from hqrc_v3.baselines.config import MODEL_NAMES, load_paper_baselines
 from hqrc_v3.baselines.paper import run_paper_final_stage, run_paper_oof_stage
 from hqrc_v3.config import ConfigError, load_config
 from hqrc_v3.contracts import DataContractError
+from hqrc_v3.correction_stage import fit_causal_2024_correction
 from hqrc_v3.data import (
     FIXED_PUBLIC_HOLIDAY_DATES,
     FIXED_SUBSTITUTE_OR_TEMPORARY_DATES,
@@ -68,9 +69,7 @@ def audit_data_handler(arguments: argparse.Namespace) -> object:
             "expected_end": datetime.fromisoformat(_EXPECTED_END),
             "expected_rows": _EXPECTED_ROWS,
             "expected_public_holiday_dates": FIXED_PUBLIC_HOLIDAY_DATES,
-            "expected_substitute_or_temporary_dates": (
-                FIXED_SUBSTITUTE_OR_TEMPORARY_DATES
-            ),
+            "expected_substitute_or_temporary_dates": (FIXED_SUBSTITUTE_OR_TEMPORARY_DATES),
             "temporary_holiday_availability": load_temporary_holiday_availability(
                 Path(arguments.temporary_holiday_availability)
             ),
@@ -104,9 +103,7 @@ def prepare_residuals_handler(arguments: argparse.Namespace) -> object:
         model_config_path=Path(arguments.frozen_model_config),
         event_registry_path=Path(arguments.event_registry),
         holiday_calendar_path=Path(arguments.holiday_calendar),
-        temporary_holiday_availability_path=Path(
-            arguments.temporary_holiday_availability
-        ),
+        temporary_holiday_availability_path=Path(arguments.temporary_holiday_availability),
         profile=arguments.profile,
     )
 
@@ -140,9 +137,7 @@ def _paper_stage_inputs(arguments: argparse.Namespace) -> dict[str, object]:
             "expected_end": datetime.fromisoformat(_EXPECTED_END),
             "expected_rows": _EXPECTED_ROWS,
             "expected_public_holiday_dates": FIXED_PUBLIC_HOLIDAY_DATES,
-            "expected_substitute_or_temporary_dates": (
-                FIXED_SUBSTITUTE_OR_TEMPORARY_DATES
-            ),
+            "expected_substitute_or_temporary_dates": (FIXED_SUBSTITUTE_OR_TEMPORARY_DATES),
             "temporary_holiday_availability": temporary_availability,
         }
         if arguments.profile == "paper"
@@ -155,16 +150,12 @@ def _paper_stage_inputs(arguments: argparse.Namespace) -> dict[str, object]:
     )
     audited = audit_hourly_data(read_hourly_data(data_path), **paper_bounds)
     featured = attach_calendar_features(audited, calendar)
-    selected_features = (
-        ("B0", "B1") if arguments.feature_set == "all" else (arguments.feature_set,)
-    )
+    selected_features = ("B0", "B1") if arguments.feature_set == "all" else (arguments.feature_set,)
     matrices = {
         feature_set: build_daily_forecast_matrix(featured, feature_set=feature_set)
         for feature_set in selected_features
     }
-    selected_models = (
-        baseline_config.models if arguments.model == "all" else (arguments.model,)
-    )
+    selected_models = baseline_config.models if arguments.model == "all" else (arguments.model,)
     run_dir = Path(arguments.run_dir)
     cache_dir = Path(arguments.cache_dir or run_dir / "prediction-stream-cache")
     return {
@@ -245,6 +236,25 @@ def approve_ar_calibration_handler(arguments: argparse.Namespace) -> object:
         current_residual_sha256=arguments.residual_sha256,
         current_config_sha256=arguments.config_sha256,
         current_event_sha256=arguments.event_sha256,
+    )
+
+
+def fit_corrections_handler(arguments: argparse.Namespace) -> object:
+    """Fit only the bounded causal-2024 H3 stage from one approved context."""
+
+    if arguments.evaluation == "loeo":
+        raise StageInputError(
+            "loeo requires fold-specific approved calibrations; that stage is not yet implemented"
+        )
+    return fit_causal_2024_correction(
+        run_dir=Path(arguments.run_dir),
+        config_path=Path(arguments.config),
+        approved_ar_path=Path(arguments.approved_ar),
+        sampler_seed=arguments.seed,
+        profile=arguments.profile,
+        draws=arguments.draws,
+        tune=arguments.tune,
+        chains=arguments.chains,
     )
 
 
@@ -383,7 +393,15 @@ def build_parser() -> argparse.ArgumentParser:
     corrections.add_argument("--config", required=True)
     corrections.add_argument("--approved-ar", required=True)
     corrections.add_argument("--evaluation", choices=("causal-2024", "loeo"), required=True)
-    corrections.add_argument("--seed", type=int, required=True)
+    corrections.add_argument(
+        "--seed",
+        type=int,
+        required=True,
+        help="sampler and posterior-predictive RNG seed; baseline seed comes from approval",
+    )
+    corrections.add_argument("--draws", type=int, help="explicit retained draws for smoke")
+    corrections.add_argument("--tune", type=int, help="explicit warm-up draws for smoke")
+    corrections.add_argument("--chains", type=int, help="explicit chains for smoke")
     corrections.add_argument("--profile", choices=("smoke", "paper"), required=True)
 
     ablations = subcommands.add_parser("run-ablations", help="run declared H0--H5 ablations")
@@ -422,7 +440,7 @@ def _default_handlers() -> dict[str, StageHandler]:
         "prepare-residuals": prepare_residuals_handler,
         "diagnose-ar": diagnose_ar_handler,
         "approve-ar-calibration": approve_ar_calibration_handler,
-        "fit-corrections": _unavailable_handler("fit-corrections"),
+        "fit-corrections": fit_corrections_handler,
         "run-ablations": _unavailable_handler("run-ablations"),
         "benchmark-samplers": _unavailable_handler("benchmark-samplers"),
         "report": report_handler,

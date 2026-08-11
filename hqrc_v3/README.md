@@ -182,6 +182,7 @@ uv run --project hqrc_v3 --locked hqrc audit-data --data power_demand_final.csv 
 uv run --project hqrc_v3 --locked hqrc prepare-residuals --run-dir runs/RUN_ID --data power_demand_final.csv --config hqrc_v3/configs/experiment.toml --frozen-model-config hqrc_v3/configs/model_spaces.toml --event-registry hqrc_v3/configs/events.csv --holiday-calendar hqrc_v3/configs/holiday_calendar.csv --temporary-holiday-availability hqrc_v3/configs/temporary_holiday_availability.csv --profile paper
 uv run --project hqrc_v3 --locked hqrc diagnose-ar --run-dir runs/RUN_ID --config hqrc_v3/configs/experiment.toml --event-registry hqrc_v3/configs/events.csv --output runs/RUN_ID/ar_diagnostics/lightgbm-B1-proposed.json --through 2023 --model lightgbm --feature-set B1
 uv run --project hqrc_v3 --locked hqrc approve-ar-calibration --proposal runs/RUN_ID/ar_diagnostics/lightgbm-B1-proposed.json --output runs/RUN_ID/ar_diagnostics/lightgbm-B1-approved.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256
+uv run --project hqrc_v3 --locked hqrc fit-corrections --run-dir runs/RUN_ID --config hqrc_v3/configs/experiment.toml --approved-ar runs/RUN_ID/ar_diagnostics/lightgbm-B1-approved.json --evaluation causal-2024 --seed 20260811 --profile paper
 uv run --project hqrc_v3 --locked hqrc report --run-dir runs/RUN_ID --profile smoke
 ```
 
@@ -189,6 +190,26 @@ Run `diagnose-ar` separately for each of the ten model/feature contexts. The
 selector resolves exactly one point-stream seed and fails if it is ambiguous;
 `--seed` can be supplied as an additional assertion. Diagnosis only writes an
 unapproved proposal. It never creates or updates the approval artifact.
+
+`fit-corrections` runs one approved `(model, feature set, point-stream seed)`
+context per command. Its `--seed` controls only PyMC and posterior-predictive
+randomness; the baseline point-stream seed is read exclusively from the approved
+AR context. The stage rebuilds source-derived matrices and invokes the public
+final-baseline stage only as a validator, requiring `fit_count == 0`, so it never
+refits a baseline. It fits only H3 partial pooling with full covariance,
+restriction effects, and event-reset Gaussian AR(1), using the eight 2020--2023
+OOF occurrences and the `oof-2023` residual scale. Evaluation is limited to the
+264 registered 2024 Seollal/Chuseok hours; 1 October is unchanged. LOEO requires
+separate fold-specific approvals and is intentionally unavailable in this stage.
+
+Smoke correction runs must state their reduced sampler limits explicitly, for
+example `--profile smoke --draws 20 --tune 20 --chains 2`. Paper runs enforce
+four chains, at least 1,000 warm-up draws, at least 1,000 retained draws, target
+acceptance 0.99, and the strict posterior diagnostic gate.
+The command profile is the sampler profile. The source profile is inferred from
+the immutable residual and baseline manifests and recorded separately: a paper
+sampler requires paper sources, while a smoke sampler may read either paper or
+smoke sources without relabeling those source artifacts.
 
 The boundary calendar dates are documented by the official Korea Astronomy and
 Space Science Institute almanac releases for

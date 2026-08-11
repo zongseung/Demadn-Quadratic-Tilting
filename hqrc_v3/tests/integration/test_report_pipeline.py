@@ -52,10 +52,11 @@ def _write_production_sampler_benchmark(run, tmp_path):
     inputs = tmp_path / "sampler-inputs"
     inputs.mkdir(exist_ok=True)
     files = {}
-    for name in ("data.npz", "data.json", "approved.json"):
+    for name in ("data.npz", "data.json"):
         path = inputs / name
         path.write_text(name)
         files[name] = path
+    files["approved.json"] = run / "ar_diagnostics/approved.json"
     output = benchmark_sampler_processes(
         run / "benchmarks/samplers.json",
         request_directory=tmp_path / "sampler-workers",
@@ -64,9 +65,11 @@ def _write_production_sampler_benchmark(run, tmp_path):
             "hqrc_npz": files["data.npz"],
             "hqrc_metadata": files["data.json"],
             "approved_ar": files["approved.json"],
-            "residual_sha256": "a" * 64,
-            "config_sha256": "b" * 64,
-            "event_sha256": "c" * 64,
+            "residual_sha256": file_sha256(
+                run / "inputs/standardized_residuals.parquet"
+            ),
+            "config_sha256": file_sha256(run / "inputs/resolved_config.toml"),
+            "event_sha256": file_sha256(run / "inputs/event_registry.csv"),
             "variant": "H3",
             "pooling": "partial",
             "options": {"covariance": "full"},

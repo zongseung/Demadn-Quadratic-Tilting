@@ -9,12 +9,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import hqrc_v3.baselines.paper as paper
 import numpy as np
 import polars as pl
 import pytest
-
-import hqrc_v3.baselines.paper as paper
-from hqrc_v3 import cli
 from hqrc_v3.baselines.config import MODEL_NAMES, PAPER_SEEDS, load_paper_baselines
 from hqrc_v3.baselines.paper import run_paper_final_stage, run_paper_oof_stage
 from hqrc_v3.contracts import DataContractError, ForecastMatrix
@@ -22,6 +20,8 @@ from hqrc_v3.features import feature_columns, history_columns
 from hqrc_v3.oof import cache_key
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
 from hqrc_v3.splits import expanding_oof_folds
+
+from hqrc_v3 import cli
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_CONFIG = PROJECT_ROOT / "configs/model_spaces.toml"
