@@ -26,7 +26,7 @@ from hqrc_v3.provenance import file_sha256
 from hqrc_v3.residual_stage import STANDARDIZED_RESIDUAL_COLUMNS
 
 _SCHEMA_VERSION = "hqrc-v3.loeo-universe.v1"
-_ROOT_NAMESPACE = frozenset({".loeo.lock", "generations", "current.json"})
+_ROOT_NAMESPACE = frozenset({".loeo.lock", "generations", "current.json", ".current.tmp"})
 _GENERATION_NAMESPACE = frozenset({"universe.parquet", "folds", "manifest.json", "COMPLETE"})
 _COLUMNS = (*STANDARDIZED_RESIDUAL_COLUMNS, "causal")
 _YEARS = tuple(range(2020, 2025))
@@ -124,6 +124,120 @@ def _write_json(path: Path, value: object) -> None:
         destination.write(payload)
         destination.flush()
         os.fsync(destination.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_file(path: Path) -> None:
+    _require_real_file(path, "LOEO publication artifact")
+    with path.open("rb") as source:
+        os.fsync(source.fileno())
+
+
+def _remove_safe_tree(path: Path) -> None:
+    """Remove only a no-symlink publication debris tree while holding the lock."""
+
+    _require_real_directory(path, "LOEO partial generation")
+    for child in path.iterdir():
+        mode = child.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            raise LOEOError("LOEO partial generation is unsafe")
+        if stat.S_ISDIR(mode):
+            _remove_safe_tree(child)
+        elif stat.S_ISREG(mode):
+            child.unlink()
+        else:
+            raise LOEOError("LOEO partial generation is unsafe")
+    path.rmdir()
+
+
+def _recoverable_generation(path: Path, identity: str, source: Mapping[str, object]) -> str | None:
+    """Return a complete generation's manifest digest only after structural/hash checks."""
+
+    try:
+        _require_real_directory(path, "LOEO generation")
+        if {entry.name for entry in path.iterdir()} != _GENERATION_NAMESPACE:
+            return None
+        _require_real_directory(path / "folds", "LOEO fold namespace")
+        manifest = _read_json(path / "manifest.json", "LOEO manifest")
+        complete = _read_json(path / "COMPLETE", "LOEO completion marker")
+        if (
+            manifest.get("generation_identity") != identity
+            or manifest.get("source") != source
+            or complete.get("manifest_sha256") != manifest.get("manifest_sha256")
+        ):
+            return None
+        universe = manifest.get("universe")
+        folds = manifest.get("folds")
+        if not isinstance(universe, dict) or not isinstance(folds, dict):
+            return None
+        artifacts = [(path / "universe.parquet", universe.get("sha256"))]
+        artifacts.extend(
+            (path / str(item.get("path")), item.get("sha256"))
+            for item in folds.values()
+            if isinstance(item, dict)
+        )
+        if len(artifacts) != 11:
+            return None
+        for artifact, digest in artifacts:
+            _require_real_file(artifact, "LOEO recovery artifact")
+            if not isinstance(digest, str) or file_sha256(artifact) != digest:
+                return None
+        return str(manifest["manifest_sha256"])
+    except (KeyError, LOEOError):
+        return None
+
+
+def _recover_publication_debris(
+    root: Path, identity: str, source: Mapping[str, object]
+) -> str | None:
+    """Clean abandoned staging/dead pointer files and recover only a validated complete target."""
+
+    temporary = root / ".current.tmp"
+    if temporary.exists():
+        _require_real_file(temporary, "LOEO temporary pointer")
+        temporary.unlink()
+        _fsync_directory(root)
+    generations = root / "generations"
+    if not generations.exists():
+        generations.mkdir(mode=0o700)
+        _fsync_directory(root)
+    _require_real_directory(generations, "LOEO generation namespace")
+    recovered: str | None = None
+    for entry in tuple(generations.iterdir()):
+        if entry.name.startswith(".staging-"):
+            _remove_safe_tree(entry)
+            continue
+        if entry.name != identity:
+            raise LOEOError("LOEO generation namespace contains incompatible entries")
+        digest = _recoverable_generation(entry, identity, source)
+        if digest is None:
+            _remove_safe_tree(entry)
+        else:
+            recovered = digest
+    _fsync_directory(generations)
+    return recovered
+
+
+def _publish_pointer(root: Path, identity: str, manifest_sha256: str) -> None:
+    pointer = root / ".current.tmp"
+    _write_json(
+        pointer,
+        {
+            "generation": identity,
+            "generation_identity": identity,
+            "manifest_sha256": manifest_sha256,
+        },
+    )
+    _fsync_directory(root)
+    os.replace(pointer, root / "current.json")
+    _fsync_directory(root)
 
 
 @contextmanager
@@ -440,10 +554,12 @@ def _publication_from_manifest(
 
 def _load_publication(
     source: ValidatedCorrectionSource, context: EventResidualContext, output_dir: Path
-) -> tuple[LOEOPublication, pl.DataFrame, tuple[EventOccurrence, ...]]:
+) -> tuple[LOEOPublication, pl.DataFrame, tuple[EventOccurrence, ...], dict[str, pl.DataFrame]]:
     expected, events, source_identity = _build_universe(source, context)
     root = Path(output_dir)
     _validate_root(root, allow_empty=False)
+    if (root / ".current.tmp").exists():
+        raise LOEOError("LOEO publication has an unrecovered temporary pointer")
     current_path = root / "current.json"
     current = _read_json(current_path, "LOEO current pointer")
     identity = _generation_identity(source_identity)
@@ -523,6 +639,7 @@ def _load_publication(
     expected_files = {f"{identifier}.parquet" for identifier in expected_ids}
     if set(fold_files) != expected_files:
         raise LOEOError("LOEO fold namespace contains unknown or missing entries")
+    fold_frames: dict[str, pl.DataFrame] = {}
     for held_out in expected_ids:
         entry = folds[held_out]
         expected_occurrences = tuple(
@@ -554,7 +671,13 @@ def _load_publication(
             actual_fold, expected_fold
         ):
             raise LOEOError("LOEO fold contains held-out rows or differs semantically")
-    return _publication_from_manifest(root, generation, manifest, context), actual_universe, events
+        fold_frames[held_out] = actual_fold
+    return (
+        _publication_from_manifest(root, generation, manifest, context),
+        actual_universe,
+        events,
+        fold_frames,
+    )
 
 
 def publish_loeo_universe(
@@ -567,21 +690,23 @@ def publish_loeo_universe(
     _validate_root(root, allow_empty=True)
     with _publication_lock(root):
         _validate_root(root, allow_empty=False)
+        identity = _generation_identity(source_identity)
+        recovered_digest = _recover_publication_debris(root, identity, source_identity)
         current = root / "current.json"
         if current.exists():
-            publication, _, _ = _load_publication(source, context, root)
+            publication, _, _, _ = _load_publication(source, context, root)
             return publication
-        entries = {path.name for path in root.iterdir() if path.name != ".loeo.lock"}
-        if entries:
-            raise LOEOError("LOEO publication directory contains a partial generation")
-        identity = _generation_identity(source_identity)
+        if recovered_digest is not None:
+            _publish_pointer(root, identity, recovered_digest)
+            publication, _, _, _ = _load_publication(source, context, root)
+            return publication
         generations = root / "generations"
-        generations.mkdir(mode=0o700)
         _require_real_directory(generations, "LOEO generation namespace")
         staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=generations))
         try:
             universe_path = staging / "universe.parquet"
             universe.write_parquet(universe_path)
+            _fsync_file(universe_path)
             folds_dir = staging / "folds"
             folds_dir.mkdir(mode=0o700)
             folds: dict[str, tuple[Path, str, pl.DataFrame]] = {}
@@ -590,7 +715,9 @@ def publish_loeo_universe(
                 frame = universe.filter(pl.col("occurrence_id") != held_out)
                 path = folds_dir / f"{held_out}.parquet"
                 frame.write_parquet(path)
+                _fsync_file(path)
                 folds[held_out] = (Path(f"folds/{held_out}.parquet"), file_sha256(path), frame)
+            _fsync_directory(folds_dir)
             manifest = _manifest_payload(
                 identity=identity,
                 source=source_identity,
@@ -602,20 +729,13 @@ def publish_loeo_universe(
             )
             _write_json(staging / "manifest.json", manifest)
             _write_json(staging / "COMPLETE", {"manifest_sha256": manifest["manifest_sha256"]})
+            _fsync_directory(staging)
             target = generations / identity
             if target.exists():
                 raise LOEOError("LOEO generation already exists without a trusted pointer")
             os.replace(staging, target)
-            pointer = root / ".current.tmp"
-            _write_json(
-                pointer,
-                {
-                    "generation": identity,
-                    "generation_identity": identity,
-                    "manifest_sha256": manifest["manifest_sha256"],
-                },
-            )
-            os.replace(pointer, current)
+            _fsync_directory(generations)
+            _publish_pointer(root, identity, str(manifest["manifest_sha256"]))
         except Exception:
             if staging.exists():
                 # A staging directory is never trusted; leave no reusable partial state behind.
@@ -626,7 +746,7 @@ def publish_loeo_universe(
                         path.rmdir()
                 staging.rmdir()
             raise
-    publication, _, _ = _load_publication(source, context, root)
+    publication, _, _, _ = _load_publication(source, context, root)
     return publication
 
 
@@ -635,7 +755,7 @@ def load_loeo_universe(
 ) -> LOEOPublication:
     """Reload and fully revalidate a published universe against immutable source inputs."""
 
-    publication, _, _ = _load_publication(source, context, Path(output_dir))
+    publication, _, _, _ = _load_publication(source, context, Path(output_dir))
     return publication
 
 
@@ -648,14 +768,11 @@ def load_loeo_fold(
 ) -> LOEOFold:
     """Re-read one physical nine-event Parquet after complete publication validation."""
 
-    publication, _, _ = _load_publication(source, context, Path(output_dir))
+    publication, _, _, fold_frames = _load_publication(source, context, Path(output_dir))
     if held_out_occurrence_id not in publication.occurrence_ids:
         raise LOEOError("LOEO held-out occurrence is not registered")
     path = publication.fold_paths[held_out_occurrence_id]
-    try:
-        frame = pl.read_parquet(path)
-    except (OSError, pl.exceptions.PolarsError) as error:
-        raise LOEOError("LOEO fold is unreadable") from error
+    frame = fold_frames[held_out_occurrence_id]
     occurrence_ids = tuple(
         identifier
         for identifier in publication.occurrence_ids
