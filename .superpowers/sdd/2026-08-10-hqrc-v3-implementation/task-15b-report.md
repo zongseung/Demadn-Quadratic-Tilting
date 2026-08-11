@@ -97,3 +97,52 @@ the repeated real check above passed.  The original paper artifact directory was
 
 No AR proposal/approval, model sampling, ablation/metric, CLI, or paper LOEO output was added.
 Task 15 Step 2 remains unchecked pending independent review.
+
+## Fix round 1/5 — review findings and resolution
+
+Important findings received verbatim:
+
+1. `hqrc_v3/src/hqrc_v3/diagnostics/loeo.py:574`: Any process crash after creating `generations/` but before publishing `current.json` leaves entries that every later publication rejects as partial. A crash after moving staging to its final generation or while writing `.current.tmp` is likewise unrecoverable, so publication is fail-closed but not restartable; files/directories also are not fsynced around the rename boundary. Fix by cleaning validated staging debris, recovering a complete identity-matching generation or safely replacing incomplete generations under the lock, and fsyncing artifacts/directories before pointer publication.
+2. `hqrc_v3/src/hqrc_v3/diagnostics/loeo.py:651`: `_load_publication` hash-checks and reads the fold, but `load_loeo_fold` then reads it again and returns that second frame after checking only occurrence ordering. A numerical mutation between those reads can therefore be returned with the old trusted digest. Return the already hash-validated physical read, or hash/check the exact second read before returning it.
+3. `hqrc_v3/tests/unit/test_loeo_diagnostics.py:282`: Required boundary coverage is incomplete or passes for incidental reasons. Only one 2024 event and one pre-2024 event are checked; the symlink case at line 424 first adds an unknown root entry, while order mutation and held-out reinsertion are rejected by stale hashes rather than semantic validation. There are no genuine publication-boundary crash/retry, wrong-path, registry-substitution, or rehashed-fold mutation tests. Add independent all-event assertions, rehash semantic mutations where appropriate, and inject failures at publication boundaries followed by retries.
+
+Resolution:
+
+- Under the exclusive publication lock, transient `.current.tmp` files and no-symlink staging
+  debris are removed; an identity/source/hash-validated completed generation is recovered by
+  publishing its pointer, while a safely removable incomplete matching generation is replaced.
+  Incompatible generation names remain fail-closed. Every Parquet, fold directory, staging
+  directory, generation namespace, temporary pointer, and final pointer rename now has explicit
+  `fsync` durability ordering around publication.
+- `_load_publication` now returns its exact hash- and semantic-validated physical fold frame map;
+  `load_loeo_fold` returns that frame rather than performing an untrusted second Parquet read.
+- Tests now parameterize both 2024 scales and all ten held-outs, inject both generation-rename and
+  pointer-rename interruptions followed by actual retry/reload, isolate symlink targets outside
+  the publication root, and directly cover rehashed universe/fold semantic mutations, rehashed
+  wrong paths, and registry substitution.
+
+Genuine RED before the production repair:
+
+```text
+uv run pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests/unit/test_loeo_diagnostics.py -q
+3 failed, 12 passed
+```
+
+The failures were both retry boundaries (`generation-rename`, `pointer-rename`) and the former
+two-read fold TOCTOU regression. GREEN after the implementation and expanded coverage:
+
+```text
+Task 15B focused: 29 passed in 2.67s
+Task 14/15 adjacent: 105 passed, 30 existing warnings in 5.73s
+```
+
+Controller full fix-tree verification completed in a traceable session:
+
+```text
+env PYTHONPATH=/Users/ijongseung/Documents/GitHub/arima-type/Demadn-Quadratic-Tilting/.worktrees/hqrc-v3/hqrc_v3/src \
+  PYTENSOR_FLAGS=compiledir=/private/tmp/hqrc-v3-pytensor-task15b-fix1 \
+  .venv/bin/python -m pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests -m 'not slow' -q
+503 passed, 8 deselected, 77 existing warnings in 79.84s, exit 0
+```
+
+No source artifacts, sampling, AR approval, or paper LOEO output was changed.
