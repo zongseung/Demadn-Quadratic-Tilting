@@ -202,3 +202,14 @@ All checks passed!
 ```
 
 Controller full-suite verification: `505 passed, 8 deselected, 77 warnings in 80.03s`, exit 0.
+
+## Fix round 3/5 — completed namespace preservation
+
+Finding: a completed identity-named generation with an unknown entry was treated as non-complete
+by the exact-set recovery check and recursively deleted when unreferenced.
+
+Cleanup is now explicitly limited to real, no-symlink, unreferenced generation directories whose
+entries are a known generation subset and contain no `COMPLETE` marker. `COMPLETE`, any unknown
+entry, any symlink/unsafe entry, or a current-pointer reference now fails closed and preserves the
+tree byte-for-byte. Direct RED covered unknown and symlink entries on an unreferenced completed
+generation; GREEN: `33 passed in 2.81s`. Prior crash-retry tests remain in the focused suite.
