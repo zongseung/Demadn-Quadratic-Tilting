@@ -407,12 +407,7 @@ def _canonical_json(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
 
-def _rebind_completed_publication(result, output_name: str) -> None:
-    manifest = json.loads(result.manifest_path.read_bytes())
-    output_path = result.output_dir / manifest["outputs"][output_name]["path"]
-    manifest["outputs"][output_name]["sha256"] = hashlib.sha256(
-        output_path.read_bytes()
-    ).hexdigest()
+def _write_rebound_manifest(result, manifest: dict[str, object]) -> None:
     unsigned = {
         key: manifest[key] for key in ("schema_version", "state", "identity", "outputs", "rows")
     }
@@ -423,6 +418,15 @@ def _rebind_completed_publication(result, output_name: str) -> None:
         "state": "COMPLETE",
     }
     (result.output_dir / "COMPLETE").write_bytes(_canonical_json(complete) + b"\n")
+
+
+def _rebind_completed_publication(result, output_name: str) -> None:
+    manifest = json.loads(result.manifest_path.read_bytes())
+    output_path = result.output_dir / manifest["outputs"][output_name]["path"]
+    manifest["outputs"][output_name]["sha256"] = hashlib.sha256(
+        output_path.read_bytes()
+    ).hexdigest()
+    _write_rebound_manifest(result, manifest)
 
 
 def _tamper_product(result, output_name: str) -> None:
@@ -569,6 +573,69 @@ def test_complete_reuse_rejects_rehashed_semantic_parquet_tampering(
     with pytest.raises(CausalCorrectionError, match="semantics"):
         fit_causal_2024_correction(**arguments)
     assert len(calls) == 1
+
+
+def test_complete_reuse_rejects_rehashed_manifest_output_alias(tmp_path, monkeypatch):
+    inputs = _stage_inputs(tmp_path)
+    calls = _install_fake_stage(monkeypatch, inputs)
+    arguments = _stage_arguments(tmp_path, inputs)
+    completed = fit_causal_2024_correction(**arguments)
+    manifest = json.loads(completed.manifest_path.read_bytes())
+    alias = completed.output_dir / "full_period_point_predictions.parquet"
+    manifest["outputs"]["event_predictions"] = {
+        "path": alias.name,
+        "sha256": hashlib.sha256(alias.read_bytes()).hexdigest(),
+    }
+    _write_rebound_manifest(completed, manifest)
+
+    with pytest.raises(CausalCorrectionError):
+        fit_causal_2024_correction(**arguments)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "mutation", ["npz-symlink", "metadata-symlink", "unknown", "unknown-symlink"]
+)
+def test_partial_resume_rejects_unsafe_current_generation_entries(
+    tmp_path, monkeypatch, mutation
+):
+    inputs = _stage_inputs(tmp_path)
+    calls = _install_fake_stage(monkeypatch, inputs)
+    arguments = _stage_arguments(tmp_path, inputs)
+    monkeypatch.setattr(
+        stage,
+        "_publication_boundary",
+        lambda current: (_ for _ in ()).throw(RuntimeError("product crash"))
+        if current == "event_predictions-published"
+        else None,
+    )
+    with pytest.raises(RuntimeError, match="product crash"):
+        fit_causal_2024_correction(**arguments)
+    output_dir = (
+        tmp_path
+        / "output/corrections/causal-2024/lightgbm/B1/seed-7/smoke/sampler-seed-19"
+    )
+    pointer = json.loads((output_dir / "hqrc_data.current.json").read_bytes())
+    generation_dir = output_dir / ".hqrc_data.generations"
+    if mutation in {"npz-symlink", "metadata-symlink"}:
+        key = "npz" if mutation == "npz-symlink" else "metadata"
+        current = output_dir / pointer[key]
+        alternate = generation_dir / f"alternate-{current.name}"
+        alternate.write_bytes(current.read_bytes())
+        current.unlink()
+        current.symlink_to(alternate.name)
+    elif mutation == "unknown":
+        (generation_dir / "unknown.bin").write_bytes(b"unknown")
+    else:
+        (generation_dir / "unknown-link").symlink_to(
+            (output_dir / pointer["npz"]).name
+        )
+
+    monkeypatch.setattr(stage, "_publication_boundary", lambda _: None)
+    with pytest.raises(CausalCorrectionError):
+        fit_causal_2024_correction(**arguments)
+    assert len(calls) == 1
+    assert not (output_dir / "COMPLETE").exists()
 
 
 def test_sampler_profile_and_rng_seed_have_distinct_namespaces(tmp_path, monkeypatch):

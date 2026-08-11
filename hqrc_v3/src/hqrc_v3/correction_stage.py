@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import tempfile
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
@@ -1156,28 +1157,81 @@ def _write_products(directory: Path, products: CausalCorrectionProducts) -> None
             temporary.unlink(missing_ok=True)
 
 
+def _require_real_file(path: Path, description: str) -> None:
+    try:
+        identity = path.lstat()
+    except OSError as error:
+        raise CausalCorrectionError(f"{description} is missing or unsafe") from error
+    if not stat.S_ISREG(identity.st_mode):
+        raise CausalCorrectionError(f"{description} is missing or unsafe")
+
+
+def _current_hqrc_generation_paths(directory: Path) -> tuple[Path, Path, Path]:
+    pointer_path = directory / "hqrc_data.current.json"
+    pointer = _read_publication_json(pointer_path, "HQRCData pointer")
+    generation_directory = directory / ".hqrc_data.generations"
+    try:
+        namespace_identity = generation_directory.lstat()
+    except OSError as error:
+        raise CausalCorrectionError("HQRCData generation namespace is unsafe") from error
+    if not stat.S_ISDIR(namespace_identity.st_mode):
+        raise CausalCorrectionError("HQRCData generation namespace is unsafe")
+
+    targets: list[Path] = []
+    for key in ("npz", "metadata"):
+        relative = pointer.get(key)
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+        ):
+            raise CausalCorrectionError("HQRCData pointer generation path is unsafe")
+        target = directory / relative
+        if target.parent != generation_directory:
+            raise CausalCorrectionError("HQRCData pointer generation path is unsafe")
+        _require_real_file(target, f"HQRCData current {key}")
+        targets.append(target)
+    if targets[0] == targets[1]:
+        raise CausalCorrectionError("HQRCData current generation paths collide")
+    try:
+        generation_entries = tuple(generation_directory.iterdir())
+    except OSError as error:
+        raise CausalCorrectionError("HQRCData generation namespace is unreadable") from error
+    if {path.name for path in generation_entries} != {path.name for path in targets}:
+        raise CausalCorrectionError("HQRCData generation namespace contains unknown entries")
+    for path in generation_entries:
+        _require_real_file(path, "HQRCData generation entry")
+    return pointer_path, targets[0], targets[1]
+
+
+def _canonical_output_records(directory: Path) -> dict[str, dict[str, str]]:
+    pointer_path, generation_npz, generation_metadata = _current_hqrc_generation_paths(directory)
+    paths = {
+        "hqrc_data_pointer": pointer_path,
+        "hqrc_data_npz": generation_npz,
+        "hqrc_data_metadata": generation_metadata,
+        "posterior": directory / "posterior.nc",
+        "posterior_checkpoint": directory / "posterior.checkpoint.json",
+        **{name: directory / filename for name, filename in _PRODUCT_FILENAMES.items()},
+    }
+    records: dict[str, dict[str, str]] = {}
+    for name, path in paths.items():
+        _require_real_file(path, f"correction output {name}")
+        records[name] = {
+            "path": path.relative_to(directory).as_posix(),
+            "sha256": file_sha256(path),
+        }
+    return records
+
+
 def _manifest_payload(
     directory: Path,
     *,
     identity: Mapping[str, Any],
     products: CausalCorrectionProducts,
 ) -> dict[str, Any]:
-    pointer = _read_publication_json(directory / "hqrc_data.current.json", "HQRCData pointer")
-    paths = {
-        "hqrc_data_pointer": directory / "hqrc_data.current.json",
-        "hqrc_data_npz": directory / pointer["npz"],
-        "hqrc_data_metadata": directory / pointer["metadata"],
-        "posterior": directory / "posterior.nc",
-        "posterior_checkpoint": directory / "posterior.checkpoint.json",
-        **{name: directory / filename for name, filename in _PRODUCT_FILENAMES.items()},
-    }
-    outputs = {
-        name: {
-            "path": path.relative_to(directory).as_posix(),
-            "sha256": file_sha256(path),
-        }
-        for name, path in paths.items()
-    }
+    outputs = _canonical_output_records(directory)
     rows = {
         "event_predictions": products.event_predictions.height,
         "full_period_point_predictions": products.full_period_point_predictions.height,
@@ -1253,29 +1307,8 @@ def _validate_complete(
     ):
         raise CausalCorrectionError("completed correction manifest differs")
     outputs = manifest.get("outputs")
-    expected_output_names = {
-        "hqrc_data_pointer",
-        "hqrc_data_npz",
-        "hqrc_data_metadata",
-        "posterior",
-        "posterior_checkpoint",
-        *_PRODUCT_FILENAMES,
-    }
-    if not isinstance(outputs, dict) or set(outputs) != expected_output_names:
-        raise CausalCorrectionError("correction output manifest is invalid")
-    for entry in outputs.values():
-        if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
-            raise CausalCorrectionError("correction output identity is invalid")
-        relative = entry["path"]
-        if (
-            not isinstance(relative, str)
-            or Path(relative).is_absolute()
-            or ".." in Path(relative).parts
-        ):
-            raise CausalCorrectionError("correction output path is unsafe")
-        path = directory / relative
-        if not path.is_file() or path.is_symlink() or file_sha256(path) != entry["sha256"]:
-            raise CausalCorrectionError("correction output hash differs")
+    if not isinstance(outputs, dict) or outputs != _canonical_output_records(directory):
+        raise CausalCorrectionError("correction output manifest differs")
     data, settings = load_hqrc_data(directory / "hqrc_data.npz")
     identity_sha256 = hashlib.sha256(_canonical_json(identity)).hexdigest()
     if not _same_hqrc_data(data, inputs.hqrc_data) or settings != {
@@ -1335,6 +1368,7 @@ def _load_resumable_checkpoint(
                 raise CausalCorrectionError("unsafe partial correction publication")
         elif not path.is_file():
             raise CausalCorrectionError("unsafe partial correction publication")
+    _current_hqrc_generation_paths(directory)
     try:
         data, settings = load_hqrc_data(directory / "hqrc_data.npz")
     except (OSError, ValueError) as error:
