@@ -221,3 +221,54 @@ Only the three reported E501 expressions were mechanically wrapped. Focused veri
 `f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`.
 Controller full non-slow verification passed: `507 passed, 8 deselected, 77 warnings in 79.86s`,
 exit 0.
+
+## Fix round 4/5 — exact recursive incomplete-tree validation
+
+Finding: recovery validated only generation-root names plus descendant symlinks before deletion.
+Consequently, `folds/unexpected` was accepted and deleted, while a canonical fold filename
+replaced by a FIFO was discovered only after earlier artifacts had already been unlinked.
+
+Resolution:
+
+- Replaced the permissive predicate/recursive delete with a complete removal-plan validator. It
+  accepts only a real generation directory containing a subset of the two expected regular root
+  files plus an optional real `folds/` directory; `folds/` may contain only regular, no-symlink
+  Parquets named for the canonical ten occurrence ids. `COMPLETE`, unknown names, nested
+  directories, symlinks, and any special filesystem node at either depth reject the whole tree.
+- `_remove_safe_tree` now validates and records the entire tree before performing its first
+  unlink, then removes only the fixed validated plan. A current-pointer-referenced generation is
+  still rejected before cleanup. Invalid trees are preserved rather than partially traversed.
+- Added direct nested-unknown and FIFO regressions. Their before/after snapshots cover every
+  relative path and filesystem type, and additionally preserve the full bytes and SHA-256 of
+  every regular file.
+
+Genuine RED before the production repair:
+
+```text
+env PYTHONPATH=.../.worktrees/hqrc-v3/hqrc_v3/src \
+  .venv/bin/python -m pytest -c hqrc_v3/pyproject.toml \
+  hqrc_v3/tests/unit/test_loeo_diagnostics.py -q
+2 failed, 33 passed in 2.96s
+```
+
+The nested unknown case did not raise because recovery deleted and replaced the entire
+generation. The FIFO case raised only after `_remove_safe_tree` had already removed regular
+artifacts, demonstrating the partial-destruction path.
+
+GREEN and required verification:
+
+```text
+Task 15B focused: 35 passed in 2.91s
+Task 14/15 adjacent: 131 passed, 30 existing warnings in 12.96s
+Full non-slow: 509 passed, 8 deselected, 77 existing warnings in 80.77s
+Full Ruff check: All checks passed!
+git diff --check: clean
+protected hqrc_v3/uv.lock SHA-256:
+f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657
+```
+
+The full suite used the root `.venv/bin/python`, explicit worktree `PYTHONPATH`, and
+`PYTENSOR_FLAGS=compiledir=/private/tmp/hqrc-v3-pytensor-task15b-fix4`. Self-review confirmed
+that every rejection occurs before the deletion loops, safe empty/partial-schema debris remains
+restartable, all prior crash-retry tests remain green, and no statistical/source/context/scale,
+AR, sampling, or paper-artifact behavior changed. Implementation/tests commit: `0dfb6f9`.
