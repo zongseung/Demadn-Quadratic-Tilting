@@ -187,3 +187,18 @@ silently replaced, and with a pointer its tree was removed before rejection. GRE
 ```
 
 No source artifact, AR proposal/approval, sampling, or paper LOEO output was changed.
+
+## Fix round 2 verification follow-up
+
+Mechanically wrapped the four Ruff E501 test expressions only; production semantics are unchanged.
+
+```text
+env PYTHONPATH=/Users/ijongseung/Documents/GitHub/arima-type/Demadn-Quadratic-Tilting/.worktrees/hqrc-v3/hqrc_v3/src \
+  .venv/bin/python -m pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests/unit/test_loeo_diagnostics.py -q
+31 passed in 2.71s
+
+.venv/bin/ruff check --config hqrc_v3/pyproject.toml hqrc_v3/src hqrc_v3/tests
+All checks passed!
+```
+
+Controller full-suite verification: `505 passed, 8 deselected, 77 warnings in 80.03s`, exit 0.
