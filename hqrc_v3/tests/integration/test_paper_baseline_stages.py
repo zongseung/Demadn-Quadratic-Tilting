@@ -1189,6 +1189,7 @@ def test_readme_hqrc_commands_are_executable_from_the_repository_root() -> None:
     for command in (
         "generate-oof",
         "fit-final-baselines",
+        "prepare-residuals",
         "audit-data",
         "diagnose-ar",
         "approve-ar-calibration",

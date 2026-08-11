@@ -32,6 +32,7 @@ from hqrc_v3.diagnostics.ar import (
 from hqrc_v3.events import load_event_registry, load_holiday_calendar
 from hqrc_v3.features import attach_calendar_features, build_daily_forecast_matrix
 from hqrc_v3.provenance import file_sha256
+from hqrc_v3.residual_stage import prepare_standardized_residual_artifact
 
 StageHandler = Callable[[argparse.Namespace], object]
 _EXPECTED_START = "2019-01-01T00:00:00"
@@ -87,6 +88,17 @@ def generate_oof_handler(arguments: argparse.Namespace) -> object:
 
 def fit_final_baselines_handler(arguments: argparse.Namespace) -> object:
     return run_paper_final_stage(**_paper_stage_inputs(arguments))
+
+
+def prepare_residuals_handler(arguments: argparse.Namespace) -> object:
+    """Publish all OOF point streams as one fold-standardized event artifact."""
+
+    return prepare_standardized_residual_artifact(
+        run_dir=Path(arguments.run_dir),
+        config_path=Path(arguments.config),
+        event_registry_path=Path(arguments.event_registry),
+        profile=arguments.profile,
+    )
 
 
 def _paper_stage_inputs(arguments: argparse.Namespace) -> dict[str, object]:
@@ -170,7 +182,16 @@ def diagnose_ar_handler(arguments: argparse.Namespace) -> object:
     residual_path = Path(arguments.residuals)
     if file_sha256(residual_path) != arguments.residual_sha256:
         raise StageInputError("diagnose-ar residual-sha256 does not match the residual artifact")
-    residuals = pl.read_parquet(residual_path)
+    residuals = pl.read_parquet(residual_path).filter(
+        (pl.col("model") == arguments.model)
+        & (pl.col("feature_set") == arguments.feature_set)
+    )
+    if arguments.seed is not None:
+        residuals = residuals.filter(pl.col("seed") == arguments.seed)
+    if residuals.is_empty():
+        raise StageInputError("diagnose-ar selectors match no standardized residual context")
+    if residuals["seed"].n_unique() != 1:
+        raise StageInputError("diagnose-ar context must resolve to exactly one point-stream seed")
     diagnostics = diagnose_event_residuals(residuals)
     if any(split.split("-", 1)[-1] > str(arguments.through) for split in residuals["split_id"]):
         raise StageInputError("diagnose-ar residuals include rows later than --through")
@@ -289,6 +310,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_frozen_model_inputs(final)
     final.add_argument("--cache-dir", help="immutable prediction cache directory")
 
+    residuals = subcommands.add_parser(
+        "prepare-residuals",
+        help="standardize OOF event residuals with fold-local non-event scales",
+    )
+    residuals.add_argument("--run-dir", required=True, help="run root containing predictions/")
+    residuals.add_argument("--config", required=True, help="experiment TOML path")
+    residuals.add_argument("--event-registry", required=True, help="fixed correction registry")
+    residuals.add_argument("--profile", choices=("paper", "smoke"), default="paper")
+
     diagnose = subcommands.add_parser(
         "diagnose-ar", help="generate an unapproved event-reset AR diagnostic proposal"
     )
@@ -298,6 +328,13 @@ def build_parser() -> argparse.ArgumentParser:
     diagnose.add_argument("--config-sha256", required=True, help="hash of the experiment config")
     diagnose.add_argument("--event-sha256", required=True, help="hash of the event registry")
     diagnose.add_argument("--through", type=int, required=True, help="latest OOF year included")
+    diagnose.add_argument("--model", choices=MODEL_NAMES, required=True)
+    diagnose.add_argument("--feature-set", choices=("B0", "B1"), required=True)
+    diagnose.add_argument(
+        "--seed",
+        type=int,
+        help="optional point-stream seed assertion; otherwise inferred after context selection",
+    )
 
     approve = subcommands.add_parser(
         "approve-ar-calibration", help="freeze a reviewed AR calibration proposal"
@@ -352,6 +389,7 @@ def _default_handlers() -> dict[str, StageHandler]:
         "tune-baselines": tune_baselines_handler,
         "generate-oof": generate_oof_handler,
         "fit-final-baselines": fit_final_baselines_handler,
+        "prepare-residuals": prepare_residuals_handler,
         "diagnose-ar": diagnose_ar_handler,
         "approve-ar-calibration": approve_ar_calibration_handler,
         "fit-corrections": _unavailable_handler("fit-corrections"),

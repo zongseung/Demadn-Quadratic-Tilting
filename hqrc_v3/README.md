@@ -131,6 +131,25 @@ digests. Per-fold stream caches are immutable and resumable. A partial pair,
 changed hash, changed feature/preprocessing schema, changed scaler population,
 altered seed/model identity, or tampered publication fails closed.
 
+Convert the complete OOF point publication into HQRC training targets with:
+
+```text
+uv run --project hqrc_v3 --locked hqrc prepare-residuals \
+  --run-dir runs/RUN_ID \
+  --config hqrc_v3/configs/experiment.toml \
+  --event-registry hqrc_v3/configs/events.csv \
+  --profile paper
+```
+
+This publishes one canonical `inputs/standardized_residuals.parquet` containing
+all five models and both feature sets. Each context contains the 1,032 event
+hours from the eight 2020--2023 occurrences; no 2024 row enters calibration.
+For every model, feature set, point-stream seed, and OOF split, the scale is the
+RMS of residuals outside every registered correction window. The adjacent strict
+manifest records all four scales and identifies `oof-2023` as the scale for the
+later causal 2024 MW conversion. Neural point streams use ensemble seed 0;
+classical point streams use the requested classical seed.
+
 The opt-in real smoke uses the same LightGBM-B1 stage with a reduced round cap:
 
 ```text
@@ -156,10 +175,16 @@ Other concrete operator stages are:
 
 ```text
 uv run --project hqrc_v3 --locked hqrc audit-data --data power_demand_final.csv --fixed-bounds --temporary-holiday-availability hqrc_v3/configs/temporary_holiday_availability.csv
-uv run --project hqrc_v3 --locked hqrc diagnose-ar --residuals runs/RUN_ID/inputs/standardized_residuals.parquet --output runs/RUN_ID/ar_diagnostics/proposed.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256 --through 2023
-uv run --project hqrc_v3 --locked hqrc approve-ar-calibration --proposal runs/RUN_ID/ar_diagnostics/proposed.json --output runs/RUN_ID/ar_diagnostics/approved.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256
+uv run --project hqrc_v3 --locked hqrc prepare-residuals --run-dir runs/RUN_ID --config hqrc_v3/configs/experiment.toml --event-registry hqrc_v3/configs/events.csv --profile paper
+uv run --project hqrc_v3 --locked hqrc diagnose-ar --residuals runs/RUN_ID/inputs/standardized_residuals.parquet --output runs/RUN_ID/ar_diagnostics/lightgbm-B1-proposed.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256 --through 2023 --model lightgbm --feature-set B1
+uv run --project hqrc_v3 --locked hqrc approve-ar-calibration --proposal runs/RUN_ID/ar_diagnostics/lightgbm-B1-proposed.json --output runs/RUN_ID/ar_diagnostics/lightgbm-B1-approved.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256
 uv run --project hqrc_v3 --locked hqrc report --run-dir runs/RUN_ID --profile smoke
 ```
+
+Run `diagnose-ar` separately for each of the ten model/feature contexts. The
+selector resolves exactly one point-stream seed and fails if it is ambiguous;
+`--seed` can be supplied as an additional assertion. Diagnosis only writes an
+unapproved proposal. It never creates or updates the approval artifact.
 
 The boundary calendar dates are documented by the official Korea Astronomy and
 Space Science Institute almanac releases for

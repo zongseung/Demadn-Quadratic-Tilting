@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+import polars as pl
 import pytest
 
 from hqrc_v3 import cli
+from hqrc_v3.provenance import file_sha256
 
 
 def test_help_succeeds(capsys):
@@ -53,6 +59,19 @@ def test_help_succeeds(capsys):
                 "B1",
                 "--seed",
                 "9",
+            ],
+        ),
+        (
+            "prepare-residuals",
+            [
+                "--run-dir",
+                "run",
+                "--config",
+                "experiment.toml",
+                "--event-registry",
+                "events.csv",
+                "--profile",
+                "paper",
             ],
         ),
         (
@@ -173,6 +192,10 @@ def test_ar_commands_require_explicit_hashes_and_diagnose_never_auto_approves(ca
         "events",
         "--through",
         "2023",
+        "--model",
+        "lightgbm",
+        "--feature-set",
+        "B1",
     ]
     received = []
     assert cli.main(diagnose_arguments, handlers={"diagnose-ar": received.append}) == 0
@@ -182,3 +205,64 @@ def test_ar_commands_require_explicit_hashes_and_diagnose_never_auto_approves(ca
 
     assert cli.main(["approve-ar-calibration", "--proposal", "proposal.json"]) != 0
     assert "residual-sha256" in capsys.readouterr().err
+
+
+def test_diagnose_ar_selects_one_context_from_the_combined_residual_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    timestamp = datetime(2023, 1, 1)
+    rows = []
+    for model, seed in (("lightgbm", 7), ("transformer", 0)):
+        for offset in range(2):
+            rows.append(
+                {
+                    "target_timestamp": timestamp + timedelta(hours=offset),
+                    "occurrence_id": "seollal-2023",
+                    "tau_days": offset / 24.0,
+                    "hour": offset,
+                    "standardized_residual": float(offset),
+                    "model": model,
+                    "feature_set": "B1",
+                    "seed": seed,
+                    "split_id": "oof-2023",
+                }
+            )
+    residual_path = tmp_path / "standardized_residuals.parquet"
+    pl.DataFrame(rows).write_parquet(residual_path)
+    captured: list[pl.DataFrame] = []
+
+    def diagnose(frame: pl.DataFrame) -> tuple[SimpleNamespace, ...]:
+        captured.append(frame)
+        return (SimpleNamespace(occurrence_id="seollal-2023", phi=0.5),)
+
+    monkeypatch.setattr(cli, "diagnose_event_residuals", diagnose)
+    monkeypatch.setattr(cli, "calibrate_beta_prior", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cli, "write_ar_diagnostics", lambda *args, **kwargs: None)
+
+    assert (
+        cli.main(
+            [
+                "diagnose-ar",
+                "--residuals",
+                str(residual_path),
+                "--output",
+                str(tmp_path / "proposal.json"),
+                "--residual-sha256",
+                file_sha256(residual_path),
+                "--config-sha256",
+                "config",
+                "--event-sha256",
+                "events",
+                "--through",
+                "2023",
+                "--model",
+                "transformer",
+                "--feature-set",
+                "B1",
+            ]
+        )
+        == 0
+    )
+    assert len(captured) == 1
+    assert set(captured[0]["model"]) == {"transformer"}
+    assert set(captured[0]["seed"]) == {0}
