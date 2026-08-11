@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build an isolated, reproducible HQRC v3 pipeline that generates expanding-window OOF residuals for 2020--2023, calibrates an AR(1) prior from residual diagnostics, fits the paper's hierarchical correction, and evaluates a final 2019--2023-to-2024 forecast.
+**Goal:** Build an isolated, reproducible HQRC v3 pipeline that generates expanding-window OOF residuals for 2020--2023, calibrates an AR(1) prior from residual diagnostics, fits the paper's hierarchical correction, and evaluates a causal final 2019--2023-to-January--October-2024 forecast.
 
 **Architecture:** A standalone `hqrc_v3/` src-layout project keeps Polars/Arrow data contracts separate from NumPy/Torch model boundaries. Fixed baseline configurations are fitted once per expanding fold and once on all pre-2024 data; cached long-form predictions feed residual diagnostics, Bayesian correction, ablations, and evaluation without retraining. The PyMC HQRC model uses event-reset stationary AR(1) likelihood terms and reads a hash-bound Beta prior calibration artifact.
 
-**Tech Stack:** Python 3.10+, Polars 1.38+, NumPy 2.2+, scikit-learn 1.7+, XGBoost 3.2+, LightGBM 4.6+, PyTorch 2.8+, PyMC 5.25+, ArviZ 0.22+, statsmodels 0.14+, SciPy 1.15+, Matplotlib 3.10+; optional nutpie for Rust NUTS benchmarking.
+**Tech Stack:** Python 3.11+, Polars 1.38+, NumPy 2.2+, scikit-learn 1.7+, XGBoost 3.2+, LightGBM 4.6+, PyTorch 2.8+, PyMC 5.25+, ArviZ 0.22+, statsmodels 0.14+, SciPy 1.15+, Matplotlib 3.10+; optional nutpie for Rust NUTS benchmarking.
 
 ## Global Constraints
 
@@ -17,6 +17,9 @@
 - Hyperparameters are fixed across OOF folds and the final refit; no per-fold search is allowed.
 - Use `gap_days=0`; enforce chronology by requiring every 24-hour target interval to remain inside its partition.
 - B0 contains ordinary temporal/weather predictors but no holiday-derived predictor; B1 is B0 plus the six versioned holiday feature families from the design spec.
+- The paper run has no archived day-ahead weather forecast vintages. Weather is therefore observed history only; target-window realized temperature, humidity, and weather-derived degree hours are forbidden from both B0 and B1.
+- Preserve the fixed source's public-holiday name/flag fields during ingestion. They define the full B1 public-holiday family, while the Seollal/Chuseok calendar defines only sequence position, distance, type, and HQRC windows.
+- Every direct classical estimator receives the same flattened 168-hour observed history plus the complete flattened 24-hour known-future calendar path. Every input/target scaler is fitted only on the estimator-fit partition and never on its early-stopping validation tail or evaluation year.
 - Treat an occurrence, not an hour, as the independent unit for pooling and inferential resampling.
 - AR lag pairs must reset at every event boundary; calibrate `(phi + 1) / 2 ~ Beta(a, b)` from pre-evaluation residuals and keep `phi` as a posterior parameter.
 - A corrected predictive draw is `y_hat + sigma_N * (q + e)`; never add a second baseline residual draw to it.
@@ -1099,6 +1102,167 @@ The slow test may use one real LightGBM-B1 OOF fold with reduced rounds under an
 git add hqrc_v3 docs/superpowers/plans/2026-08-10-hqrc-v3-implementation.md
 git commit -m "feat(hqrc-v3): execute frozen paper baselines"
 ```
+
+### Task 12: Causal feature schema and train-only preprocessing contract
+
+**Why this task blocks paper execution:** The Task 11 executor is operational, but an
+independent methodology audit found three result-invalidating mismatches in the matrix and
+adapter code: target-window realized weather is currently passed as `oracle_*`, B1 represents
+only Seollal/Chuseok rather than the full public-holiday source labels, and classical direct
+models use raw MW plus one horizon's future row instead of scaled targets plus the full known
+24-hour path. No full OOF/final paper run may start until this task receives a fresh independent
+READY verdict.
+
+**Files:**
+- Modify: `hqrc_v3/src/hqrc_v3/data.py`
+- Modify: `hqrc_v3/src/hqrc_v3/features.py`
+- Create: `hqrc_v3/src/hqrc_v3/baselines/preprocessing.py`
+- Modify: `hqrc_v3/src/hqrc_v3/baselines/classical.py`
+- Modify: `hqrc_v3/src/hqrc_v3/baselines/sequence.py`
+- Modify: `hqrc_v3/src/hqrc_v3/baselines/config.py`
+- Modify: `hqrc_v3/src/hqrc_v3/baselines/paper.py`
+- Modify: `hqrc_v3/configs/model_spaces.toml`
+- Modify: `hqrc_v3/README.md`
+- Modify: `docs/superpowers/specs/2026-08-10-hqrc-v3-design.md`
+- Modify: relevant feature/classical/sequence/paper integration tests
+- Create: `hqrc_v3/tests/unit/test_preprocessing.py`
+- Create: `hqrc_v3/tests/slow/test_real_causal_matrix.py`
+
+**Canonical feature contract:**
+
+```python
+B0_FUTURE = (
+    "hour", "day_of_week", "is_weekend",
+    "annual_sin", "annual_cos", "weekly_sin", "weekly_cos",
+)
+B1_ONLY = (
+    "is_public_holiday", "official_sequence_position",
+    "seollal_distance", "chuseok_distance",
+    "is_substitute_or_temporary_holiday", "holiday_type",
+)
+HISTORY = ("load_mw", "temperature_c", "relative_humidity")
+```
+
+`day_of_week` is an ordinary weekly predictor and belongs to B0; B1 inherits it. The paper's
+feature table must not list it as a B1-only family. No `oracle_*`, target-window weather, or
+degree-hour column is allowed in the main paper matrix. Degree hours may be revisited only in a
+separately labelled oracle/weather-forecast sensitivity with a source-vintage contract.
+
+The fixed real source must map `holiday_name` and `is_holiday_dummies` to canonical source
+columns and validate date-level/hour-level consistency. From 2019-01-01 through 2024-10-31 it
+contains exactly 107 public-holiday dates. The deterministic
+`is_substitute_or_temporary_holiday` flag is one only for a public-holiday row whose source name
+begins `Alternative holiday`, equals `Temporary Public Holiday`, or is `Armed Forces Day` on
+2024-10-01; this yields 14 dates in the fixed source. 2024-10-01 is B1 public/temporary holiday
+but has `holiday_type=0` and is not an HQRC event window.
+
+**Canonical preprocessing contract:**
+
+- Classical X is `flatten(history[168,3]) + flatten(future[24,p])` for every horizon. Fit one
+  `StandardScaler` on this complete X using estimator-fit rows only.
+- Fit one train-only target `StandardScaler` over the estimator-fit 24-hour target values.
+  XGBoost, LightGBM, and RBF-SVR all learn standardized targets; inverse-transform every output
+  to MW. This makes frozen SVR `epsilon=0.05` mean 0.05 training-target standard deviations and
+  restores the coordinate system assumed by the fixed regularization values.
+- XGBoost/LightGBM and neural models fit scalers on the estimator-fit portion before the
+  chronological 61-day early-stopping tail. SVR has no early stopping, so its estimator-fit
+  portion is the complete outer training fold.
+- Sequence models share the train-target scaler with the history `load_mw` channel, fit separate
+  train-only featurewise weather-history and future-calendar scalers, and inverse-transform the
+  joint 24-hour output to MW. Validation/evaluation perturbations must not change any scaler.
+- Bind preprocessing version, future-path length, scaler kinds, scaler-fit partition rule, and
+  exact history/future column order into the frozen model configuration and baseline manifest.
+
+- [ ] **Step 1: Write defect-reproducing tests and verify RED**
+
+Tests must prove all of the following before production edits:
+
+1. Perturbing actual temperature/humidity inside one target day leaves that origin's future B0
+   and B1 arrays byte-identical; no future schema contains `oracle`, `temperature`, `humidity`,
+   `heating`, or `cooling`.
+2. B0 has exactly seven known-future columns and no source/event holiday field; B1 appends exactly
+   the six named families above.
+3. The real fixed source produces 107 public-holiday dates and 14 substitute/temporary dates;
+   2024-10-01 is B1-flagged but absent from the Seollal/Chuseok analysis windows.
+4. Changing hour 24 of the future path changes the raw design row seen by every horizon,
+   demonstrating that no direct estimator consumes only `future[:, h, :]`.
+5. Perturbing validation/evaluation X or y cannot change X/target scaler statistics; perturbing
+   estimator-fit data does. Predictions are returned in MW.
+6. A recording SVR receives standardized y with configured `epsilon=0.05`; validation-target
+   values never enter that scale. XGBoost/LightGBM use the same target coordinate contract.
+7. The sequence history load channel and targets use the same training-target mean/scale while
+   weather and future calendar use their declared train-only feature scalers.
+8. Baseline artifacts fail closed when preprocessing version/path/scaler/schema metadata is
+   changed or omitted.
+
+Run the focused tests and preserve the genuine failures in the Task 12 report.
+
+- [ ] **Step 2: Preserve and audit full public-holiday source fields**
+
+Extend ingestion without copying or rewriting the CSV. Require non-null binary source flags,
+one name/flag pair per date replicated consistently across 24 rows, and no non-holiday row with a
+nonblank holiday name. Derive B1 from the source flag/name plus the versioned 12-occurrence lunar
+calendar. Keep B0 isolated from both the raw fields and all derived holiday columns.
+
+- [ ] **Step 3: Remove realized future weather and freeze the causal matrix schema**
+
+Delete the main-path `oracle_*` and future degree-hour expressions. Retain observed
+temperature/humidity only in the 168-hour history. Add boundary tests for official sequence
+position, signed distances, substitute/temporary dates, and the distinction between the official
+sequence and the wider `official +/- 1 day` HQRC analysis window.
+
+- [ ] **Step 4: Implement reusable train-only preprocessing and full-path classical inputs**
+
+Create immutable fitted scaler objects with finite/nonzero-scale/schema checks. Make all 24
+classical estimators consume the same scaled full-path X and standardized targets, and store the
+scalers and exact schemas in `HorizonRegressor`. Apply the shared target/load contract to both
+neural adapters. Reject changed columns, reordered columns, changed widths, nonfinite values, or
+attempted fitting with validation/evaluation rows.
+
+- [ ] **Step 5: Bind the contract into config, manifests, and operator documentation**
+
+Add an exact `[preprocessing]` table to `model_spaces.toml`; parse and validate it as part of the
+frozen SHA-bound registry. Add the canonical preprocessing object to baseline manifest identity
+and semantic reload validation. Document that weather forecast vintages are unavailable, future
+weather is therefore excluded from the main analysis, 2024 evaluation ends on October 31, and
+the exact daily sample counts are 2,124 total, 1,461 OOF, 1,819 outer-final-train (1,758
+estimator-fit plus 61 validation for early-stopped models), and 305 final-evaluation samples.
+
+- [ ] **Step 6: Verify focused, full-fast, lint, and real causal matrix/model smokes**
+
+Run from the repository root with explicit `--locked`:
+
+```bash
+uv run --project hqrc_v3 --locked pytest -c hqrc_v3/pyproject.toml \
+  hqrc_v3/tests/unit/test_data.py \
+  hqrc_v3/tests/unit/test_features.py \
+  hqrc_v3/tests/unit/test_preprocessing.py \
+  hqrc_v3/tests/integration/test_classical_baselines.py \
+  hqrc_v3/tests/unit/test_sequence_models.py \
+  hqrc_v3/tests/integration/test_paper_baseline_stages.py -q
+uv run --project hqrc_v3 --locked pytest -c hqrc_v3/pyproject.toml \
+  hqrc_v3/tests -m "not slow" -q
+uv run --project hqrc_v3 --locked ruff check --config hqrc_v3/pyproject.toml \
+  hqrc_v3/src hqrc_v3/tests
+uv run --project hqrc_v3 --locked pytest -c hqrc_v3/pyproject.toml \
+  hqrc_v3/tests/slow/test_real_causal_matrix.py -m slow -q
+```
+
+The real smoke must traverse source audit, B0/B1 matrix construction, preprocessing, one actual
+LightGBM fit/predict, MW inverse transformation, and manifest validation. It is explicitly
+non-paper and may reduce boosting rounds, but it may not substitute a model.
+
+- [ ] **Step 7: Commit and obtain a fresh methodology review**
+
+```bash
+git add hqrc_v3 docs/superpowers/plans/2026-08-10-hqrc-v3-implementation.md \
+  docs/superpowers/specs/2026-08-10-hqrc-v3-design.md
+git commit -m "fix(hqrc-v3): enforce causal baseline preprocessing"
+```
+
+The independent reviewer must inspect feature availability at the forecast origin, source
+holiday coverage, scaler fit rows, full 24-hour classical path, MW inverse transformation, and
+manifest binding. Do not launch the all-model OOF/final run before verdict **READY**.
 
 ## Final Verification
 

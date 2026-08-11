@@ -158,13 +158,15 @@ hqrc_v3/
 
 ### 5.1 입력 스키마
 
-필수 열은 timestamp, load MW, temperature, relative humidity다. 기존 한글 열 이름은 config의 명시적 rename map으로 표준 이름에 매핑한다. 파이프라인은 다음 조건을 만족하지 않으면 즉시 실패한다.
+필수 열은 timestamp, load MW, temperature, relative humidity, source holiday name, source public-holiday flag다. 기존 열 이름은 config의 명시적 rename map으로 표준 이름에 매핑한다. 고정 논문 자료에서는 `holiday_name`과 `is_holiday_dummies`를 각각 source holiday name과 source public-holiday flag로 보존한다. 파이프라인은 다음 조건을 만족하지 않으면 즉시 실패한다.
 
 - timestamp 중복 없음
 - 오름차순 정렬 후 1시간 간격
 - 2019-01-01 00:00부터 2024-10-31 23:00까지 51,144개 관측
 - load가 유한하고 양수
 - 학습에 필요한 weather 값이 결측 처리 정책 이후 유한함
+- public-holiday flag가 시간별 0/1이고 같은 날짜의 24개 행에서 동일함
+- holiday name과 flag가 날짜 수준에서 일치하며, 고정 자료의 public-holiday 날짜가 107개임
 
 결측 처리 통계는 fold 학습 구간에서만 계산한다. 보간 또는 대체가 일어난 timestamp와 방법은 별도 audit 파일에 기록한다.
 
@@ -183,21 +185,23 @@ hqrc_v3/
 B0는 휴일과 무관한 일반 예측 능력을 표현한다.
 
 - lagged load/weather 168시간
-- 알려진 미래 weather가 실제 예보가 아니라 관측치라면 반드시 `oracle_weather`로 라벨링
-- hour, day-of-week, weekend
-- 연간 및 주간 Fourier 항
-- heating/cooling degree hour
+- 알려진 미래 hour, day-of-week, weekend
+- 알려진 미래 연간 및 주간 Fourier 항
+
+이 자료에는 forecast origin 이전에 발행된 24시간 기상예보 vintage가 없다. 따라서 주 분석에서 temperature, humidity, heating/cooling degree hour는 과거 168시간에만 사용한다. target window에서 실현된 기상 관측치나 그 파생항을 `oracle_weather`로 이름만 바꾸어 입력하는 것도 금지한다. 별도 weather/oracle 민감도를 추가하려면 발행시각 또는 명시적 oracle 라벨과 별도 결과표가 필요하다.
 
 B1은 B0 전체에 다음만 추가한다.
 
-- public-holiday flag
+- source public-holiday flag
 - 공식 연휴 내 signed day position
 - 설날까지 signed distance
 - 추석까지 signed distance
-- bridge/substitute holiday flag
+- substitute/temporary public-holiday flag
 - holiday type
 
-B0 특징 행렬에 holiday 이름, holiday flag, event-relative time, 이벤트 창 여부가 들어가면 테스트가 실패한다. 이벤트 정보는 B0 예측과 별개로 HQRC window 선택에만 사용한다.
+day-of-week는 일반 주간 예측 변수이므로 B0에 속하며 B1-only 특징으로 중복 기술하지 않는다. substitute/temporary flag는 source public-holiday 행 중 이름이 `Alternative holiday`로 시작하거나 `Temporary Public Holiday`와 같거나, 2024-10-01의 `Armed Forces Day`인 날짜에만 1이다. 고정 자료에서는 14개 날짜다. 2024-10-01은 B1 public/temporary flag에는 포함되지만 holiday type은 0이고 HQRC 보정 창에는 포함되지 않는다.
+
+B0 특징 행렬에 holiday 이름, holiday flag, event-relative time, 이벤트 창 여부가 들어가면 테스트가 실패한다. 이벤트 정보는 B0 예측과 별개로 HQRC window 선택에만 사용한다. 공식 연휴 내 signed day position/type과 `official sequence +/- 1 day`인 HQRC 분석 창은 서로 다른 계약이다.
 
 ## 6. 이벤트 계약
 
@@ -242,7 +246,11 @@ predict(fitted, forecast_batch) -> PredictionFrame
 
 `PredictionFrame`은 sample origin, target timestamp, horizon 1--24, observed MW, predicted MW, model, feature set, seed, split id를 가진 long-form 자료다. 중복된 `(model, feature_set, seed, split_id, target_timestamp)`는 허용하지 않는다.
 
-Tree/SVR은 horizon별 estimator 24개를 사용한다. Seq2Seq-LSTM과 Transformer는 24시간을 공동 출력한다. 신경망은 다섯 seed의 예측 평균을 한 baseline residual stream으로 사용하고 seed별 성능과 분산을 별도로 보존한다.
+Tree/SVR은 horizon별 estimator 24개를 사용한다. 각 estimator는 동일한 `flatten(168시간 load/weather history) + flatten(24시간 known-future calendar path)`를 받는다. classical X는 estimator-fit 표본에만 적합한 StandardScaler로 변환하고, 모든 classical target은 같은 estimator-fit target StandardScaler로 표준화한 뒤 예측을 MW로 역변환한다. 이 좌표계에서 SVR의 `epsilon=0.05`는 0.05 MW가 아니라 학습 target 표준편차의 0.05다.
+
+Seq2Seq-LSTM과 Transformer는 24시간을 공동 출력한다. history load와 target은 동일한 estimator-fit target scaler를 사용하고, history weather 및 future calendar는 estimator-fit 표본에만 적합한 featurewise scaler를 사용한다. 61일 early-stopping validation tail이나 evaluation year는 어떤 scaler 통계에도 포함되지 않는다. 신경망은 다섯 seed의 예측 평균을 한 baseline residual stream으로 사용하고 seed별 성능과 분산을 별도로 보존한다.
+
+전처리 version, scaler 종류, scaler-fit partition, 24시간 future-path 길이, history/future 열 이름과 순서는 `model_spaces.toml`의 고정 설정과 baseline manifest에 포함한다. 이 중 하나가 없거나 달라지면 cache를 재사용하지 않고 실패한다.
 
 하이퍼파라미터는 2019--2022/2023에서 한 번 선택하고 고정한다. 기존 baseline 연구에서 확정된 versioned 설정을 사용하면 탐색을 생략한다. OOF fold마다 다시 탐색하지 않으며, 고정된 설정으로 해당 fold train만 다시 학습한다. final baseline은 동일 설정으로 2019--2023 전체를 다시 학습해 2024를 예측한다.
 
