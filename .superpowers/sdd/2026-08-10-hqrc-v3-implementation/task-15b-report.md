@@ -76,10 +76,18 @@ the repeated real check above passed.  The original paper artifact directory was
 - `git diff --check`: clean.
 - Protected untracked `hqrc_v3/uv.lock` remains byte-identical:
   `f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`.
-- The requested full non-slow command was attempted three times.  This execution environment
-  returned only partial pytest progress at 14% and no exit summary, while focused/adjacent suites
-  completed normally.  It is therefore not represented as a passing full-suite result and needs
-  rerun during independent review.
+- Full non-slow verification completed in the locked workspace virtual environment with explicit
+  source and temporary PyTensor-cache paths after the sandbox denied `uv` cache access:
+
+  ```text
+  env PYTHONPATH=/Users/ijongseung/Documents/GitHub/arima-type/Demadn-Quadratic-Tilting/.worktrees/hqrc-v3/hqrc_v3/src \
+    PYTENSOR_FLAGS=compiledir=/private/tmp/hqrc-v3-pytensor-task15b \
+    .venv/bin/python -m pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests -m 'not slow' -q
+  486 passed, 8 deselected, 77 existing warnings in 80.07s, exit 0
+  ```
+
+  The original `uv` command's only issue was sandbox access to its external cache; the protected
+  lock was not touched.
 
 ## Files changed
 
