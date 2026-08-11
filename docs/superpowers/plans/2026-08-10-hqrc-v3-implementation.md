@@ -1293,6 +1293,182 @@ The independent reviewer must inspect feature availability at the forecast origi
 holiday coverage, scaler fit rows, full 24-hour classical path, MW inverse transformation, and
 manifest binding. Do not launch the all-model OOF/final run before verdict **READY**.
 
+### Task 14: Production causal-2024 H3 correction stage
+
+**Why this task is bounded:** This task wires the already-reviewed Bayesian primitives into the
+paper's primary causal comparison only. One invocation fits one approved
+`(model, feature_set, seed)` context using the eight expanding-OOF occurrences from 2020--2023,
+then predicts the two registered 2024 occurrences from the immutable 2019--2023 final baseline.
+LOEO, H0--H5, pooling ablations, AR(2), Student-t innovations, sampler benchmarking, and final
+paper-wide reporting remain separate later tasks. This prevents the primary fit from silently
+changing its estimand or reusing a full-data AR approval in a leave-one-event-out fold.
+
+**Files:**
+- Modify: `hqrc_v3/src/hqrc_v3/diagnostics/ar.py`
+- Create: `hqrc_v3/src/hqrc_v3/correction_stage.py`
+- Modify: `hqrc_v3/src/hqrc_v3/corrections/__init__.py`
+- Modify: `hqrc_v3/src/hqrc_v3/cli.py`
+- Modify: `hqrc_v3/README.md`
+- Modify: `hqrc_v3/tests/integration/test_ar_artifact.py`
+- Create: `hqrc_v3/tests/unit/test_correction_stage.py`
+- Create: `hqrc_v3/tests/integration/test_cli_corrections.py`
+- Create: `hqrc_v3/tests/slow/test_real_correction_stage.py`
+
+**Frozen primary method:**
+
+- variant `H3`, partial pooling, full between-event covariance, restriction covariate enabled;
+- event-reset Gaussian AR(1), where `1` is the order and **not** a fixed value of `phi`;
+- context-specific transformed prior `u=(phi+1)/2 ~ Beta(a,b)` loaded only from the explicitly
+  approved diagnostic artifact;
+- PyMC NUTS; smoke profile uses small explicit test limits, while paper profile uses exactly four
+  chains, at least 1,000 warm-up and 1,000 retained draws, and target acceptance 0.99;
+- paper output is publishable only when the existing strict posterior gate passes
+  (`R-hat <= 1.01`, bulk/tail ESS at least 400, zero divergences).
+
+**Canonical causal data flow:**
+
+```text
+2020--2023 expanding OOF baseline residuals (8 events)
+    -> fold-local non-event standardization
+    -> approved context-specific AR(1) Beta prior
+    -> H3 partial-pooling posterior
+    -> 2024 Seollal + Chuseok only (264 hours total)
+    -> correction in MW using that context's oof-2023 sigma_N
+```
+
+The 2024 outcomes and final-baseline predictions must never enter HQRC fitting or AR calibration.
+The 1 October 2024 temporary holiday remains B1 calendar information but is outside the HQRC
+event set and receives no correction.
+
+- [ ] **Step 1: Write context-binding and causal-adapter tests; verify genuine RED**
+
+Tests must first demonstrate the current missing/unsafe behavior:
+
+1. `ApprovedARCalibration` exposes its artifact's validated `EventResidualContext`; revalidation
+   compares it as part of the opaque trusted wrapper. A LightGBM-B1 approval cannot fit an
+   XGBoost, B0, different-seed, different-split, or differently ordered/event-populated input.
+2. Approved calibration `event_ids` must equal the eight HQRCData occurrence ids exactly as a
+   set, and the context split ids must be exactly `oof-2020` through `oof-2023`.
+3. The residual-to-`HQRCData` adapter deterministically sorts complete occurrence segments,
+   maps Seollal/Chuseok to 0/1, retains `tau_days`, hour, and restriction, and rejects duplicate,
+   missing, extra, final-2024, non-hourly, or context-mismatched rows.
+4. A source-derived final-baseline loader accepts exactly 7,320 Jan--Oct 2024 point hours per
+   stream and extracts exactly 144 Seollal plus 120 Chuseok hours. It rejects rehashed target,
+   model/feature/seed, window, timestamp, member-mean, preprocessing-population, or source-hash
+   tampering and excludes 2024-10-01.
+5. The final MW scale is exactly the selected residual manifest context's finite positive
+   `latest_complete_oof_scale` and its split must be `oof-2023`; no 2024 residual scale may be
+   computed.
+
+- [ ] **Step 2: Close approved-AR context substitution**
+
+Parse the already digest-validated artifact `context` into `EventResidualContext`, include it in
+`ApprovedARCalibration`, and compare it in `require_approved_calibration`. Do not add a public
+constructor or an approval bypass. Preserve the existing artifact schema and all ten approved
+paper files: this is a stricter loader interpretation, not a new calibration or an automatic
+approval.
+
+- [ ] **Step 3: Implement the strict causal input adapter and source preflight**
+
+Create one production API which receives `run_dir`, experiment config, approved AR path, seed,
+and profile. It must:
+
+1. load the canonical standardized-residual manifest with current config/event/residual hashes;
+2. resolve and hash-check all six source identities recorded by that manifest;
+3. rebuild audited B0/B1 forecast matrices from the raw source and calendars;
+4. invoke the public final-baseline stage in validation/reuse mode and require `fit_count == 0`,
+   thereby proving the existing final publication against source-derived truth without a refit;
+5. infer exactly one model/feature/point-seed from the approved context and select the matching
+   residual and final-baseline streams;
+6. bind the eight training occurrence ids to the approval, build immutable `HQRCData`, select the
+   `oof-2023` MW scale, and construct the two exact 2024 prediction contexts with an AR reset at
+   each event boundary.
+
+No caller-supplied model/feature selector may override the approved artifact. Paper profile must
+require the full five-model/two-feature baseline and residual publications even though one
+context is fitted per invocation.
+
+- [ ] **Step 4: Fit and predict only the primary H3 causal model**
+
+Call `sample_hqrc` with `variant="H3"`, `pooling="partial"`, and
+`HQRCModelOptions(covariance="full", include_restriction=True,
+innovation="normal_ar1")`. Generate new-event coefficient and event-reset innovation
+trajectories with the existing reviewed predictive code. The corrected predictive distribution
+is
+
+```python
+baseline_mw[None, :] + sigma_n_mw * (q_standardized + e_standardized)
+```
+
+and must not add a second baseline-residual bootstrap. The point forecast is the baseline plus
+`sigma_n_mw` times the posterior mean of `q`; outside the two event windows it is bitwise equal
+to the final baseline.
+
+- [ ] **Step 5: Publish one immutable, reusable context result**
+
+Use a context-specific location under
+`corrections/causal-2024/<model>/<feature_set>/seed-<seed>/`. Publish only after all products are
+fsynced and verified:
+
+```text
+hqrc_data.current.json + immutable HQRCData generation
+posterior.nc
+event_predictions.parquet
+full_period_point_predictions.parquet
+event_metrics.parquet
+full_period_point_metrics.parquet
+manifest.json
+COMPLETE
+```
+
+The manifest must bind source/config/event/model/residual/final-baseline/approved-AR hashes,
+approved context and proposal/artifact digests, exact training and evaluation occurrence ids,
+latest OOF scale, frozen model/options/sampler profile, seed, row/coverage digests, every output
+hash, and completion state. Use a context lock plus staged atomic publication. A valid complete
+result is reused without sampling; partial, symlinked, hash-changed, semantically changed, or
+diagnostically invalid results fail closed. Different contexts must be able to run concurrently.
+
+- [ ] **Step 6: Wire the singular CLI and document its scope**
+
+Replace only the `fit-corrections` unavailable handler. For Task 14,
+`--evaluation causal-2024` is accepted and `--evaluation loeo` must explicitly report that the
+fold-specific approved-calibration stage is not yet implemented; it must not reuse the eight-event
+causal approval. Keep `run-ablations` and `benchmark-samplers` unavailable. Document one command
+per approved context and state that paper fitting does not refit the baseline.
+
+- [ ] **Step 7: Verify focused, full-fast, lint, lock, and reduced real-data smoke**
+
+```bash
+uv run --project hqrc_v3 --locked pytest -c hqrc_v3/pyproject.toml \
+  hqrc_v3/tests/integration/test_ar_artifact.py \
+  hqrc_v3/tests/unit/test_correction_stage.py \
+  hqrc_v3/tests/integration/test_cli_corrections.py -q
+uv run --project hqrc_v3 --locked pytest -c hqrc_v3/pyproject.toml \
+  hqrc_v3/tests -m "not slow" -q
+uv run --project hqrc_v3 --locked ruff check --config hqrc_v3/pyproject.toml \
+  hqrc_v3/src hqrc_v3/tests
+uv run --project hqrc_v3 --locked pytest -c hqrc_v3/pyproject.toml \
+  hqrc_v3/tests/slow/test_real_correction_stage.py -m slow -q
+```
+
+The slow smoke must use one real approved context, rebuild/revalidate the real source and final
+baseline without fitting it, traverse the actual H3 PyMC model with reduced smoke draws, and
+verify exact 8-training/2-evaluation event coverage plus event-only correction. It must write to
+a temporary output, not mutate the paper artifact directory. Full four-chain paper computation
+starts only after a fresh independent READY review.
+
+- [ ] **Step 8: Commit and obtain a fresh independent production review**
+
+```bash
+git add hqrc_v3 docs/superpowers/plans/2026-08-10-hqrc-v3-implementation.md \
+  .superpowers/sdd/2026-08-10-hqrc-v3-implementation
+git commit -m "feat(hqrc-v3): fit causal 2024 corrections"
+```
+
+The reviewer must inspect the approved-context binding, absence of 2024 fitting leakage,
+source-derived final validation, event reset, use of the oof-2023 scale, no residual
+double-counting, point-forecast locality, posterior gates, atomic/reuse behavior, and CLI scope.
+
 ## Final Verification
 
 - [ ] Run: `uv run pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests -m "not slow" -q`
