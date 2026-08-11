@@ -78,3 +78,33 @@ Fix-round evidence:
 - Scoped Ruff and `git diff --check` are clean. The protected untracked nested lock remains
   byte-identical at
   `f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`.
+
+## Independent-review fix round 2
+
+Commit: `1e74c99` (`fix(hqrc-v3): verify OOF truth from source matrices`)
+
+- Extracted public pure baseline helpers that derive expected OOF coverage and preprocessing
+  populations from audited forecast matrices using the same expanding folds, validation-tail
+  rules, model families, feature sets, and frozen `validation_days` as baseline publication.
+- Residual preparation now rereads and audits the concrete raw source, holiday calendar, and
+  temporary-holiday availability registry, rebuilds every declared feature matrix, and passes
+  those matrices plus the frozen model config to the shared source-truth verifier.
+- Stage-owned `expected_coverage` is compared with a matrix-derived digest containing exact
+  origins, target timestamps, horizons, split IDs, and observed MW values. Point/member frames
+  are then checked against that independent digest, closing a self-consistent observed-value
+  rebound.
+- Every model/feature/fold scaler population is independently reconstructed from source
+  matrices and compared exactly, including scaler names, counts, start/end ranges, and units.
+
+Fix-round evidence:
+
+- Genuine RED: `2 failed, 9 passed`; a valid-but-false scaler population and a +1,000 MW
+  point/member observed-value rebound with recomputed artifact SHAs and coverage digest were
+  both accepted before implementation.
+- Acceptance GREEN independently covers target-population count tampering, start-range
+  tampering, and the observed-value rebound; focused residual tests report `12 passed`.
+- Adjacent residual/CLI/paper-publication verification passed before the final split of the
+  scaler test, and the superset full non-slow suite passed `396 passed, 7 deselected` with the
+  same 47 deferred tiny-draw warnings.
+- Scoped Ruff, `git diff --check`, and protected-lock verification are clean. No real paper
+  artifact or baseline computation was run.
