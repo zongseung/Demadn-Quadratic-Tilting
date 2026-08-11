@@ -947,7 +947,7 @@ def test_readme_hqrc_commands_are_executable_from_the_repository_root() -> None:
 
     assert "Run these commands from the repository root" in readme
     assert "uv sync --project hqrc_v3 --locked" in readme
-    assert "export UV_LOCKED=1" in readme
+    assert "export UV_LOCKED" not in readme
     assert "repository-root `uv.lock`" in readme
     for command in (
         "generate-oof",
@@ -957,7 +957,8 @@ def test_readme_hqrc_commands_are_executable_from_the_repository_root() -> None:
         "approve-ar-calibration",
         "report",
     ):
-        assert f"uv run --project hqrc_v3 hqrc {command}" in readme
+        assert f"uv run --project hqrc_v3 --locked hqrc {command}" in readme
+    assert "uv run --project hqrc_v3 hqrc " not in readme
     assert "uv run hqrc " not in readme
     assert "\nhqrc " not in readme
     assert "MODEL_SHA256=<" not in readme

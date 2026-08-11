@@ -79,8 +79,8 @@ the shared cache/publication stage. Paper CLI execution requires the exact
 2019-01-01 00:00 through 2024-10-31 23:00 range and 51,144 rows before feature
 construction; only the explicit smoke profile is relaxed. No handler invokes the
 tuning boundary. README commands declare repository-root execution and consistently
-use `uv run --project hqrc_v3 hqrc ...`; they compute the model hash with OpenSSL
-and pass the quoted `"$MODEL_SHA256"` value.
+use `uv run --project hqrc_v3 --locked hqrc ...`; they compute the model hash
+with OpenSSL and pass the quoted `"$MODEL_SHA256"` value.
 
 The opt-in real smoke audited the 51,144-row source and executed actual LightGBM-B1
 for OOF 2020 with three boosting rounds. It traversed the same loader, frozen
@@ -180,10 +180,10 @@ no fallback estimator was used.
 - Packaging-focused tests: `3 passed`; Task 11 focused tests: `58 passed`; full
   non-slow suite: `351 passed, 6 deselected` with the same 47 tiny-draw
   ArviZ/runtime warnings.
-- Operator bootstrap is now explicit:
-  `uv sync --project hqrc_v3 --locked`, followed by `export UV_LOCKED=1` for the
-  documented `uv run --project hqrc_v3 hqrc ...` commands. The exact bootstrap
-  resolved all 134 locked packages successfully.
+- Round 3's bootstrap used `uv sync --project hqrc_v3 --locked` and then exported
+  `UV_LOCKED=1`; round 4 replaces that environment-dependent operator contract
+  with an explicit flag on every command. The bootstrap resolved all 134 locked
+  packages successfully.
 - Both required real baseline smokes passed: installed-console LightGBM-B1
   (`1 passed` in 27.58 seconds) and the existing real-source SVR smoke (`1 passed`
   in 1.94 seconds). The isolated installed-console audit also passed (`1 passed`
@@ -192,6 +192,30 @@ no fallback estimator was used.
   without changing the lock; `git diff --check` was clean. Generated
   `hqrc_v3.egg-info` was removed before publication.
 
+### Fix round 4
+
+- Exact-argv RED: the README contract test failed on the existing
+  `export UV_LOCKED=1`, and the subprocess-helper regression captured
+  `uv run --project hqrc_v3 hqrc ...` instead of the required literal argv with
+  `--locked`. Both failures directly reproduced the review finding.
+- GREEN: every README `hqrc` example is now
+  `uv run --project hqrc_v3 --locked hqrc ...`, including paper OOF/final, smoke,
+  audit, AR diagnostics/approval, and report commands. The test command also
+  carries `--locked`; the README neither requires nor recommends `UV_LOCKED`.
+- The isolated helper emits that same exact argv. Its clean environment removes
+  `PYTHONPATH` and `VIRTUAL_ENV`, sets only the isolated
+  `UV_PROJECT_ENVIRONMENT` plus progress control, and contains no `UV_LOCKED`
+  escape hatch.
+- The exact RED pair passed after the minimal change (`2 passed`), and the
+  packaging plus README contracts passed (`4 passed`). The clean installed audit,
+  actual LightGBM-B1 console smoke, and real-source SVR smoke passed together
+  (`3 passed, 1 deselected` in 32.28 seconds).
+- Ruff reported `All checks passed!`; `uv lock --check` resolved the unchanged
+  134-package root lock; `git diff --check` was clean. No model configuration,
+  dependency metadata, or Python floor changed.
+- The protected `hqrc_v3/uv.lock` remained unstaged and byte-identical at
+  SHA-256 `f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`.
+
 ## Commits
 
 - `f857e04 feat(hqrc-v3): freeze paper baseline factories`
@@ -199,7 +223,8 @@ no fallback estimator was used.
 - `c4a30ec docs(hqrc-v3): report Task 11 verification`
 - `ddf86ba fix(hqrc-v3): harden paper baseline execution`
 - `bd5ede3 fix(hqrc-v3): validate complete baseline run state`
-- `fix(hqrc-v3): install workspace console package` (fix round 3)
+- `3ad2b4e fix(hqrc-v3): install workspace console package`
+- `fix(hqrc-v3): make lock flag explicit` (fix round 4)
 
 The protected workspace-local `hqrc_v3/uv.lock` was not staged or modified; its
 SHA-256 remained

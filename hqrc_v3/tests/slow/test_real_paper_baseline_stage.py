@@ -28,10 +28,10 @@ def clean_project_environment(
     environment_path = temporary_root / "environment"
     environment = dict(os.environ)
     environment.pop("PYTHONPATH", None)
+    environment.pop("UV_LOCKED", None)
     environment.pop("VIRTUAL_ENV", None)
     environment.update(
         {
-            "UV_LOCKED": "1",
             "UV_NO_PROGRESS": "1",
             "UV_PROJECT_ENVIRONMENT": str(environment_path),
         }
@@ -45,7 +45,7 @@ def _run_repository_command(
     arguments: Sequence[str], *, environment: Mapping[str, str]
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["uv", "run", "--project", "hqrc_v3", "hqrc", *arguments],
+        ["uv", "run", "--project", "hqrc_v3", "--locked", "hqrc", *arguments],
         cwd=REPOSITORY_ROOT,
         env=environment,
         check=False,
@@ -60,6 +60,39 @@ def _assert_success(result: subprocess.CompletedProcess[str]) -> None:
     )
 
 
+def test_repository_command_passes_locked_in_the_exact_uv_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[list[str]] = []
+
+    def capture_run(
+        arguments: Sequence[str], **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        captured.append(list(arguments))
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", capture_run)
+    _run_repository_command(
+        ["audit-data", "--data", "power_demand_final.csv", "--fixed-bounds"],
+        environment={"UV_PROJECT_ENVIRONMENT": "/isolated/environment"},
+    )
+
+    assert captured == [
+        [
+            "uv",
+            "run",
+            "--project",
+            "hqrc_v3",
+            "--locked",
+            "hqrc",
+            "audit-data",
+            "--data",
+            "power_demand_final.csv",
+            "--fixed-bounds",
+        ]
+    ]
+
+
 @pytest.mark.slow
 def test_clean_locked_install_exposes_console_and_audits_real_source(
     clean_project_environment: tuple[dict[str, str], Path, Path],
@@ -69,6 +102,7 @@ def test_clean_locked_install_exposes_console_and_audits_real_source(
     if not SOURCE.is_file():
         pytest.skip("repository power_demand_final.csv source is absent")
     environment, environment_path, temporary_root = clean_project_environment
+    assert "UV_LOCKED" not in environment
 
     result = _run_repository_command(
         ["audit-data", "--data", "power_demand_final.csv", "--fixed-bounds"],

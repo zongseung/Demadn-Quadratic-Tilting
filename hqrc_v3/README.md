@@ -8,12 +8,11 @@ horizon estimators; both neural models jointly predict all 24 hours from observe
 history and known future covariates only.
 
 Run these commands from the repository root. Bootstrap the Python 3.11+ workspace
-from the committed repository-root `uv.lock`, then keep subsequent uv commands
-locked for the shell session:
+from the committed repository-root `uv.lock`; every invocation below carries its
+own explicit lock check:
 
 ```bash
 uv sync --project hqrc_v3 --locked
-export UV_LOCKED=1
 ```
 
 The root `pyproject.toml` owns the uv workspace and installs `hqrc_v3/` as the
@@ -27,7 +26,7 @@ with all models and both feature sets:
 ```bash
 MODEL_SHA256="$(openssl dgst -sha256 hqrc_v3/configs/model_spaces.toml | awk '{print $NF}')"
 
-uv run --project hqrc_v3 hqrc generate-oof \
+uv run --project hqrc_v3 --locked hqrc generate-oof \
   --data power_demand_final.csv \
   --config hqrc_v3/configs/experiment.toml \
   --frozen-model-config hqrc_v3/configs/model_spaces.toml \
@@ -38,7 +37,7 @@ uv run --project hqrc_v3 hqrc generate-oof \
   --cache-dir runs/RUN_ID/prediction-stream-cache \
   --model all --feature-set all --seed 7 --profile paper
 
-uv run --project hqrc_v3 hqrc fit-final-baselines \
+uv run --project hqrc_v3 --locked hqrc fit-final-baselines \
   --data power_demand_final.csv \
   --config hqrc_v3/configs/experiment.toml \
   --frozen-model-config hqrc_v3/configs/model_spaces.toml \
@@ -77,7 +76,7 @@ schema, altered seed/model identity, or tampered publication fails closed.
 The opt-in real smoke uses the same LightGBM-B1 stage with a reduced round cap:
 
 ```text
-uv run --project hqrc_v3 hqrc generate-oof \
+uv run --project hqrc_v3 --locked hqrc generate-oof \
   --data power_demand_final.csv \
   --config hqrc_v3/configs/experiment.toml \
   --frozen-model-config hqrc_v3/configs/model_spaces.toml \
@@ -95,10 +94,10 @@ and round overrides.
 Other concrete operator stages are:
 
 ```text
-uv run --project hqrc_v3 hqrc audit-data --data power_demand_final.csv --fixed-bounds
-uv run --project hqrc_v3 hqrc diagnose-ar --residuals runs/RUN_ID/inputs/standardized_residuals.parquet --output runs/RUN_ID/ar_diagnostics/proposed.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256 --through 2023
-uv run --project hqrc_v3 hqrc approve-ar-calibration --proposal runs/RUN_ID/ar_diagnostics/proposed.json --output runs/RUN_ID/ar_diagnostics/approved.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256
-uv run --project hqrc_v3 hqrc report --run-dir runs/RUN_ID --profile smoke
+uv run --project hqrc_v3 --locked hqrc audit-data --data power_demand_final.csv --fixed-bounds
+uv run --project hqrc_v3 --locked hqrc diagnose-ar --residuals runs/RUN_ID/inputs/standardized_residuals.parquet --output runs/RUN_ID/ar_diagnostics/proposed.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256 --through 2023
+uv run --project hqrc_v3 --locked hqrc approve-ar-calibration --proposal runs/RUN_ID/ar_diagnostics/proposed.json --output runs/RUN_ID/ar_diagnostics/approved.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256
+uv run --project hqrc_v3 --locked hqrc report --run-dir runs/RUN_ID --profile smoke
 ```
 
 Before `report`, the run must contain the strict version-2 reporting manifest and
@@ -109,5 +108,5 @@ gate before writing `COMPLETE`. Only a full `paper` run satisfying posterior
 diagnostics may populate manuscript numbers.
 
 Run fast contracts from the repository root with
-`uv run --project hqrc_v3 pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests -m "not slow"`;
+`uv run --project hqrc_v3 --locked pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests -m "not slow"`;
 real-data and sampler checks are opt-in under `pytest -m slow`.
