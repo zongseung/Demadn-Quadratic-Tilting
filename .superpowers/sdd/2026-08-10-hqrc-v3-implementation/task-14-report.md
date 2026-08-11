@@ -78,3 +78,41 @@ Implementation commits:
 - The 50 fast-suite and 24 real-smoke warnings arise from intentionally tiny synthetic/reduced
   posterior draws and are not present as accepted paper diagnostic evidence; paper publication
   still requires the frozen strict R-hat, ESS, and divergence gates.
+
+## Independent-review fix round 1 — RED evidence
+
+- Before production edits, reviewer reproductions were added for all five downstream crash
+  boundaries, independently self-rehashed tampering of all four Parquet products, sampler
+  profile/RNG namespace collision, and a Bayesian `SamplingError` escaping the CLI boundary.
+- Exact RED command:
+  `uv run --project hqrc_v3 --locked pytest -c hqrc_v3/pyproject.toml
+  hqrc_v3/tests/unit/test_correction_stage.py
+  hqrc_v3/tests/integration/test_cli_corrections.py -q`.
+- Result: `11 failed, 13 passed, 16 warnings in 2.27s`. The failures independently demonstrated
+  five non-resumable product/manifest crashes, acceptance of four semantically changed and fully
+  rehashed Parquets, one smoke/RNG namespace collision, and one uncaught diagnostic error.
+
+### Fix round 1 GREEN
+
+Commit: `5031417` (`fix(hqrc-v3): harden correction publication reuse`)
+
+- A valid HQRCData/posterior checkpoint now resumes after each known product or manifest boundary,
+  removes only explicitly enumerated downstream files, regenerates them deterministically, and
+  never calls the sampler again. Unknown entries, symlinks, and invalid HQRCData/posteriors remain
+  fail-closed.
+- Complete reuse reloads the diagnostics-valid posterior and re-derives all four products from the
+  manifest-bound sampler seed and draw count. Exact column order, schema, row order, scalar/list
+  values, masks, forecasts, and metrics must match, so fully rehashed semantic tampering fails.
+- Output paths now include both sampler profile and sampler RNG seed below the approval-derived
+  baseline seed. Smoke, paper, and distinct sampler seeds are independent namespaces.
+- `SamplingError` now uses the declared `hqrc:` stderr and exit-code-2 CLI boundary without
+  broadening it to unrelated runtime/programmer exceptions.
+- Focused approval/correction/CLI suite: `37 passed, 25 expected tiny-draw warnings in 3.36s`.
+- Full non-slow suite: `426 passed, 8 deselected, 72 expected tiny-draw warnings in 63.40s`.
+- Full project Ruff and `git diff --check`: clean. Protected nested lock SHA remains
+  `f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`.
+- The real paper-source/reduced-PyMC smoke now also performs a second complete semantic reuse from
+  NetCDF without sampling: `1 passed, 36 expected reduced-draw warnings in 13.21s`. Protected
+  paper inputs remained hash-identical and all correction output stayed in pytest temporary space.
+- Full paper sampling and actual paper correction publication remain prohibited pending a fresh
+  independent READY verdict.
