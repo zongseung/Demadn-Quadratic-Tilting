@@ -6,6 +6,8 @@ Implementation commit: `d32580f`
 
 Fix round 1 commit: `cfef558`
 
+Verification-only import-order commit: `8e313d2`
+
 ## Scope delivered
 
 - Added the exact public operations `prepare_loeo_ar_proposal_set`,
@@ -226,6 +228,60 @@ Scoped Ruff check and format check passed, `git diff --check` was clean, and the
 untracked `hqrc_v3/uv.lock` remained byte-identical at
 `f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`. No real artifacts,
 approvals, fitting, sampling, or paper outputs were created in this fix round. Task 15 Step 3
+remains unchecked pending fresh independent review.
+
+### Post-fix controller and real-source verification follow-up
+
+The controller's post-fix full non-slow run completed successfully:
+
+```text
+545 passed, 8 deselected, 77 warnings in 188.16s, exit 0
+```
+
+Its full Ruff lint found one fixable `I001` in the amended Task 15C test import block. Commit
+`8e313d2` mechanically organizes only those imports. The configured full source/test lint then
+passed, and the two changed Task 15C files passed the configured format check. A repository-wide
+format check also reports 40 unrelated pre-existing files as differently formatted; none was
+modified by this verification follow-up.
+
+Post-import focused and exact report-adjacent verification passed:
+
+```text
+hqrc_v3/tests/unit/test_loeo_ar.py
+36 passed in 105.59s
+
+Task 7/14/15 adjacent set from this report
+180 passed, 30 existing warnings in 119.23s
+```
+
+A new real unapproved preparation used the same validated paper-source copy and XGBoost/B1 LOEO
+inputs documented above, writing only to
+`/private/tmp/hqrc-v3-task15c-fix1-real.6DHoD4`. The exact second call returned the same immutable
+generation and proposal digest. A before/after snapshot of all 35 regular output files matched
+both inode and SHA-256, proving exact reuse rather than replacement:
+
+```text
+approved_first=false
+approved_second=false
+events=10
+generation_same=true
+snapshot_same=true
+proposal_set_sha256_first=db54721c0899f29312abe3d47d08977b33e02f53315d629c17fd319f6bfa83cd
+proposal_set_sha256_second=db54721c0899f29312abe3d47d08977b33e02f53315d629c17fd319f6bfa83cd
+approval_exists=false
+approval_lexists=false
+```
+
+The original paper artifact and temporary validated source aggregate regular-file hashes matched
+their before values after the real check:
+
+```text
+paper:  4ab54f253ed520e93475dd46381c913e289a32c03251f76a0da0fd74e3a5ee8e
+source: 7d637f91adf92ae02e741d05bd0ac6fe28a1c535e2e10c7aefa56bd2c63bcb64
+```
+
+No approval directory, fit, sampler call, prediction, source mutation, original-paper mutation,
+or paper output was produced. The protected nested lock remains byte-identical. Task 15 Step 3
 remains unchecked pending fresh independent review.
 
 ## Files changed
