@@ -1530,7 +1530,7 @@ events. Re-read that Parquet before diagnostics so no in-memory full-universe fr
 accidentally. Tests must prove 10 events/1,296 rows, exact hourly grids, no held-out row, and
 held-out outcome mutation invariance of its training artifact.
 
-- [ ] **Step 3: Generate and explicitly approve a ten-fold AR proposal set**
+- [x] **Step 3: Generate and explicitly approve a ten-fold AR proposal set**
 
 Add `prepare_loeo_ar_proposal_set`, `approve_loeo_ar_proposal_set`, and
 `load_approved_loeo_ar_set`. Each fold proposal derives occurrence-reset ACF/PACF and the existing
