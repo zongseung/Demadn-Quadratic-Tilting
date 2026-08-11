@@ -30,6 +30,11 @@ _ROOT_NAMESPACE = frozenset({".loeo.lock", "generations", "current.json", ".curr
 _GENERATION_NAMESPACE = frozenset({"universe.parquet", "folds", "manifest.json", "COMPLETE"})
 _COLUMNS = (*STANDARDIZED_RESIDUAL_COLUMNS, "causal")
 _YEARS = tuple(range(2020, 2025))
+_FOLD_FILENAMES = frozenset(
+    f"{holiday}-{year}.parquet"
+    for year in _YEARS
+    for holiday in ("seollal", "chuseok")
+)
 
 
 class LOEOError(ValueError):
@@ -140,37 +145,53 @@ def _fsync_file(path: Path) -> None:
         os.fsync(source.fileno())
 
 
-def _remove_safe_tree(path: Path) -> None:
-    """Remove only a no-symlink publication debris tree while holding the lock."""
-
-    _require_real_directory(path, "LOEO partial generation")
-    for child in path.iterdir():
-        mode = child.lstat().st_mode
-        if stat.S_ISLNK(mode):
-            raise LOEOError("LOEO partial generation is unsafe")
-        if stat.S_ISDIR(mode):
-            _remove_safe_tree(child)
-        elif stat.S_ISREG(mode):
-            child.unlink()
-        else:
-            raise LOEOError("LOEO partial generation is unsafe")
-    path.rmdir()
-
-
-def _is_removable_incomplete_generation(path: Path) -> bool:
-    """Only a known-only, no-COMPLETE, no-symlink generation is disposable debris."""
+def _incomplete_generation_removal_plan(
+    path: Path,
+) -> tuple[tuple[Path, ...], tuple[Path, ...]] | None:
+    """Prove the complete tree is an exact safe schema subset before deleting anything."""
 
     try:
         _require_real_directory(path, "LOEO partial generation")
-        names = {child.name for child in path.iterdir()}
-        if "COMPLETE" in names or not names.issubset(_GENERATION_NAMESPACE):
-            return False
-        for child in path.rglob("*"):
-            if child.is_symlink():
-                return False
-        return True
-    except LOEOError:
-        return False
+        entries = {child.name: child for child in path.iterdir()}
+        allowed = _GENERATION_NAMESPACE - {"COMPLETE"}
+        if not set(entries).issubset(allowed):
+            return None
+
+        files: list[Path] = []
+        directories: list[Path] = []
+        for name in ("universe.parquet", "manifest.json"):
+            if child := entries.get(name):
+                _require_real_file(child, f"LOEO partial generation {name}")
+                files.append(child)
+
+        folds = entries.get("folds")
+        if folds is not None:
+            _require_real_directory(folds, "LOEO partial fold namespace")
+            fold_entries = {child.name: child for child in folds.iterdir()}
+            if not set(fold_entries).issubset(_FOLD_FILENAMES):
+                return None
+            for name in sorted(fold_entries):
+                child = fold_entries[name]
+                _require_real_file(child, f"LOEO partial fold {name}")
+                files.append(child)
+            directories.append(folds)
+        directories.append(path)
+        return tuple(files), tuple(directories)
+    except (LOEOError, OSError):
+        return None
+
+
+def _remove_safe_tree(path: Path) -> None:
+    """Remove debris only after validating every path and filesystem type under the lock."""
+
+    plan = _incomplete_generation_removal_plan(path)
+    if plan is None:
+        raise LOEOError("LOEO partial generation is invalid and preserved")
+    files, directories = plan
+    for child in files:
+        child.unlink()
+    for child in directories:
+        child.rmdir()
 
 
 def _recoverable_generation(path: Path, identity: str, source: Mapping[str, object]) -> str | None:
@@ -241,11 +262,12 @@ def _recover_publication_debris(
             raise LOEOError("LOEO generation namespace contains incompatible entries")
         digest = _recoverable_generation(entry, identity, source)
         if digest is None:
-            if entry.name == referenced_generation or not _is_removable_incomplete_generation(
-                entry
-            ):
+            if entry.name == referenced_generation:
                 raise LOEOError("LOEO completed generation is invalid and preserved")
-            _remove_safe_tree(entry)
+            try:
+                _remove_safe_tree(entry)
+            except LOEOError as error:
+                raise LOEOError("LOEO completed generation is invalid and preserved") from error
         else:
             recovered = digest
     _fsync_directory(generations)

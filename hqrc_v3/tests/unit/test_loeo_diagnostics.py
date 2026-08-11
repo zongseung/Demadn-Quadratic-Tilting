@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from dataclasses import replace
 from datetime import datetime, time, timedelta
 from hashlib import sha256
@@ -452,6 +453,64 @@ def test_completed_namespace_invalid_generation_is_preserved(
         if path.is_file() and not path.is_symlink()
     }
     assert after == before
+
+
+def _tree_state(root: Path) -> dict[str, tuple[object, ...]]:
+    state: dict[str, tuple[object, ...]] = {}
+
+    def record(path: Path) -> None:
+        mode = path.lstat().st_mode
+        relative = path.relative_to(root).as_posix() if path != root else "."
+        if stat.S_ISDIR(mode):
+            state[relative] = ("directory",)
+            for child in sorted(path.iterdir(), key=lambda candidate: candidate.name):
+                record(child)
+        elif stat.S_ISREG(mode):
+            content = path.read_bytes()
+            state[relative] = ("regular", content, file_sha256(path))
+        elif stat.S_ISLNK(mode):
+            state[relative] = ("symlink", os.readlink(path))
+        elif stat.S_ISFIFO(mode):
+            state[relative] = ("fifo",)
+        else:
+            state[relative] = ("special", stat.S_IFMT(mode))
+
+    record(root)
+    return state
+
+
+def test_nested_unknown_in_incomplete_generation_is_preserved(
+    source: ValidatedCorrectionSource, tmp_path: Path
+):
+    output = tmp_path / "loeo"
+    published = publish_loeo_universe(source, CONTEXT, output_dir=output)
+    (output / "current.json").unlink()
+    (published.generation_dir / "COMPLETE").unlink()
+    (published.generation_dir / "folds/unexpected").write_bytes(b"nested evidence")
+    before = _tree_state(published.generation_dir)
+
+    with pytest.raises(LOEOError, match="preserved"):
+        publish_loeo_universe(source, CONTEXT, output_dir=output)
+
+    assert _tree_state(published.generation_dir) == before
+
+
+def test_fifo_in_incomplete_generation_is_preserved(
+    source: ValidatedCorrectionSource, tmp_path: Path
+):
+    output = tmp_path / "loeo"
+    published = publish_loeo_universe(source, CONTEXT, output_dir=output)
+    (output / "current.json").unlink()
+    (published.generation_dir / "COMPLETE").unlink()
+    fifo = published.generation_dir / "folds/seollal-2024.parquet"
+    fifo.unlink()
+    os.mkfifo(fifo)
+    before = _tree_state(published.generation_dir)
+
+    with pytest.raises(LOEOError, match="preserved"):
+        publish_loeo_universe(source, CONTEXT, output_dir=output)
+
+    assert _tree_state(published.generation_dir) == before
 
 
 def _canonical_write(path: Path, value: object) -> None:
