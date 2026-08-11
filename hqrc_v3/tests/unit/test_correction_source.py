@@ -274,7 +274,7 @@ def test_validated_source_is_immutable_and_loads_canonical_context_streams(
     changed_manifest = source.residual_manifest
     changed_manifest["profile"] = "changed"
     assert source.residual_manifest["profile"] == "smoke"
-    assert source.available_contexts == ((CONTEXT.model, CONTEXT.feature_set, CONTEXT.seed),)
+    assert source.available_contexts == (CONTEXT,)
     assert source.load_standardized_context(CONTEXT, through=2023).equals(
         pl.read_parquet(fixture.residual_path)
     )
@@ -293,6 +293,44 @@ def test_validated_source_rejects_missing_requested_context(tmp_path, monkeypatc
 
     with pytest.raises(CorrectionSourceError, match="requested context"):
         source.load_final_point_context(missing)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "split_ids"),
+    [
+        ("subset", CONTEXT.split_ids[:-1]),
+        ("reordered", (CONTEXT.split_ids[1], CONTEXT.split_ids[0], *CONTEXT.split_ids[2:])),
+        ("duplicate", (*CONTEXT.split_ids, CONTEXT.split_ids[-1])),
+        ("substituted", (*CONTEXT.split_ids[:-1], "oof-2024")),
+    ],
+)
+@pytest.mark.parametrize(
+    "loader",
+    ["standardized", "oof-point", "final-point"],
+)
+def test_all_context_loaders_reject_changed_split_identity(
+    tmp_path, monkeypatch, mutation, split_ids, loader
+):
+    fixture = _install_source_fixture(tmp_path, monkeypatch)
+    source = validate_correction_source(
+        run_dir=fixture.run,
+        config_path=fixture.sources["experiment_config"],
+        profile="smoke",
+    )
+    changed = EventResidualContext(
+        CONTEXT.model,
+        CONTEXT.feature_set,
+        CONTEXT.seed,
+        split_ids,
+    )
+
+    with pytest.raises(CorrectionSourceError, match="requested context"):
+        if loader == "standardized":
+            source.load_standardized_context(changed, through=2023)
+        elif loader == "oof-point":
+            source.load_oof_point_context(changed)
+        else:
+            source.load_final_point_context(changed)
 
 
 def test_source_preflight_rejects_same_content_config_path_substitution(tmp_path, monkeypatch):

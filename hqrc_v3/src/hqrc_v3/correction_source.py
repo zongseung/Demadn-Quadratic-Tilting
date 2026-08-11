@@ -36,7 +36,7 @@ from hqrc_v3.residual_stage import (
     load_standardized_residual_manifest,
     select_diagnostic_residual_context,
 )
-from hqrc_v3.splits import final_fold, select_fold_samples
+from hqrc_v3.splits import expanding_oof_folds, final_fold, select_fold_samples
 
 _SOURCE_KEYS = (
     "data",
@@ -199,6 +199,20 @@ def _context_key(context: EventResidualContext) -> tuple[str, str, int]:
     return context.model, context.feature_set, context.seed
 
 
+def _require_canonical_context(
+    context: EventResidualContext, *, description: str
+) -> EventResidualContext:
+    _context_key(context)
+    split_ids = context.split_ids
+    if not isinstance(split_ids, tuple) or not split_ids:
+        raise CorrectionSourceError(f"{description} split identity is not canonical")
+    allowed = tuple(fold.split_id for fold in expanding_oof_folds())
+    canonical = tuple(split_id for split_id in allowed if split_id in split_ids)
+    if split_ids != canonical:
+        raise CorrectionSourceError(f"{description} split identity is not canonical")
+    return context
+
+
 def _select_point_context(
     frame: pl.DataFrame,
     *,
@@ -242,7 +256,7 @@ class ValidatedCorrectionSource:
     events: tuple[EventOccurrence, ...]
     source_paths: Mapping[str, Path]
     source_hashes: Mapping[str, str]
-    available_contexts: tuple[tuple[str, str, int], ...]
+    available_contexts: tuple[EventResidualContext, ...]
     residual_manifest_path: Path
     residual_path: Path
     baseline_manifest_path: Path
@@ -267,7 +281,12 @@ class ValidatedCorrectionSource:
         object.__setattr__(
             self, "source_hashes", MappingProxyType(dict(self.source_hashes))
         )
-        object.__setattr__(self, "available_contexts", tuple(self.available_contexts))
+        contexts = tuple(self.available_contexts)
+        for context in contexts:
+            _require_canonical_context(context, description="available context")
+        if len(contexts) != len(set(contexts)):
+            raise CorrectionSourceError("available contexts are duplicated")
+        object.__setattr__(self, "available_contexts", contexts)
 
     @property
     def residual_manifest(self) -> dict[str, Any]:
@@ -286,10 +305,10 @@ class ValidatedCorrectionSource:
         _require_exact_namespace(
             self.run_dir / "predictions", _PREDICTION_NAMESPACE, "baseline"
         )
-        key = _context_key(context)
-        if key not in self.available_contexts:
+        _require_canonical_context(context, description="requested context")
+        if context not in self.available_contexts:
             raise CorrectionSourceError("requested context is not present in validated sources")
-        return key
+        return _context_key(context)
 
     def load_standardized_context(
         self, context: EventResidualContext, *, through: int
@@ -369,11 +388,11 @@ def _manifest_artifact(
     return Path(expected), str(entry["sha256"])
 
 
-def _manifest_contexts(manifest: Mapping[str, Any]) -> tuple[tuple[str, str, int], ...]:
+def _manifest_contexts(manifest: Mapping[str, Any]) -> tuple[EventResidualContext, ...]:
     records = manifest.get("contexts")
     if not isinstance(records, list) or not records:
         raise CorrectionSourceError("residual publication has no contexts")
-    contexts: list[tuple[str, str, int]] = []
+    contexts: list[EventResidualContext] = []
     for record in records:
         if not isinstance(record, dict):
             raise CorrectionSourceError("residual publication context is invalid")
@@ -389,8 +408,17 @@ def _manifest_contexts(manifest: Mapping[str, Any]) -> tuple[tuple[str, str, int
             or not isinstance(seed, int)
         ):
             raise CorrectionSourceError("residual publication context is invalid")
-        contexts.append((model, feature_set, seed))
-    if len(contexts) != len(set(contexts)):
+        split_ids = record.get("split_ids")
+        if not isinstance(split_ids, list) or not all(
+            isinstance(split_id, str) for split_id in split_ids
+        ):
+            raise CorrectionSourceError("residual publication context is invalid")
+        context = EventResidualContext(model, feature_set, seed, tuple(split_ids))
+        contexts.append(
+            _require_canonical_context(context, description="residual publication context")
+        )
+    keys = [_context_key(context) for context in contexts]
+    if len(contexts) != len(set(contexts)) or len(keys) != len(set(keys)):
         raise CorrectionSourceError("residual publication contexts are duplicated")
     return tuple(contexts)
 
@@ -597,7 +625,7 @@ def validate_correction_source(
     _validate_final_source_truth(final_point, matrices[feature_sets[0]])
 
     available_contexts = _manifest_contexts(residual_manifest)
-    expected_contexts = set(available_contexts)
+    expected_contexts = {_context_key(context) for context in available_contexts}
     if _frame_contexts(oof_point) != expected_contexts or _frame_contexts(
         final_point
     ) != expected_contexts:
