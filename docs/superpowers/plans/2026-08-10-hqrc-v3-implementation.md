@@ -1402,7 +1402,9 @@ baseline_mw[None, :] + sigma_n_mw * (q_standardized + e_standardized)
 
 and must not add a second baseline-residual bootstrap. The point forecast is the baseline plus
 `sigma_n_mw` times the posterior mean of `q`; outside the two event windows it is bitwise equal
-to the final baseline.
+to the final baseline. Preserve the validated approved context in the sampler/NetCDF calibration
+metadata and across the process-worker request boundary; global residual/config/event hashes are
+not sufficient context identity.
 
 - [ ] **Step 5: Publish one immutable, reusable context result**
 
@@ -1425,16 +1427,20 @@ The manifest must bind source/config/event/model/residual/final-baseline/approve
 approved context and proposal/artifact digests, exact training and evaluation occurrence ids,
 latest OOF scale, frozen model/options/sampler profile, seed, row/coverage digests, every output
 hash, and completion state. Use a context lock plus staged atomic publication. A valid complete
-result is reused without sampling; partial, symlinked, hash-changed, semantically changed, or
-diagnostically invalid results fail closed. Different contexts must be able to run concurrently.
+result is reused without sampling. A hash-valid, diagnostics-valid posterior checkpoint created
+before a later prediction/publication crash must also be resumed without calling the sampler a
+second time. Other partial, symlinked, hash-changed, semantically changed, or diagnostically
+invalid results fail closed. Different contexts must be able to run concurrently.
 
 - [ ] **Step 6: Wire the singular CLI and document its scope**
 
 Replace only the `fit-corrections` unavailable handler. For Task 14,
 `--evaluation causal-2024` is accepted and `--evaluation loeo` must explicitly report that the
 fold-specific approved-calibration stage is not yet implemented; it must not reuse the eight-event
-causal approval. Keep `run-ablations` and `benchmark-samplers` unavailable. Document one command
-per approved context and state that paper fitting does not refit the baseline.
+causal approval. The CLI `--seed` controls only sampler and posterior-predictive randomness;
+baseline point-stream seed is inferred exclusively from the approved context. Keep
+`run-ablations` and `benchmark-samplers` unavailable. Document one command per approved context
+and state that paper fitting does not refit the baseline.
 
 - [ ] **Step 7: Verify focused, full-fast, lint, lock, and reduced real-data smoke**
 
