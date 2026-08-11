@@ -217,16 +217,18 @@ def _install_source_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         source_module, "build_daily_forecast_matrix", lambda _value, *, feature_set: matrix
     )
-    monkeypatch.setattr(
-        source_module,
-        "run_paper_final_stage",
-        lambda **_kwargs: SimpleNamespace(
+    runner_state = SimpleNamespace(calls=[], fit_count=0)
+
+    def run_paper_final_stage(**kwargs):
+        runner_state.calls.append(kwargs)
+        return SimpleNamespace(
             members_path=final_members,
             point_path=final_point,
             manifest_path=baseline_manifest_path,
-            fit_count=0,
-        ),
-    )
+            fit_count=runner_state.fit_count,
+        )
+
+    monkeypatch.setattr(source_module, "run_paper_final_stage", run_paper_final_stage)
     monkeypatch.setattr(source_module, "final_fold", lambda: object())
     monkeypatch.setattr(
         source_module,
@@ -252,7 +254,9 @@ def _install_source_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         baseline_manifest_path=baseline_manifest_path,
         residual_path=residual_path,
         oof_point=oof_point,
+        final_members=final_members,
         final_point=final_point,
+        runner_state=runner_state,
     )
 
 
@@ -280,6 +284,68 @@ def test_validated_source_is_immutable_and_loads_canonical_context_streams(
     )
     assert source.load_oof_point_context(CONTEXT).equals(pl.read_parquet(fixture.oof_point))
     assert source.load_final_point_context(CONTEXT).equals(pl.read_parquet(fixture.final_point))
+    assert len(fixture.runner_state.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("condition", "artifact"),
+    [
+        ("missing", "members"),
+        ("missing", "point"),
+        ("corrupt", "members"),
+        ("corrupt", "point"),
+        ("symlink", "members"),
+        ("symlink", "point"),
+        ("hash", "members"),
+        ("hash", "point"),
+        ("namespace", "point"),
+    ],
+)
+def test_final_artifact_preflight_rejects_before_baseline_runner(
+    tmp_path, monkeypatch, condition, artifact
+):
+    fixture = _install_source_fixture(tmp_path, monkeypatch)
+    path = fixture.final_members if artifact == "members" else fixture.final_point
+    entry = fixture.baseline_manifest["stages"]["final"]["artifacts"][artifact]
+    if condition == "missing":
+        path.unlink()
+    elif condition == "corrupt":
+        path.write_bytes(b"not a parquet publication")
+        entry["sha256"] = file_sha256(path)
+        _canonical_write(fixture.baseline_manifest_path, fixture.baseline_manifest)
+    elif condition == "symlink":
+        target = tmp_path / f"{artifact}-copy.parquet"
+        target.write_bytes(path.read_bytes())
+        path.unlink()
+        path.symlink_to(target)
+    elif condition == "hash":
+        entry["sha256"] = "0" * 64
+        _canonical_write(fixture.baseline_manifest_path, fixture.baseline_manifest)
+    else:
+        (fixture.run / "predictions/unknown.bin").write_bytes(b"unknown")
+
+    with pytest.raises(CorrectionSourceError):
+        validate_correction_source(
+            run_dir=fixture.run,
+            config_path=fixture.sources["experiment_config"],
+            profile="smoke",
+        )
+
+    assert fixture.runner_state.calls == []
+
+
+def test_valid_final_artifacts_call_reuse_runner_and_reject_any_fit(tmp_path, monkeypatch):
+    fixture = _install_source_fixture(tmp_path, monkeypatch)
+    fixture.runner_state.fit_count = 1
+
+    with pytest.raises(CorrectionSourceError, match="unexpectedly fitted"):
+        validate_correction_source(
+            run_dir=fixture.run,
+            config_path=fixture.sources["experiment_config"],
+            profile="smoke",
+        )
+
+    assert len(fixture.runner_state.calls) == 1
 
 
 def test_validated_source_rejects_missing_requested_context(tmp_path, monkeypatch):

@@ -388,6 +388,42 @@ def _manifest_artifact(
     return Path(expected), str(entry["sha256"])
 
 
+def _preflight_baseline_publication(
+    run: Path, manifest: Mapping[str, Any]
+) -> tuple[dict[str, tuple[Path, str]], dict[str, pl.DataFrame]]:
+    """Validate every canonical baseline file without invoking a baseline stage."""
+
+    _require_exact_namespace(run / "inputs", _INPUT_NAMESPACE, "residual")
+    _require_exact_namespace(run / "predictions", _PREDICTION_NAMESPACE, "baseline")
+    expected_paths = {
+        "oof_members": run / "predictions/oof_members.parquet",
+        "oof_point": run / "predictions/oof.parquet",
+        "final_members": run / "predictions/final_2024_members.parquet",
+        "final_point": run / "predictions/final_2024.parquet",
+    }
+    artifacts: dict[str, tuple[Path, str]] = {}
+    frames: dict[str, pl.DataFrame] = {}
+    for key, stage, artifact, relative in (
+        ("oof_members", "oof", "members", "predictions/oof_members.parquet"),
+        ("oof_point", "oof", "point", "predictions/oof.parquet"),
+        (
+            "final_members",
+            "final",
+            "members",
+            "predictions/final_2024_members.parquet",
+        ),
+        ("final_point", "final", "point", "predictions/final_2024.parquet"),
+    ):
+        bound_relative, digest = _manifest_artifact(manifest, stage, artifact, relative)
+        path = run / bound_relative
+        frame = _read_bound_parquet(path, digest, f"baseline {key} artifact")
+        if path.resolve() != expected_paths[key].resolve():
+            raise CorrectionSourceError(f"baseline {key} path is substituted")
+        artifacts[key] = path, digest
+        frames[key] = frame
+    return artifacts, frames
+
+
 def _manifest_contexts(manifest: Mapping[str, Any]) -> tuple[EventResidualContext, ...]:
     records = manifest.get("contexts")
     if not isinstance(records, list) or not records:
@@ -514,6 +550,8 @@ def validate_correction_source(
     ):
         raise CorrectionSourceError("paper correction requires all baseline contexts")
 
+    artifacts, _ = _preflight_baseline_publication(run, baseline_manifest)
+
     baseline_config = load_paper_baselines(sources["model_config"])
     audited = audit_hourly_data(
         read_hourly_data(sources["data"]),
@@ -553,44 +591,17 @@ def validate_correction_source(
     if final_result.fit_count != 0:
         raise CorrectionSourceError("final baseline validation unexpectedly fitted a model")
 
-    expected_paths = {
-        "oof_members": run / "predictions/oof_members.parquet",
-        "oof_point": run / "predictions/oof.parquet",
-        "final_members": run / "predictions/final_2024_members.parquet",
-        "final_point": run / "predictions/final_2024.parquet",
-    }
     if (
         Path(final_result.members_path).resolve()
-        != expected_paths["final_members"].resolve()
-        or Path(final_result.point_path).resolve() != expected_paths["final_point"].resolve()
+        != artifacts["final_members"][0].resolve()
+        or Path(final_result.point_path).resolve()
+        != artifacts["final_point"][0].resolve()
         or Path(final_result.manifest_path).resolve() != baseline_manifest_path.resolve()
     ):
         raise CorrectionSourceError("final baseline reuse returned substituted paths")
-    _require_exact_namespace(run / "inputs", _INPUT_NAMESPACE, "residual")
-    _require_exact_namespace(run / "predictions", _PREDICTION_NAMESPACE, "baseline")
     if _read_canonical_json(baseline_manifest_path, "baseline manifest") != baseline_manifest:
         raise CorrectionSourceError("baseline manifest changed during source validation")
-
-    artifacts: dict[str, tuple[Path, str]] = {}
-    for key, stage, artifact, relative in (
-        ("oof_members", "oof", "members", "predictions/oof_members.parquet"),
-        ("oof_point", "oof", "point", "predictions/oof.parquet"),
-        (
-            "final_members",
-            "final",
-            "members",
-            "predictions/final_2024_members.parquet",
-        ),
-        ("final_point", "final", "point", "predictions/final_2024.parquet"),
-    ):
-        bound_relative, digest = _manifest_artifact(
-            baseline_manifest, stage, artifact, relative
-        )
-        path = run / bound_relative
-        _read_bound_parquet(path, digest, f"baseline {key} artifact")
-        if path.resolve() != expected_paths[key].resolve():
-            raise CorrectionSourceError(f"baseline {key} path is substituted")
-        artifacts[key] = path, digest
+    artifacts, frames = _preflight_baseline_publication(run, baseline_manifest)
 
     residual_entry = residual_manifest.get("outputs", {}).get("standardized_residuals")
     if (
@@ -605,9 +616,7 @@ def validate_correction_source(
         str(residual_entry["sha256"]),
         "standardized residual artifact",
     )
-    oof_point = _read_bound_parquet(
-        artifacts["oof_point"][0], artifacts["oof_point"][1], "OOF point publication"
-    )
+    oof_point = frames["oof_point"]
     rebuilt_residual = build_standardized_residuals(oof_point, events).frame
     if (
         residual_frame.columns != rebuilt_residual.columns
@@ -617,11 +626,7 @@ def validate_correction_source(
         raise CorrectionSourceError(
             "standardized residual semantics differ from canonical OOF predictions"
         )
-    final_point = _read_bound_parquet(
-        artifacts["final_point"][0],
-        artifacts["final_point"][1],
-        "final point publication",
-    )
+    final_point = frames["final_point"]
     _validate_final_source_truth(final_point, matrices[feature_sets[0]])
 
     available_contexts = _manifest_contexts(residual_manifest)
