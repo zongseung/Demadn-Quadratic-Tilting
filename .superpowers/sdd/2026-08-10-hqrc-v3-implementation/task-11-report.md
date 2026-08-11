@@ -151,13 +151,57 @@ no fallback estimator was used.
   seconds), and the existing real-data smoke passed (`1 passed` in 1.52 seconds).
 - Full Ruff: `All checks passed!`; `git diff --check`: clean.
 
+### Fix round 3
+
+- Packaging RED: from a clean `UV_PROJECT_ENVIRONMENT`, with `VIRTUAL_ENV` and
+  `PYTHONPATH` removed, the documented repository-root command failed with
+  `Failed to spawn: hqrc`. The old child metadata was a uv virtual project and
+  therefore installed no distribution or console script.
+- Packaging GREEN: `hqrc_v3/` now uses the supported `setuptools.build_meta`
+  PEP 517 backend and exact, non-namespace discovery of `src/hqrc_v3`. Its
+  metadata declares every direct production dependency for classical/neural
+  baselines, diagnostics, PyMC sampling, evaluation, and Polars Parquet I/O;
+  optional nutpie acceleration and the pytest/Ruff development group are also
+  locked.
+- The repository root now owns a uv workspace containing `hqrc_v3`, and its
+  Python floor is aligned at 3.11. The tracked repository-root `uv.lock` is the
+  sole committed lock used by `uv run --project hqrc_v3 ...`; it records the
+  child as `source = { editable = "hqrc_v3" }`. The changed root-level files are
+  `pyproject.toml` and `uv.lock`.
+- Clean-install GREEN: the real 51,144-row fixed-bound audit passed through the
+  installed console in an isolated locked environment. A Python `-I` inspection
+  from an external temporary cwd resolved `hqrc_v3` to
+  `hqrc_v3/src/hqrc_v3/__init__.py`, and distribution metadata exposed exactly
+  `hqrc = hqrc_v3.cli:main`.
+- Real installed-console GREEN: the non-paper LightGBM-B1 OOF-2020 smoke passed
+  with three boosting rounds, published the expected Parquet/manifest products,
+  and resolved the estimator to `lightgbm.sklearn.LGBMRegressor` rather than a
+  fallback.
+- Packaging-focused tests: `3 passed`; Task 11 focused tests: `58 passed`; full
+  non-slow suite: `351 passed, 6 deselected` with the same 47 tiny-draw
+  ArviZ/runtime warnings.
+- Operator bootstrap is now explicit:
+  `uv sync --project hqrc_v3 --locked`, followed by `export UV_LOCKED=1` for the
+  documented `uv run --project hqrc_v3 hqrc ...` commands. The exact bootstrap
+  resolved all 134 locked packages successfully.
+- Both required real baseline smokes passed: installed-console LightGBM-B1
+  (`1 passed` in 27.58 seconds) and the existing real-source SVR smoke (`1 passed`
+  in 1.94 seconds). The isolated installed-console audit also passed (`1 passed`
+  in 24.89 seconds).
+- Ruff reported `All checks passed!`; `uv lock --check` resolved all 134 packages
+  without changing the lock; `git diff --check` was clean. Generated
+  `hqrc_v3.egg-info` was removed before publication.
+
 ## Commits
 
 - `f857e04 feat(hqrc-v3): freeze paper baseline factories`
 - `4fad1ce feat(hqrc-v3): execute frozen paper baselines`
 - `c4a30ec docs(hqrc-v3): report Task 11 verification`
 - `ddf86ba fix(hqrc-v3): harden paper baseline execution`
-- `fix(hqrc-v3): validate complete baseline run state` (fix round 2)
+- `bd5ede3 fix(hqrc-v3): validate complete baseline run state`
+- `fix(hqrc-v3): install workspace console package` (fix round 3)
 
-The protected workspace-local `hqrc_v3/uv.lock` was not staged or modified and
+The protected workspace-local `hqrc_v3/uv.lock` was not staged or modified; its
+SHA-256 remained
+`f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`, and it
 remains the only untracked path.

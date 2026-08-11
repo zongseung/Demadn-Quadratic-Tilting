@@ -7,8 +7,22 @@ path and no model substitution. XGBoost, LightGBM, and SVR fit 24 independent
 horizon estimators; both neural models jointly predict all 24 hours from observed
 history and known future covariates only.
 
-Run these commands from the repository root. For a paper baseline run, calculate
-the model-config digest and run both stages with all models and both feature sets:
+Run these commands from the repository root. Bootstrap the Python 3.11+ workspace
+from the committed repository-root `uv.lock`, then keep subsequent uv commands
+locked for the shell session:
+
+```bash
+uv sync --project hqrc_v3 --locked
+export UV_LOCKED=1
+```
+
+The root `pyproject.toml` owns the uv workspace and installs `hqrc_v3/` as the
+editable PEP 517 package that provides the `hqrc` console script. Do not create or
+use a member-local lock file; `uv.lock` at the repository root is the reproducible
+runtime and test lock.
+
+For a paper baseline run, calculate the model-config digest and run both stages
+with all models and both feature sets:
 
 ```bash
 MODEL_SHA256="$(openssl dgst -sha256 hqrc_v3/configs/model_spaces.toml | awk '{print $NF}')"

@@ -946,6 +946,9 @@ def test_readme_hqrc_commands_are_executable_from_the_repository_root() -> None:
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
 
     assert "Run these commands from the repository root" in readme
+    assert "uv sync --project hqrc_v3 --locked" in readme
+    assert "export UV_LOCKED=1" in readme
+    assert "repository-root `uv.lock`" in readme
     for command in (
         "generate-oof",
         "fit-final-baselines",
