@@ -1509,7 +1509,7 @@ orchestration of this singular API, never one shared posterior or AR calibration
   -> prediction of only the omitted occurrence, with a fresh AR reset
 ```
 
-- [ ] **Step 1: Extract the common source preflight without changing Task 14 semantics**
+- [x] **Step 1: Extract the common source preflight without changing Task 14 semantics**
 
 Create `hqrc_v3/src/hqrc_v3/correction_source.py` and
 `hqrc_v3/tests/unit/test_correction_source.py`. Move source/calendar reconstruction, manifest and
