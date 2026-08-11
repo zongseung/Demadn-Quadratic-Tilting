@@ -183,6 +183,7 @@ uv run --project hqrc_v3 --locked hqrc prepare-residuals --run-dir runs/RUN_ID -
 uv run --project hqrc_v3 --locked hqrc diagnose-ar --run-dir runs/RUN_ID --config hqrc_v3/configs/experiment.toml --event-registry hqrc_v3/configs/events.csv --output runs/RUN_ID/ar_diagnostics/lightgbm-B1-proposed.json --through 2023 --model lightgbm --feature-set B1
 uv run --project hqrc_v3 --locked hqrc approve-ar-calibration --proposal runs/RUN_ID/ar_diagnostics/lightgbm-B1-proposed.json --output runs/RUN_ID/ar_diagnostics/lightgbm-B1-approved.json --residual-sha256 RESIDUAL_SHA256 --config-sha256 CONFIG_SHA256 --event-sha256 EVENT_SHA256
 uv run --project hqrc_v3 --locked hqrc fit-corrections --run-dir runs/RUN_ID --config hqrc_v3/configs/experiment.toml --approved-ar runs/RUN_ID/ar_diagnostics/lightgbm-B1-approved.json --evaluation causal-2024 --seed 20260811 --profile paper
+uv run --project hqrc_v3 --locked hqrc fit-corrections --run-dir runs/RUN_ID --config hqrc_v3/configs/experiment.toml --approved-ar runs/RUN_ID/ar_diagnostics/lightgbm-B1-approved.json --evaluation causal-2024 --seed 20260811 --profile paper --draws 2000 --tune 1000 --chains 4
 uv run --project hqrc_v3 --locked hqrc report --run-dir runs/RUN_ID --profile smoke
 ```
 
@@ -205,16 +206,20 @@ separate fold-specific approvals and is intentionally unavailable in this stage.
 Smoke correction runs must state their reduced sampler limits explicitly, for
 example `--profile smoke --draws 20 --tune 20 --chains 2`. Paper runs enforce
 four chains, at least 1,000 warm-up draws, at least 1,000 retained draws, target
-acceptance 0.99, and the strict posterior diagnostic gate.
+acceptance 0.99, and the strict posterior diagnostic gate. Omitting paper limits
+uses 1,000 warm-up and retained draws with four chains; explicit paper overrides
+are accepted only when both draw counts remain at least 1,000 and chains remains
+exactly four. A diagnostic retry can therefore retain its RNG seed while raising
+the retained draw count, as in the 2,000-draw command above.
 The command profile is the sampler profile. The source profile is inferred from
 the immutable residual and baseline manifests and recorded separately: a paper
 sampler requires paper sources, while a smoke sampler may read either paper or
 smoke sources without relabeling those source artifacts.
 Each completed context is namespaced as
-`corrections/causal-2024/<model>/<feature-set>/seed-<baseline-seed>/<sampler-profile>/sampler-seed-<rng-seed>/`.
+`corrections/causal-2024/<model>/<feature-set>/seed-<baseline-seed>/<sampler-profile>/sampler-seed-<rng-seed>/draws-<D>-tune-<T>-chains-<C>/`.
 The first seed remains exclusively the baseline seed from the approved AR
 context; the final seed is the CLI `--seed`. Consequently smoke/paper runs and
-different sampler seeds never reuse or invalidate one another.
+different sampler seeds or sampler sizes never reuse or invalidate one another.
 
 The boundary calendar dates are documented by the official Korea Astronomy and
 Space Science Institute almanac releases for

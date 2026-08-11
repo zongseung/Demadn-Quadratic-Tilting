@@ -400,9 +400,21 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="sampler and posterior-predictive RNG seed; baseline seed comes from approval",
     )
-    corrections.add_argument("--draws", type=int, help="explicit retained draws for smoke")
-    corrections.add_argument("--tune", type=int, help="explicit warm-up draws for smoke")
-    corrections.add_argument("--chains", type=int, help="explicit chains for smoke")
+    corrections.add_argument(
+        "--draws",
+        type=int,
+        help="retained draws (smoke: required; paper: optional, minimum/default 1000)",
+    )
+    corrections.add_argument(
+        "--tune",
+        type=int,
+        help="warm-up draws (smoke: required; paper: optional, minimum/default 1000)",
+    )
+    corrections.add_argument(
+        "--chains",
+        type=int,
+        help="chains (smoke: required; paper: optional/default 4 and must equal 4)",
+    )
     corrections.add_argument("--profile", choices=("smoke", "paper"), required=True)
 
     ablations = subcommands.add_parser("run-ablations", help="run declared H0--H5 ablations")

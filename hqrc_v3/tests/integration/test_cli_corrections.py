@@ -6,6 +6,10 @@ from hqrc_v3.bayes.samplers import SamplingError
 
 from hqrc_v3 import cli
 
+PAPER_DRAWS_HELP = "retained draws (smoke: required; paper: optional, minimum/default 1000)"
+PAPER_TUNE_HELP = "warm-up draws (smoke: required; paper: optional, minimum/default 1000)"
+PAPER_CHAINS_HELP = "chains (smoke: required; paper: optional/default 4 and must equal 4)"
+
 
 def test_causal_cli_routes_rng_seed_and_explicit_smoke_limits(monkeypatch):
     received = []
@@ -48,6 +52,21 @@ def test_causal_cli_routes_rng_seed_and_explicit_smoke_limits(monkeypatch):
             "chains": 2,
         }
     ]
+
+
+def test_correction_cli_help_describes_smoke_and_paper_sampler_overrides():
+    parser = cli.build_parser()
+    command_action = next(action for action in parser._actions if action.dest == "command")
+    correction_parser = command_action.choices["fit-corrections"]
+    help_by_option = {
+        option: action.help
+        for action in correction_parser._actions
+        for option in action.option_strings
+    }
+
+    assert help_by_option["--draws"] == PAPER_DRAWS_HELP
+    assert help_by_option["--tune"] == PAPER_TUNE_HELP
+    assert help_by_option["--chains"] == PAPER_CHAINS_HELP
 
 
 def test_loeo_cli_fails_before_loading_causal_approval(capsys, monkeypatch):

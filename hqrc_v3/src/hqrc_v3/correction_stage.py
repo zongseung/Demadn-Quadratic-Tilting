@@ -1427,6 +1427,9 @@ def fit_causal_2024_correction(
         / f"seed-{context.seed}"
         / profile
         / f"sampler-seed-{sampler_seed}"
+        / (
+            f"draws-{sampler['draws']}-tune-{sampler['tune']}-chains-{sampler['chains']}"
+        )
     )
     identity = _input_identity(inputs, sampler)
     identity_sha256 = hashlib.sha256(_canonical_json(identity)).hexdigest()

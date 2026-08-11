@@ -66,7 +66,11 @@ def test_real_causal_correction_reuses_final_and_runs_reduced_pymc(tmp_path):
 
     assert result.sampler_fit_count == 1 and not result.reused
     assert result.output_dir.is_relative_to(tmp_path)
-    assert result.output_dir.parts[-2:] == ("smoke", "sampler-seed-20260811")
+    assert result.output_dir.parts[-3:] == (
+        "smoke",
+        "sampler-seed-20260811",
+        "draws-5-tune-5-chains-2",
+    )
     event = pl.read_parquet(result.event_predictions_path)
     full = pl.read_parquet(result.full_period_point_predictions_path)
     assert event.height == 264

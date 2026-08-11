@@ -11,6 +11,7 @@ import hqrc_v3.correction_stage as stage
 import numpy as np
 import polars as pl
 import pytest
+from hqrc_v3.bayes.samplers import SamplingError
 from hqrc_v3.correction_stage import (
     CausalCorrectionError,
     CausalCorrectionInputs,
@@ -533,6 +534,7 @@ def test_partial_resume_fails_closed_on_unsafe_or_invalid_checkpoint(
     output_dir = (
         tmp_path
         / "output/corrections/causal-2024/lightgbm/B1/seed-7/smoke/sampler-seed-19"
+        / "draws-3-tune-3-chains-2"
     )
     if mutation == "unknown":
         (output_dir / "unknown.txt").write_text("unknown", encoding="utf-8")
@@ -614,6 +616,7 @@ def test_partial_resume_rejects_unsafe_current_generation_entries(
     output_dir = (
         tmp_path
         / "output/corrections/causal-2024/lightgbm/B1/seed-7/smoke/sampler-seed-19"
+        / "draws-3-tune-3-chains-2"
     )
     pointer = json.loads((output_dir / "hqrc_data.current.json").read_bytes())
     generation_dir = output_dir / ".hqrc_data.generations"
@@ -675,8 +678,88 @@ def test_sampler_profile_and_rng_seed_have_distinct_namespaces(tmp_path, monkeyp
     assert "sampler-seed-23" in smoke_23.output_dir.parts
     assert "paper" in paper_29.output_dir.parts
     assert "sampler-seed-29" in paper_29.output_dir.parts
+    assert smoke_19.output_dir.name == "draws-3-tune-3-chains-2"
+    assert smoke_23.output_dir.name == "draws-3-tune-3-chains-2"
+    assert paper_29.output_dir.name == "draws-1000-tune-1000-chains-4"
     assert all(
         (result.output_dir / "COMPLETE").is_file()
         for result in (smoke_19, smoke_23, paper_29)
     )
     assert len(calls) == 3
+
+
+@pytest.mark.parametrize(
+    ("profile", "initial", "retry"),
+    [
+        ("smoke", (3, 3, 2), (4, 3, 2)),
+        ("smoke", (3, 3, 2), (3, 4, 2)),
+        ("smoke", (3, 3, 2), (3, 3, 3)),
+        ("paper", (1_000, 1_000, 4), (2_000, 1_000, 4)),
+    ],
+)
+def test_failed_sampler_contract_and_retry_sizes_have_independent_namespaces(
+    tmp_path, monkeypatch, profile, initial, retry
+):
+    inputs = _stage_inputs(tmp_path, source_profile="paper")
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(stage, "prepare_causal_correction_inputs", lambda **_: inputs)
+    monkeypatch.setattr(
+        stage,
+        "validate_inference_data",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            max_rhat=1.0,
+            min_bulk_ess=10_000.0,
+            min_tail_ess=10_000.0,
+            divergences=0,
+        ),
+    )
+
+    def fail_then_sample(_data, approved, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise SamplingError("strict diagnostics rejected first attempt")
+        return _fake_sample(
+            approved,
+            draws=kwargs["draws"],
+            chains=kwargs["chains"],
+            tune=kwargs["tune"],
+            seed=kwargs["seed"],
+            paper_profile=kwargs["paper_profile"],
+        )
+
+    monkeypatch.setattr(stage, "sample_hqrc", fail_then_sample)
+    initial_arguments = _stage_arguments(
+        tmp_path,
+        inputs,
+        profile=profile,
+        draws=initial[0],
+        tune=initial[1],
+        chains=initial[2],
+    )
+    retry_arguments = _stage_arguments(
+        tmp_path,
+        inputs,
+        profile=profile,
+        draws=retry[0],
+        tune=retry[1],
+        chains=retry[2],
+    )
+
+    with pytest.raises(SamplingError, match="strict diagnostics"):
+        fit_causal_2024_correction(**initial_arguments)
+    completed = fit_causal_2024_correction(**retry_arguments)
+    failed_directory = completed.output_dir.parent / (
+        f"draws-{initial[0]}-tune-{initial[1]}-chains-{initial[2]}"
+    )
+
+    assert failed_directory != completed.output_dir
+    assert (failed_directory / "hqrc_data.current.json").is_file()
+    assert not (failed_directory / "COMPLETE").exists()
+    assert completed.output_dir.name == (
+        f"draws-{retry[0]}-tune-{retry[1]}-chains-{retry[2]}"
+    )
+    assert (completed.output_dir / "COMPLETE").is_file()
+    assert len(calls) == 2
+    reused = fit_causal_2024_correction(**retry_arguments)
+    assert reused.reused and reused.output_dir == completed.output_dir
+    assert len(calls) == 2
