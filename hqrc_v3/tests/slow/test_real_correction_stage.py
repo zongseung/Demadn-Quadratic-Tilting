@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import pytest
+from hqrc_v3.bayes.samplers import PYMC_INITIALIZATION, SAMPLER_GEOMETRY
 from hqrc_v3.correction_stage import (
     fit_causal_2024_correction,
     prepare_causal_correction_inputs,
@@ -66,9 +67,10 @@ def test_real_causal_correction_reuses_final_and_runs_reduced_pymc(tmp_path):
 
     assert result.sampler_fit_count == 1 and not result.reused
     assert result.output_dir.is_relative_to(tmp_path)
-    assert result.output_dir.parts[-3:] == (
+    assert result.output_dir.parts[-4:] == (
         "smoke",
         "sampler-seed-20260811",
+        f"init-{PYMC_INITIALIZATION}-geometry-{SAMPLER_GEOMETRY}",
         "draws-5-tune-5-chains-2",
     )
     event = pl.read_parquet(result.event_predictions_path)
@@ -82,6 +84,8 @@ def test_real_causal_correction_reuses_final_and_runs_reduced_pymc(tmp_path):
     manifest = json.loads(result.manifest_path.read_bytes())
     assert manifest["identity"]["source_profile"] == source_profile
     assert manifest["identity"]["sampler_profile"] == "smoke"
+    assert manifest["identity"]["sampler"]["init"] == PYMC_INITIALIZATION
+    assert manifest["identity"]["sampler"]["geometry"] == SAMPLER_GEOMETRY
     reused = fit_causal_2024_correction(
         run_dir=run,
         config_path=config_path,

@@ -23,7 +23,7 @@ import polars as pl
 from hqrc_v3.baselines.config import MODEL_NAMES, load_paper_baselines
 from hqrc_v3.baselines.paper import PAPER_HASH_KEYS, run_paper_final_stage
 from hqrc_v3.bayes.artifacts import load_hqrc_data, write_hqrc_data
-from hqrc_v3.bayes.model import HQRCData, HQRCModelOptions
+from hqrc_v3.bayes.model import CYCLIC_HOUR_PARAMETERIZATION, HQRCData, HQRCModelOptions
 from hqrc_v3.bayes.predictive import (
     corrected_predictive_draws,
     draw_new_event_correction,
@@ -31,7 +31,12 @@ from hqrc_v3.bayes.predictive import (
     select_posterior_indices,
     simulate_stationary_ar1,
 )
-from hqrc_v3.bayes.samplers import sample_hqrc, validate_inference_data
+from hqrc_v3.bayes.samplers import (
+    PYMC_INITIALIZATION,
+    SAMPLER_GEOMETRY,
+    sample_hqrc,
+    validate_inference_data,
+)
 from hqrc_v3.config import load_config
 from hqrc_v3.contracts import DataContractError, validate_prediction_frame
 from hqrc_v3.data import (
@@ -883,6 +888,8 @@ def _sampler_contract(
         "chains": resolved[2],
         "target_accept": 0.99 if profile == "paper" else 0.9,
         "profile": profile,
+        "init": PYMC_INITIALIZATION,
+        "geometry": SAMPLER_GEOMETRY,
     }
 
 
@@ -951,6 +958,7 @@ def _input_identity(
                 "between_scale_prior": 1.0,
                 "innovation": "normal_ar1",
             },
+            "cyclic_hour_parameterization": CYCLIC_HOUR_PARAMETERIZATION,
         },
         "sampler": dict(sampler),
         "coverage": {
@@ -998,6 +1006,7 @@ def _posterior_metadata_matches(
             "between_scale_prior": 1.0,
             "innovation": "normal_ar1",
         },
+        "cyclic_hour_parameterization": CYCLIC_HOUR_PARAMETERIZATION,
     }:
         raise CausalCorrectionError("posterior H3 model contract differs")
     if idata.attrs.get("hqrc_backend") != sampler["backend"]:
@@ -1009,6 +1018,8 @@ def _posterior_metadata_matches(
         "chains": sampler["chains"],
         "target_accept": sampler["target_accept"],
         "paper_profile": sampler["profile"] == "paper",
+        "init": sampler["init"],
+        "geometry": sampler["geometry"],
     }
     if recorded_sampler != expected_sampler:
         raise CausalCorrectionError("posterior sampler contract differs")
@@ -1427,6 +1438,7 @@ def fit_causal_2024_correction(
         / f"seed-{context.seed}"
         / profile
         / f"sampler-seed-{sampler_seed}"
+        / f"init-{sampler['init']}-geometry-{sampler['geometry']}"
         / (
             f"draws-{sampler['draws']}-tune-{sampler['tune']}-chains-{sampler['chains']}"
         )

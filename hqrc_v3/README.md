@@ -216,7 +216,11 @@ the immutable residual and baseline manifests and recorded separately: a paper
 sampler requires paper sources, while a smoke sampler may read either paper or
 smoke sources without relabeling those source artifacts.
 Each completed context is namespaced as
-`corrections/causal-2024/<model>/<feature-set>/seed-<baseline-seed>/<sampler-profile>/sampler-seed-<rng-seed>/draws-<D>-tune-<T>-chains-<C>/`.
+`corrections/causal-2024/<model>/<feature-set>/seed-<baseline-seed>/<sampler-profile>/sampler-seed-<rng-seed>/init-adapt_diag-geometry-noncentered-cyclic-hour-rw1-v1/draws-<D>-tune-<T>-chains-<C>/`.
+The fixed PyMC contract starts from deterministic `adapt_diag` values and samples the cyclic
+hour RW1 in an exactly equivalent non-centered geometry; both choices are recorded in the
+posterior metadata and manifest. The prior, target acceptance, and strict diagnostic gate are
+unchanged.
 The first seed remains exclusively the baseline seed from the approved AR
 context; the final seed is the CLI `--seed`. Consequently smoke/paper runs and
 different sampler seeds or sampler sizes never reuse or invalidate one another.

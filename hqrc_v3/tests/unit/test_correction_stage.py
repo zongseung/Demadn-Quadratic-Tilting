@@ -11,7 +11,7 @@ import hqrc_v3.correction_stage as stage
 import numpy as np
 import polars as pl
 import pytest
-from hqrc_v3.bayes.samplers import SamplingError
+from hqrc_v3.bayes.samplers import PYMC_INITIALIZATION, SAMPLER_GEOMETRY, SamplingError
 from hqrc_v3.correction_stage import (
     CausalCorrectionError,
     CausalCorrectionInputs,
@@ -32,6 +32,7 @@ from hqrc_v3.events import load_event_registry
 
 EVENTS = Path(__file__).parents[2] / "configs/events.csv"
 SPLITS = tuple(f"oof-{year}" for year in range(2020, 2024))
+GEOMETRY_NAMESPACE = f"init-{PYMC_INITIALIZATION}-geometry-{SAMPLER_GEOMETRY}"
 
 
 def _approved(tmp_path: Path, event_ids: tuple[str, ...]):
@@ -343,6 +344,7 @@ def _fake_sample(
                         "between_scale_prior": 1.0,
                         "innovation": "normal_ar1",
                     },
+                    "cyclic_hour_parameterization": "noncentered-rw1-v1",
                 },
                 sort_keys=True,
             ),
@@ -354,6 +356,8 @@ def _fake_sample(
                     "seed": seed,
                     "target_accept": 0.99 if paper_profile else 0.9,
                     "paper_profile": paper_profile,
+                    "init": PYMC_INITIALIZATION,
+                    "geometry": SAMPLER_GEOMETRY,
                 },
                 sort_keys=True,
             ),
@@ -534,6 +538,7 @@ def test_partial_resume_fails_closed_on_unsafe_or_invalid_checkpoint(
     output_dir = (
         tmp_path
         / "output/corrections/causal-2024/lightgbm/B1/seed-7/smoke/sampler-seed-19"
+        / GEOMETRY_NAMESPACE
         / "draws-3-tune-3-chains-2"
     )
     if mutation == "unknown":
@@ -616,6 +621,7 @@ def test_partial_resume_rejects_unsafe_current_generation_entries(
     output_dir = (
         tmp_path
         / "output/corrections/causal-2024/lightgbm/B1/seed-7/smoke/sampler-seed-19"
+        / GEOMETRY_NAMESPACE
         / "draws-3-tune-3-chains-2"
     )
     pointer = json.loads((output_dir / "hqrc_data.current.json").read_bytes())
@@ -678,6 +684,10 @@ def test_sampler_profile_and_rng_seed_have_distinct_namespaces(tmp_path, monkeyp
     assert "sampler-seed-23" in smoke_23.output_dir.parts
     assert "paper" in paper_29.output_dir.parts
     assert "sampler-seed-29" in paper_29.output_dir.parts
+    assert all(
+        GEOMETRY_NAMESPACE in result.output_dir.parts
+        for result in (smoke_19, smoke_23, paper_29)
+    )
     assert smoke_19.output_dir.name == "draws-3-tune-3-chains-2"
     assert smoke_23.output_dir.name == "draws-3-tune-3-chains-2"
     assert paper_29.output_dir.name == "draws-1000-tune-1000-chains-4"

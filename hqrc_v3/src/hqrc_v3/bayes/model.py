@@ -14,6 +14,7 @@ from hqrc_v3.diagnostics.ar import ApprovedARCalibration, require_approved_calib
 Variant = Literal["H1", "H2", "H3", "H4"]
 Pooling = Literal["complete", "partial", "none"]
 Innovation = Literal["normal_ar1", "student_t_ar1", "normal_ar2"]
+CYCLIC_HOUR_PARAMETERIZATION = "noncentered-rw1-v1"
 
 
 @dataclass(frozen=True)
@@ -187,20 +188,45 @@ def _validate_calibration(calibration: ApprovedARCalibration) -> ApprovedARCalib
 
 
 def _intrinsic_random_walk(
-    pm, pt, *, name: str, positions: int, scale_name: str, scale: float, circular: bool = False
+    pm,
+    pt,
+    *,
+    name: str,
+    positions: int,
+    scale_name: str,
+    scale: float,
+    circular: bool = False,
+    noncentered: bool = False,
 ):
     """Build an identified sum-zero RW1 from innovations, never iid level effects."""
 
     sigma = pm.HalfNormal(scale_name, sigma=scale, shape=2)
     if positions == 1:
         return pm.Deterministic(name, pt.zeros((2, 1)))
-    innovation = pm.Normal(
-        f"{name}_innovation", mu=0.0, sigma=sigma[:, None], shape=(2, positions - 1)
-    )
+    if noncentered:
+        # The circular potential stays in scaled-innovation coordinates. With
+        # the raw Normal density this is the exact change-of-variables form of
+        # the normalized centered cyclic RW1 density.
+        raw = pm.Normal(
+            f"{name}_innovation_raw", mu=0.0, sigma=1.0, shape=(2, positions - 1)
+        )
+        innovation = pm.Deterministic(f"{name}_innovation", raw * sigma[:, None])
+    else:
+        innovation = pm.Normal(
+            f"{name}_innovation", mu=0.0, sigma=sigma[:, None], shape=(2, positions - 1)
+        )
     if circular:
+        # Normalize the closure density with respect to the 23 free increments
+        # so it cannot silently multiply the declared scale prior by 1 / sigma.
         pm.Potential(
             f"{name}_circular_random_walk",
-            pm.logp(pm.Normal.dist(mu=0.0, sigma=sigma), -pt.sum(innovation, axis=1)).sum(),
+            (
+                pm.logp(
+                    pm.Normal.dist(mu=0.0, sigma=sigma),
+                    -pt.sum(innovation, axis=1),
+                )
+                + pt.log(sigma)
+            ).sum(),
         )
     path = pt.concatenate((pt.zeros((2, 1)), pt.cumsum(innovation, axis=1)), axis=1)
     return pm.Deterministic(name, path - pt.mean(path, axis=1, keepdims=True))
@@ -208,7 +234,14 @@ def _intrinsic_random_walk(
 
 def _cyclic_hour_profile(pm, pt, *, name: str):
     profile = _intrinsic_random_walk(
-        pm, pt, name=name, positions=24, scale_name="sigma_gamma", scale=0.5, circular=True
+        pm,
+        pt,
+        name=name,
+        positions=24,
+        scale_name="sigma_gamma",
+        scale=0.5,
+        circular=True,
+        noncentered=True,
     )
     return profile
 

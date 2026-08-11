@@ -3,8 +3,15 @@ from __future__ import annotations
 from dataclasses import replace
 
 import numpy as np
+import pymc as pm
+import pytensor.tensor as pt
 import pytest
-from hqrc_v3.bayes.model import HQRCData, HQRCModelOptions, build_hqrc_model
+from hqrc_v3.bayes.model import (
+    HQRCData,
+    HQRCModelOptions,
+    _intrinsic_random_walk,
+    build_hqrc_model,
+)
 from hqrc_v3.diagnostics.ar import (
     EventResidualContext,
     approve_calibration,
@@ -82,6 +89,70 @@ def test_h3_contains_required_random_variables(tiny_hqrc_data, approved_calibrat
         model.named_vars
     )
     assert "u_phi" in model.named_vars
+
+
+def test_h3_noncenters_cyclic_hour_random_walk_without_changing_output_shape(
+    tiny_hqrc_data, approved_calibration
+):
+    model = build_hqrc_model(
+        tiny_hqrc_data,
+        approved_calibration,
+        variant="H3",
+        pooling="partial",
+        options=HQRCModelOptions(),
+    )
+
+    free_names = {variable.name for variable in model.free_RVs}
+    assert "gamma_innovation_raw" in free_names
+    assert "gamma_innovation" not in free_names
+    assert model.named_vars["gamma_innovation_raw"].type.shape == (2, 23)
+    assert model.named_vars["gamma_innovation"].type.shape == (2, 23)
+    assert model.named_vars["gamma"].type.shape == (2, 24)
+
+
+@pytest.mark.parametrize("sigma", [0.05, 0.5, 1.7])
+def test_noncentered_cyclic_rw_density_is_exact_change_of_variables(sigma):
+    raw = np.linspace(-1.1, 0.9, 23)
+    innovation = sigma * raw
+    log_two_pi = np.log(2.0 * np.pi)
+
+    def normal_logp(value, scale):
+        return -0.5 * (value / scale) ** 2 - np.log(scale) - 0.5 * log_two_pi
+
+    centered = np.sum(normal_logp(innovation, sigma)) + normal_logp(
+        -np.sum(innovation), sigma
+    )
+    transformed_centered = centered + (raw.size + 1) * np.log(sigma)
+    noncentered = (
+        np.sum(normal_logp(raw, 1.0))
+        + normal_logp(-np.sum(innovation), sigma)
+        + np.log(sigma)
+    )
+
+    np.testing.assert_allclose(noncentered, transformed_centered, rtol=0.0, atol=1e-12)
+
+
+def test_noncentered_cyclic_closure_does_not_change_halfnormal_scale_prior():
+    with pm.Model() as model:
+        _intrinsic_random_walk(
+            pm,
+            pt,
+            name="test_cycle",
+            positions=24,
+            scale_name="test_sigma",
+            scale=0.5,
+            circular=True,
+            noncentered=True,
+        )
+    potential_logp = model.compile_logp(vars=model.potentials, jacobian=False)
+    point = model.initial_point()
+    point["test_cycle_innovation_raw"] = np.tile(np.linspace(-0.8, 0.6, 23), (2, 1))
+    point["test_sigma_log__"] = np.log(np.array([0.08, 0.2]))
+    narrow = potential_logp(point)
+    point["test_sigma_log__"] = np.log(np.array([0.8, 1.4]))
+    wide = potential_logp(point)
+
+    np.testing.assert_allclose(narrow, wide, rtol=0.0, atol=1e-12)
 
 
 def test_model_rejects_untrusted_direct_calibration(tiny_hqrc_data):

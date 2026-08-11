@@ -13,12 +13,23 @@ import arviz as az
 import numpy as np
 import xarray as xr
 
-from hqrc_v3.bayes.model import HQRCData, HQRCModelOptions, Pooling, Variant, build_hqrc_model
+from hqrc_v3.bayes.model import (
+    CYCLIC_HOUR_PARAMETERIZATION,
+    HQRCData,
+    HQRCModelOptions,
+    Pooling,
+    Variant,
+    build_hqrc_model,
+)
 from hqrc_v3.diagnostics.ar import ApprovedARCalibration, require_approved_calibration
 
 
 class SamplingError(RuntimeError):
     """Raised when an unavailable sampler or paper-profile diagnostic gate fails."""
+
+
+PYMC_INITIALIZATION = "adapt_diag"
+SAMPLER_GEOMETRY = "noncentered-cyclic-hour-rw1-v1"
 
 
 @dataclass(frozen=True)
@@ -112,6 +123,7 @@ def sample_hqrc(
                 progressbar=False,
                 compute_convergence_checks=False,
                 target_accept=target_accept,
+                init=PYMC_INITIALIZATION,
             )
     elif backend == "nutpie":
         try:
@@ -148,6 +160,8 @@ def sample_hqrc(
                     "seed": seed,
                     "target_accept": target_accept,
                     "paper_profile": paper_profile,
+                    "init": PYMC_INITIALIZATION if backend == "pymc" else "nutpie-default",
+                    "geometry": SAMPLER_GEOMETRY,
                 },
                 sort_keys=True,
             ),
@@ -156,6 +170,7 @@ def sample_hqrc(
                     "variant": variant,
                     "pooling": pooling,
                     "options": asdict(options or HQRCModelOptions()),
+                    "cyclic_hour_parameterization": CYCLIC_HOUR_PARAMETERIZATION,
                 },
                 sort_keys=True,
             ),
