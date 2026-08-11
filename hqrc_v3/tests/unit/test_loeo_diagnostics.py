@@ -262,8 +262,12 @@ def test_publish_exact_universe_and_physical_folds(
     oof = source.load_standardized_context(CONTEXT, through=2023)
     for occurrence_id in (event.occurrence_id for event in _events()[:8]):
         assert (
-            universe.filter(pl.col("occurrence_id") == occurrence_id)["standardized_residual"].to_list()
-            == oof.filter(pl.col("occurrence_id") == occurrence_id)["standardized_residual"].to_list()
+            universe.filter(pl.col("occurrence_id") == occurrence_id)[
+                "standardized_residual"
+            ].to_list()
+            == oof.filter(pl.col("occurrence_id") == occurrence_id)[
+                "standardized_residual"
+            ].to_list()
         )
     for held_out in published.occurrence_ids:
         fold = load_loeo_fold(
@@ -407,10 +411,18 @@ def test_completed_invalid_generation_is_preserved_on_recovery(
     if not with_pointer:
         (output / "current.json").unlink()
     published.universe_path.write_bytes(b"corrupt")
-    before = {path.relative_to(published.generation_dir): file_sha256(path) for path in published.generation_dir.rglob("*") if path.is_file()}
+    before = {
+        path.relative_to(published.generation_dir): file_sha256(path)
+        for path in published.generation_dir.rglob("*")
+        if path.is_file()
+    }
     with pytest.raises(LOEOError):
         publish_loeo_universe(source, CONTEXT, output_dir=output)
-    after = {path.relative_to(published.generation_dir): file_sha256(path) for path in published.generation_dir.rglob("*") if path.is_file()}
+    after = {
+        path.relative_to(published.generation_dir): file_sha256(path)
+        for path in published.generation_dir.rglob("*")
+        if path.is_file()
+    }
     assert after == before
 
 
