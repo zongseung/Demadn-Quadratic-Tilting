@@ -86,3 +86,50 @@ resume, completed-result reuse, and rejection of rehashed semantic products.
 - This step intentionally retains Task 14's public causal API and product namespace; the new
   abstraction is ready for the later ten-event universe and LOEO stages but does not implement
   them.
+
+## Independent-review fix round 1 — complete split-context identity
+
+Review finding: `ValidatedCorrectionSource` stored and checked availability only as
+`(model, feature_set, seed)`. A caller could therefore supply an `EventResidualContext` with a
+subset, reordered list, duplicate, or substitution in `split_ids`; the standardized and final
+loaders ignored the change, while the OOF loader caught only some mutations incidentally after
+frame selection.
+
+Genuine RED was recorded before the production fix. The amended test matrix passes all four
+split mutations to each of the standardized-residual, OOF-point, and final-point loaders. It also
+requires the source to expose the complete manifest-derived `EventResidualContext`, rather than
+the former three-field tuple.
+
+```text
+uv run --project hqrc_v3 --locked pytest -c hqrc_v3/pyproject.toml \
+  hqrc_v3/tests/unit/test_correction_source.py -q
+```
+
+RED result: `12 failed, 9 passed`. The failures showed all four mutations bypassing the
+standardized/final loaders, reordered and duplicate identities bypassing the OOF loader, and the
+source retaining only a partial context key.
+
+Fix commit: `bdc46ea` (`fix(hqrc-v3): bind correction split context`).
+
+- `available_contexts` now contains complete immutable `EventResidualContext` values parsed from
+  the validated residual manifest.
+- Manifest and requested contexts must use a non-empty, unique, canonically ordered subsequence
+  of the four immutable OOF split IDs.
+- Every loader requires exact equality with one complete available context before reading or
+  filtering any Parquet stream. Model/feature/seed equality alone is insufficient.
+- Duplicate manifest records are rejected both by complete context and by
+  model/feature/seed key, so different split populations cannot masquerade as separate contexts.
+
+Final evidence on the fix:
+
+- amended source suite: `21 passed in 1.03s`;
+- Task 14 approval/source/stage/CLI focused suite: `69 passed, 30 expected warnings in 4.85s`;
+- full non-slow suite: `464 passed, 8 deselected, 77 existing warnings in 65.23s`;
+- full Ruff and `git diff --check`: clean;
+- protected nested lock remains
+  `f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`.
+
+The no-fit Task 14 adapter was rechecked against the existing temporary paper-publication copy
+and XGBoost-B1 approval. It retained the exact approved split context
+`oof-2020`--`oof-2023`, source profile `paper`, 1,032 training rows, 264 event rows, and scale
+`2290.0780128512224` MW. No original artifact or paper fit was touched.
