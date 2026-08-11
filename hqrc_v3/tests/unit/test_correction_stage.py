@@ -196,6 +196,94 @@ def test_final_stream_rejects_context_or_coverage_change():
         )
 
 
+def test_causal_input_adapter_uses_validated_source_without_changing_bound_values(
+    tmp_path, monkeypatch
+):
+    events = load_event_registry(EVENTS)
+    training = _training_frame()
+    approved = _approved(tmp_path, tuple(sorted(training["occurrence_id"].unique().to_list())))
+    final = _final_stream()
+    residual_manifest = {
+        "outputs": {"standardized_residuals": {"sha256": "residual"}},
+        "contexts": [
+            {
+                "model": "lightgbm",
+                "feature_set": "B1",
+                "seed": 7,
+                "latest_complete_oof_scale": {
+                    "split_id": "oof-2023",
+                    "sigma_n_mw": 123.5,
+                },
+            }
+        ],
+    }
+    baseline_manifest = {"identity": "unchanged"}
+    source_paths = {"data": tmp_path / "data.csv"}
+    source_hashes = {"experiment_config": "config", "event_registry": "events"}
+    residual_path = tmp_path / "residual.parquet"
+    members_path = tmp_path / "members.parquet"
+    point_path = tmp_path / "point.parquet"
+    calls: list[tuple[object, ...]] = []
+
+    class FakeSource:
+        def __init__(self):
+            self.source_profile = "smoke"
+            self.residual_manifest = residual_manifest
+            self.baseline_manifest = baseline_manifest
+            self.source_paths = source_paths
+            self.source_hashes = source_hashes
+            self.residual_path = residual_path
+            self.final_members_path = members_path
+            self.final_point_path = point_path
+            self.events = events
+
+        def load_standardized_context(self, context, *, through):
+            calls.append(("oof", context, through))
+            return training
+
+        def load_final_point_context(self, context):
+            calls.append(("final", context))
+            return final
+
+    def fake_validate_source(**kwargs):
+        calls.append(("preflight", kwargs))
+        return FakeSource()
+
+    monkeypatch.setattr(stage, "validate_correction_source", fake_validate_source)
+    monkeypatch.setattr(stage, "load_approved_calibration", lambda *_args, **_kwargs: approved)
+
+    prepared = stage.prepare_causal_correction_inputs(
+        run_dir=tmp_path / "run",
+        config_path=tmp_path / "experiment.toml",
+        approved_ar_path=approved.artifact_path,
+        profile="smoke",
+    )
+
+    assert calls == [
+        (
+            "preflight",
+            {
+                "run_dir": tmp_path / "run",
+                "config_path": tmp_path / "experiment.toml",
+                "profile": "smoke",
+            },
+        ),
+        ("oof", approved.context, 2023),
+        ("final", approved.context),
+    ]
+    assert prepared.source_profile == "smoke"
+    assert prepared.sigma_n_mw == 123.5
+    assert prepared.residual_manifest is residual_manifest
+    assert prepared.baseline_manifest is baseline_manifest
+    assert prepared.source_paths is source_paths
+    assert prepared.source_hashes is source_hashes
+    assert prepared.residual_path == residual_path
+    assert prepared.final_members_path == members_path
+    assert prepared.final_point_path == point_path
+    assert prepared.training_frame.equals(training)
+    assert prepared.prediction.full_frame.equals(final)
+
+
 def test_causal_products_use_q_plus_event_reset_e_and_leave_other_hours_bitwise_equal(
     tmp_path,
 ):

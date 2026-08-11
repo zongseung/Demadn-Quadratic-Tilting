@@ -20,8 +20,6 @@ import arviz as az
 import numpy as np
 import polars as pl
 
-from hqrc_v3.baselines.config import MODEL_NAMES, load_paper_baselines
-from hqrc_v3.baselines.paper import PAPER_HASH_KEYS, run_paper_final_stage
 from hqrc_v3.bayes.artifacts import load_hqrc_data, write_hqrc_data
 from hqrc_v3.bayes.model import CYCLIC_HOUR_PARAMETERIZATION, HQRCData, HQRCModelOptions
 from hqrc_v3.bayes.predictive import (
@@ -37,18 +35,8 @@ from hqrc_v3.bayes.samplers import (
     sample_hqrc,
     validate_inference_data,
 )
-from hqrc_v3.config import load_config
 from hqrc_v3.contracts import DataContractError, validate_prediction_frame
-from hqrc_v3.data import (
-    FIXED_END,
-    FIXED_PUBLIC_HOLIDAY_DATES,
-    FIXED_ROWS,
-    FIXED_START,
-    FIXED_SUBSTITUTE_OR_TEMPORARY_DATES,
-    audit_hourly_data,
-    load_temporary_holiday_availability,
-    read_hourly_data,
-)
+from hqrc_v3.correction_source import CorrectionSourceError, validate_correction_source
 from hqrc_v3.diagnostics.ar import (
     ApprovedARCalibration,
     EventResidualContext,
@@ -57,18 +45,8 @@ from hqrc_v3.diagnostics.ar import (
     validate_event_residual_context,
 )
 from hqrc_v3.evaluation.metrics import point_metric_frame, probabilistic_metric_frame
-from hqrc_v3.events import (
-    EventOccurrence,
-    load_event_registry,
-    load_holiday_calendar,
-)
-from hqrc_v3.features import attach_calendar_features, build_daily_forecast_matrix
+from hqrc_v3.events import EventOccurrence
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
-from hqrc_v3.residual_stage import (
-    load_standardized_residual_manifest,
-    select_diagnostic_residual_context,
-)
-from hqrc_v3.splits import final_fold, select_fold_samples
 
 _CAUSAL_SPLITS = tuple(f"oof-{year}" for year in range(2020, 2024))
 _HOLIDAY_INDEX = {"seollal": 0, "chuseok": 1}
@@ -355,24 +333,6 @@ def build_causal_prediction_data(
     )
 
 
-_SOURCE_KEYS = (
-    "data",
-    "experiment_config",
-    "model_config",
-    "event_registry",
-    "holiday_calendar",
-    "temporary_holiday_availability",
-)
-_SOURCE_TO_BASELINE_HASH = {
-    "data": "data_sha256",
-    "experiment_config": "experiment_sha256",
-    "model_config": "model_config_sha256",
-    "event_registry": "event_registry_sha256",
-    "holiday_calendar": "holiday_calendar_sha256",
-    "temporary_holiday_availability": "temporary_holiday_availability_sha256",
-}
-
-
 def _canonical_json(value: object) -> bytes:
     try:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
@@ -394,57 +354,6 @@ def _read_canonical_json(path: Path, description: str) -> dict[str, Any]:
     return value
 
 
-def _resolve_source_paths(
-    run_dir: Path, config_path: Path
-) -> tuple[dict[str, Path], dict[str, str], dict[str, Any]]:
-    """Resolve all six residual-manifest sources before trusting any downstream path."""
-
-    manifest_path = Path(run_dir) / "inputs/standardized_residuals_manifest.json"
-    raw_manifest = _read_canonical_json(manifest_path, "standardized residual manifest")
-    inputs = raw_manifest.get("inputs")
-    if not isinstance(inputs, dict):
-        raise CausalCorrectionError("residual manifest inputs are invalid")
-    paths: dict[str, Path] = {}
-    hashes: dict[str, str] = {}
-    for name in _SOURCE_KEYS:
-        entry = inputs.get(name)
-        if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
-            raise CausalCorrectionError(f"residual manifest {name} source is invalid")
-        raw_path, digest = entry.get("path"), entry.get("sha256")
-        if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
-            raise CausalCorrectionError(f"residual manifest {name} path must be absolute")
-        path = Path(raw_path)
-        if (
-            not path.is_file()
-            or path.is_symlink()
-            or not isinstance(digest, str)
-            or file_sha256(path) != digest
-        ):
-            raise CausalCorrectionError(f"residual manifest {name} source hash differs")
-        paths[name], hashes[name] = path, digest
-    if paths["experiment_config"].resolve() != Path(config_path).resolve():
-        raise CausalCorrectionError("requested experiment config differs from residual source")
-    return paths, hashes, raw_manifest
-
-
-def _paper_bounds(profile: str, availability: object) -> dict[str, object]:
-    if profile == "paper":
-        return {
-            "expected_start": FIXED_START,
-            "expected_end": FIXED_END,
-            "expected_rows": FIXED_ROWS,
-            "expected_public_holiday_dates": FIXED_PUBLIC_HOLIDAY_DATES,
-            "expected_substitute_or_temporary_dates": (FIXED_SUBSTITUTE_OR_TEMPORARY_DATES),
-            "temporary_holiday_availability": availability,
-        }
-    return {
-        "expected_start": None,
-        "expected_end": None,
-        "expected_rows": None,
-        "temporary_holiday_availability": availability,
-    }
-
-
 def prepare_causal_correction_inputs(
     *,
     run_dir: Path,
@@ -460,162 +369,51 @@ def prepare_causal_correction_inputs(
     if not approved_candidate.is_file() or approved_candidate.is_symlink():
         raise CausalCorrectionError("approved AR artifact is missing or unsafe")
     run = Path(run_dir)
-    sources, source_hashes, _ = _resolve_source_paths(run, Path(config_path))
-    load_config(sources["experiment_config"])
-    events = load_event_registry(sources["event_registry"])
-    calendar = load_holiday_calendar(sources["holiday_calendar"])
-    availability = load_temporary_holiday_availability(sources["temporary_holiday_availability"])
-    residual_manifest = load_standardized_residual_manifest(
-        run / "inputs/standardized_residuals_manifest.json",
-        run_dir=run,
-        config_sha256=source_hashes["experiment_config"],
-        event_sha256=source_hashes["event_registry"],
-    )
-    source_profile = residual_manifest.get("profile")
-    if source_profile not in {"paper", "smoke"} or (
-        profile == "paper" and source_profile != "paper"
-    ):
-        raise CausalCorrectionError("residual publication profile cannot serve this fit")
+    try:
+        source = validate_correction_source(
+            run_dir=run,
+            config_path=Path(config_path),
+            profile=profile,
+        )
+    except CorrectionSourceError as error:
+        raise CausalCorrectionError(str(error)) from error
+    residual_manifest = source.residual_manifest
+    source_profile = source.source_profile
     residual_entry = residual_manifest["outputs"]["standardized_residuals"]
-    residual_path = run / residual_entry["path"]
     approved = _trusted(
         load_approved_calibration(
             approved_candidate,
             current_residual_sha256=residual_entry["sha256"],
-            current_config_sha256=source_hashes["experiment_config"],
-            current_event_sha256=source_hashes["event_registry"],
+            current_config_sha256=source.source_hashes["experiment_config"],
+            current_event_sha256=source.source_hashes["event_registry"],
         )
     )
 
-    residuals = pl.read_parquet(residual_path)
-    training_frame = select_diagnostic_residual_context(
-        residuals,
-        residual_manifest,
-        events=events,
-        model=approved.context.model,
-        feature_set=approved.context.feature_set,
-        seed=approved.context.seed,
-        through=2023,
-    )
-    hqrc_data = build_causal_hqrc_data(training_frame, approved, events=events)
+    try:
+        training_frame = source.load_standardized_context(approved.context, through=2023)
+        final_frame = source.load_final_point_context(approved.context)
+    except CorrectionSourceError as error:
+        raise CausalCorrectionError(str(error)) from error
+    hqrc_data = build_causal_hqrc_data(training_frame, approved, events=source.events)
     sigma_n_mw = select_latest_oof_scale(residual_manifest, approved)
-
-    baseline_manifest_path = run / "predictions/baseline_manifest.json"
-    baseline_manifest = _read_canonical_json(baseline_manifest_path, "baseline manifest")
-    if baseline_manifest.get("profile") != source_profile:
-        raise CausalCorrectionError("baseline profile differs")
-    stages = baseline_manifest.get("stages")
-    final_members = run / "predictions/final_2024_members.parquet"
-    final_point = run / "predictions/final_2024.parquet"
-    if (
-        not isinstance(stages, dict)
-        or "final" not in stages
-        or not final_members.is_file()
-        or not final_point.is_file()
-        or final_members.is_symlink()
-        or final_point.is_symlink()
-    ):
-        raise CausalCorrectionError(
-            "existing final baseline publication is required; correction fitting never trains it"
-        )
-    models = baseline_manifest.get("models")
-    feature_sets = baseline_manifest.get("feature_sets")
-    if (
-        not isinstance(models, list)
-        or not isinstance(feature_sets, list)
-        or any(model not in MODEL_NAMES for model in models)
-        or any(feature not in {"B0", "B1"} for feature in feature_sets)
-    ):
-        raise CausalCorrectionError("baseline manifest model coverage is invalid")
-    if source_profile == "paper" and (
-        tuple(models) != MODEL_NAMES or feature_sets != ["B0", "B1"]
-    ):
-        raise CausalCorrectionError("paper correction requires all baseline contexts")
-    baseline_config = load_paper_baselines(sources["model_config"])
-    audited = audit_hourly_data(
-        read_hourly_data(sources["data"]),
-        **_paper_bounds(source_profile, availability),
+    prediction = build_causal_prediction_data(
+        final_frame, context=approved.context, events=source.events
     )
-    featured = attach_calendar_features(audited, calendar)
-    matrices = {
-        feature_set: build_daily_forecast_matrix(featured, feature_set=feature_set)
-        for feature_set in feature_sets
-    }
-    artifact_hashes = {_SOURCE_TO_BASELINE_HASH[name]: source_hashes[name] for name in _SOURCE_KEYS}
-    if set(artifact_hashes) != set(PAPER_HASH_KEYS):
-        raise CausalCorrectionError("baseline source hash schema differs")
-    execution_overrides = baseline_manifest.get("execution_overrides")
-    smoke_rounds = (
-        execution_overrides.get("boosting_rounds")
-        if isinstance(execution_overrides, dict)
-        else None
-    )
-    classical_seed = baseline_manifest.get("classical_seed")
-    if isinstance(classical_seed, bool) or not isinstance(classical_seed, int):
-        raise CausalCorrectionError("baseline classical seed is invalid")
-    final_result = run_paper_final_stage(
-        matrices=matrices,
-        config=baseline_config,
-        run_dir=run,
-        cache_dir=run / "prediction-stream-cache",
-        artifact_hashes=artifact_hashes,
-        classical_seed=classical_seed,
-        models=tuple(models),
-        feature_sets=tuple(feature_sets),
-        profile=source_profile,
-        smoke_boosting_rounds=smoke_rounds,
-    )
-    if final_result.fit_count != 0:
-        raise CausalCorrectionError("final baseline validation unexpectedly fitted a model")
-    final_publication = pl.read_parquet(final_result.point_path)
-    _, evaluation_indices = select_fold_samples(
-        matrices[feature_sets[0]], final_fold()
-    )
-    evaluation_matrix = matrices[feature_sets[0]].take(evaluation_indices)
-    expected_origin = np.repeat(evaluation_matrix.origins, 24).astype("datetime64[us]")
-    expected_timestamp = evaluation_matrix.target_times.reshape(-1).astype("datetime64[us]")
-    expected_horizon = np.tile(np.arange(1, 25, dtype=np.int64), len(evaluation_indices))
-    expected_observed = evaluation_matrix.target.reshape(-1).astype(float)
-    for stream in final_publication.partition_by(
-        ["model", "feature_set", "seed"], maintain_order=True
-    ):
-        ordered = stream.sort("target_timestamp")
-        if (
-            ordered.height != expected_observed.size
-            or not np.array_equal(
-                ordered["origin"].to_numpy().astype("datetime64[us]"), expected_origin
-            )
-            or not np.array_equal(
-                ordered["target_timestamp"].to_numpy().astype("datetime64[us]"),
-                expected_timestamp,
-            )
-            or not np.array_equal(ordered["horizon"].to_numpy(), expected_horizon)
-            or not np.array_equal(ordered["observed_mw"].to_numpy(), expected_observed)
-        ):
-            raise CausalCorrectionError(
-                "final baseline observed targets differ from source-derived truth"
-            )
-    final_frame = final_publication.filter(
-        (pl.col("model") == approved.context.model)
-        & (pl.col("feature_set") == approved.context.feature_set)
-        & (pl.col("seed") == approved.context.seed)
-    )
-    prediction = build_causal_prediction_data(final_frame, context=approved.context, events=events)
     return CausalCorrectionInputs(
         run_dir=run,
-        source_profile=str(source_profile),
+        source_profile=source_profile,
         approved=approved,
         hqrc_data=hqrc_data,
         training_frame=training_frame,
         prediction=prediction,
         sigma_n_mw=sigma_n_mw,
         residual_manifest=residual_manifest,
-        baseline_manifest=baseline_manifest,
-        source_paths=sources,
-        source_hashes=source_hashes,
-        residual_path=residual_path,
-        final_members_path=final_result.members_path,
-        final_point_path=final_result.point_path,
+        baseline_manifest=source.baseline_manifest,
+        source_paths=source.source_paths,
+        source_hashes=source.source_hashes,
+        residual_path=source.residual_path,
+        final_members_path=source.final_members_path,
+        final_point_path=source.final_point_path,
     )
 
 
