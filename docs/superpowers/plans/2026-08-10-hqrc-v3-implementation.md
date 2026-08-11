@@ -1475,6 +1475,133 @@ The reviewer must inspect the approved-context binding, absence of 2024 fitting 
 source-derived final validation, event reset, use of the oof-2023 scale, no residual
 double-counting, point-forecast locality, posterior gates, atomic/reuse behavior, and CLI scope.
 
+### Task 15: Leakage-safe LOEO, functional-form, and pooling evaluation
+
+**Purpose:** Promote the already reviewed low-level LOEO and H0--H5 contracts into a real-data,
+immutable production stage. One invocation handles exactly one
+`(baseline_model, feature_set, baseline_seed)` context. The ten-context paper matrix is an
+orchestration of this singular API, never one shared posterior or AR calibration.
+
+**Frozen interpretation:**
+
+- LOEO is a retrospective `causal=false` exchangeability analysis. It may use occurrences later
+  than the held-out occurrence, but the held-out occurrence itself must enter neither the fold's
+  ACF/PACF diagnostics, Beta prior, `HQRCData`, nor posterior.
+- AR(1) means order one. `phi` is never fixed to one: each fold loads an explicitly approved,
+  training-only `u=(phi+1)/2 ~ Beta(a_fold,b_fold)` prior and estimates `phi` in the posterior.
+- H1 is a partially pooled event-constant correction. H1--H4 therefore hold pooling,
+  restriction, covariance, and innovation structure fixed and change only the functional form.
+- H5 is a point-only external similar-day competitor. It must not borrow `phi`, `sigma_r`, or
+  predictive noise from any Bayesian variant; probabilistic scores are recorded as unsupported.
+- The primary Holm family is fixed before fitting: H3 versus H0 for five baselines times B0/B1.
+  Functional and pooling comparisons are separate exploratory families.
+
+**Canonical LOEO data flow:**
+
+```text
+2020--2023 expanding-OOF event residuals
+  + 2024 final-baseline event residuals standardized only by oof-2023 sigma_N
+  -> exact 10-event universe (1,296 hourly rows per context)
+  -> held-out-specific physical 9-event training artifact
+  -> training-only ACF/PACF and unapproved Beta proposal
+  -> explicit fold-set approval
+  -> H3/H1--H4 posterior from those same nine events
+  -> prediction of only the omitted occurrence, with a fresh AR reset
+```
+
+- [ ] **Step 1: Extract the common source preflight without changing Task 14 semantics**
+
+Create `hqrc_v3/src/hqrc_v3/correction_source.py` and
+`hqrc_v3/tests/unit/test_correction_source.py`. Move source/calendar reconstruction, manifest and
+hash verification, final-baseline reuse (`fit_count == 0`), and canonical OOF/final stream loading
+behind an immutable `ValidatedCorrectionSource`. Keep `correction_stage.py` as a caller and prove
+that the causal-2024 inputs, hashes, predictions, namespace, and reuse behavior are unchanged.
+Fail closed on source substitution, rehashed semantic mutation, symlinks, unknown entries, or a
+requested context not present in the validated paper publications.
+
+- [ ] **Step 2: Build the immutable ten-event universe and physical fold inputs**
+
+Create `hqrc_v3/src/hqrc_v3/diagnostics/loeo.py` and unit tests. Construct exactly the registered
+Seollal/Chuseok 2020--2024 occurrences. Preserve the 2020--2023 fold-local standardization already
+published in the residual artifact. Compute each 2024 standardized residual only as
+`(observed-final_baseline)/oof-2023_sigma_N`; never estimate a scale from a 2024 holiday. Publish
+one hash-bound universe and, for each held-out id, a real Parquet containing exactly the other nine
+events. Re-read that Parquet before diagnostics so no in-memory full-universe frame can be passed
+accidentally. Tests must prove 10 events/1,296 rows, exact hourly grids, no held-out row, and
+held-out outcome mutation invariance of its training artifact.
+
+- [ ] **Step 3: Generate and explicitly approve a ten-fold AR proposal set**
+
+Add `prepare_loeo_ar_proposal_set`, `approve_loeo_ar_proposal_set`, and
+`load_approved_loeo_ar_set`. Each fold proposal derives occurrence-reset ACF/PACF and the existing
+robust Beta-moment rule from only its physical nine-event artifact; its residual digest is that
+artifact's digest, not the universe digest. Generate reviewable ACF/PACF plots and warnings, but
+never auto-approve. Batch approval requires the caller to repeat the complete proposal-set SHA-256
+and freezes, without recalculation, all ten proposals. Every loaded approval must bind the exact
+context and `registry_ids - {held_out}`. Reject causal eight-event approvals, fold swaps, event
+order/population changes, and any proposal/plot/training digest change.
+
+- [ ] **Step 4: Implement one immutable H3 LOEO fold**
+
+Create `hqrc_v3/src/hqrc_v3/loeo_stage.py`, unit/integration tests, and a reduced real-data slow
+test. For one held-out id, build `HQRCData` from the approved nine events and call the reviewed
+sampler with H3, partial pooling, full covariance, restriction, normal event-reset AR(1), and the
+fold's approved Beta prior. Use the held-out event's known restriction flag for new-event
+prediction. Evaluation scale is the held-out OOF fold scale for 2020--2023 and `oof-2023` for
+2024. The point forecast is `baseline + sigma_eval * E[q]`; predictive draws are
+`baseline + sigma_eval * (q + e)` with no second baseline-residual term. Preserve Task 14's
+NUTS geometry, namespace identity, strict diagnostics gate, atomic posterior checkpoint, immutable
+products, semantic reuse, and fail-closed recovery.
+
+- [ ] **Step 5: Publish the complete ten-fold primary H3 matrix**
+
+Implement `fit_loeo_primary`. Paper profile requires all ten folds and creates aggregate
+`COMPLETE` only after every fold independently passes R-hat/ESS/divergence and semantic checks.
+Smoke profile alone may select a held-out subset. Derive fold RNG seeds from the root seed and a
+canonical SHA-256 label and record them. Publish hourly quantiles/scores rather than full draw
+lists, per-event metrics, pooled/by-holiday metrics, posterior summaries, and training-only
+PSIS-LOO diagnostics. Every row must carry `causal=false`. A shared H3-partial fold artifact is
+referenced, not refitted, by later functional and pooling matrices.
+
+- [ ] **Step 6: Implement the H0--H5 functional matrix**
+
+Freeze `H0`, `H1-partial`, `H2-partial`, `H3-partial`, `H4-partial`, and point-only `H5` in one
+specification registry. H0 point forecasts must be bitwise baseline-equal. Its bootstrap source is
+complete 24-hour non-event OOF blocks only; exclude an entire origin when any horizon overlaps an
+event and never include final-2024 residuals. H1--H4 use the same fold approval and all common
+model options. H5 uses only same-holiday training occurrences and never any held-out id. When a
+held-out day position has no historical support (notably Chuseok 2022 `+3`), retain the target row,
+set `q=0`, and mark `h5_supported=false`; do not extrapolate or divide by an arbitrary epsilon.
+H5 probabilistic fields remain null with an explicit unsupported reason.
+
+- [ ] **Step 7: Implement the fixed-H3 pooling matrix**
+
+Compare complete, partial, and none pooling while holding H3 and all other options fixed. Reuse
+the primary partial artifact exactly. For none pooling, a new-event draw may select only equally
+weighted training coefficients of the held-out event's holiday type; never select the held-out or
+other-holiday coefficient. Publish held-out RMSE/CRPS as the principal comparison. If LOO-ELPD is
+reported, label it explicitly as a nine-event training PSIS-LOO diagnostic rather than held-out
+forecast accuracy.
+
+- [ ] **Step 8: Aggregate inference, CLI, documentation, and review**
+
+Wire:
+
+```text
+hqrc diagnose-ar --evaluation loeo ... --output-dir ...
+hqrc approve-loeo-ar-set --proposal-set ... --confirm-proposal-set-sha256 ...
+hqrc fit-corrections --evaluation loeo --approved-ar-set ...
+hqrc run-ablations --evaluation loeo --approved-ar-set ... --family functional|pooling
+```
+
+Causal mode continues to accept only one `--approved-ar`; LOEO accepts only an approved set.
+Aggregate Wilcoxon and whole-event bootstrap use ten paired occurrence losses, never hourly or
+model-event pseudo-replicates. Report degraded-event count and maximum degradation. Keep HAC-DM
+plus event-block bootstrap secondary and apply Holm within the frozen families above. Update the
+paper-facing documentation to distinguish causal-2024 deployment evaluation from retrospective
+LOEO. Run focused, full non-slow, Ruff, protected-lock, and one-context/one-fold real smoke checks,
+commit, and obtain a fresh independent production review before any full paper LOEO fit.
+
 ## Final Verification
 
 - [ ] Run: `uv run pytest -c hqrc_v3/pyproject.toml hqrc_v3/tests -m "not slow" -q`
