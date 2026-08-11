@@ -4,6 +4,8 @@ Status: IMPLEMENTATION AWAITING INDEPENDENT REVIEW
 
 Implementation commit: `d32580f`
 
+Fix round 1 commit: `cfef558`
+
 ## Scope delivered
 
 - Added the exact public operations `prepare_loeo_ar_proposal_set`,
@@ -169,8 +171,62 @@ The temporary validated source copy was also byte-identical before/after:
   tree requires a new reviewed proposal set.
 - Existing AR artifact private serialization validators are reused inside the same diagnostics
   package to avoid duplicating or weakening their robust-Beta and approval-token contracts.
-- No unresolved implementation concern is known. Independent review should especially inspect
-  the atomic recovery namespaces and the fit-boundary use of `calibration_for()` in Task 15D.
+- No unresolved Critical/Important implementation concern is known. The controller has deferred
+  the minor size/extraction concern for this roughly 1,200-line orchestration module until the
+  load-bearing publication fixes stabilize. Independent review should especially inspect the
+  atomic recovery namespaces and the fit-boundary use of `calibration_for()` in Task 15D.
+
+## Fix round 1: durable staging and no-follow publication boundaries
+
+Independent review found that the initial retry path deleted interrupted proposal/approval
+staging trees, so a fresh call could not distinguish matching evidence from foreign evidence. It
+also found that the publication lock followed dangling symlinks and that the optional `approval`
+generation entry was not type-checked before use.
+
+The fix gives proposal and approval stages deterministic digest-derived names plus canonical
+`STAGE.json` identities bound to their exact source proposal publication. A fresh call resumes a
+matching complete or incomplete stage in place: already verified proposal/approval artifacts are
+reused without changing inode or bytes, absent artifacts are produced, and the complete tree is
+atomically renamed. Foreign identities, unknown entries, symlinks, special files, mismatched
+artifacts, and ambiguous stages fail closed and remain byte-for-byte untouched. The old staging
+deletion helpers and all exception cleanup were removed.
+
+Approval validates the proposal publication and exact digest confirmation before it creates or
+resumes approval state. A wrong confirmation leaves an existing approval stage untouched. The
+generation validator now applies `lstat`-based regular-file/directory checks to every stable and
+transient entry, including `approval`. The publication lock performs `lstat`, opens with
+`O_NOFOLLOW | O_CREAT`, and verifies the held descriptor with `fstat`, so neither existing nor
+dangling lock symlinks can modify an external target.
+
+Genuine fix-round RED:
+
+```text
+9 failed, 6 passed, 21 deselected in 23.67s
+```
+
+The nine failures directly reproduced dangling-lock escape, dangling approval traversal, absent
+stage identity, destructive fresh-call retry, and approval cleanup before confirmation.
+
+Final fix-round regression GREEN:
+
+```text
+15 passed, 21 deselected in 31.54s
+```
+
+The parameterized regressions cover existing and dangling external lock/approval targets;
+complete and incomplete fresh-call proposal/approval recovery with inode/byte preservation;
+foreign identity, unknown entry, and symlink stage preservation; and wrong-confirmation stage
+preservation. The complete Task 15C unit module also passed after the behavioral implementation:
+
+```text
+36 passed in 105.58s
+```
+
+Scoped Ruff check and format check passed, `git diff --check` was clean, and the protected
+untracked `hqrc_v3/uv.lock` remained byte-identical at
+`f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`. No real artifacts,
+approvals, fitting, sampling, or paper outputs were created in this fix round. Task 15 Step 3
+remains unchecked pending fresh independent review.
 
 ## Files changed
 
