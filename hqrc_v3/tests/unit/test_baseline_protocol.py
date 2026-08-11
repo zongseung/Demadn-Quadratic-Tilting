@@ -84,6 +84,7 @@ def test_horizon_regressor_builds_distinct_estimators(tiny_forecast_matrix):
 
     assert len({id(model) for model in fitted.estimators}) == 24
     assert {model.n_features_in_ for model in fitted.estimators} == {168 * 2 + 24 * 2}
+    assert fitted.population_contract() == fitted.preprocessor.population_contract()
 
 
 def test_one_shot_selection_returns_lowest_validation_rmse(

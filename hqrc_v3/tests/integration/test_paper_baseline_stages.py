@@ -35,6 +35,35 @@ HASHES = {
 }
 
 
+def _population(times: np.ndarray, *, unit: str) -> dict[str, object]:
+    unique = np.unique(np.asarray(times).reshape(-1).astype("datetime64[ns]"))
+    return {
+        "count": int(unique.size),
+        "start": np.datetime_as_string(unique[0], unit="s"),
+        "end": np.datetime_as_string(unique[-1], unit="s"),
+        "unit": unit,
+    }
+
+
+def _actual_population_contract(
+    model: str, train: ForecastMatrix
+) -> dict[str, dict[str, object]]:
+    target = _population(train.target_times, unit="unique-hour")
+    if model in {"seq2seq_lstm", "transformer"}:
+        history_times = train.origins[:, None] + np.arange(-168, 0).astype(
+            "timedelta64[h]"
+        )
+        return {
+            "target": target,
+            "weather": _population(history_times, unit="unique-hour"),
+            "calendar": target,
+        }
+    return {
+        "x": _population(train.origins, unit="daily-sample"),
+        "target": target,
+    }
+
+
 class AbruptPublicationStop(BaseException):
     """Simulate process death, which ordinary Exception cleanup cannot catch."""
 
@@ -117,6 +146,7 @@ def _baseline_cli_arguments(source: Path, tmp_path: Path) -> list[str]:
 class RecordingFactory:
     name: str
     calls: list[dict[str, object]] = field(default_factory=list)
+    population_mutator: Any | None = None
 
     @property
     def uses_validation_tail(self) -> bool:
@@ -137,13 +167,20 @@ class RecordingFactory:
                 "validation_rows": 0 if validation is None else len(validation.origins),
             }
         )
-        return RecordingFitted(self.name, seed)
+        population = _actual_population_contract(self.name, train)
+        if self.population_mutator is not None:
+            population = self.population_mutator(population, seed)
+        return RecordingFitted(self.name, seed, population)
 
 
 @dataclass(frozen=True)
 class RecordingFitted:
     model_name: str
     seed: int
+    population: dict[str, dict[str, object]]
+
+    def population_contract(self) -> dict[str, dict[str, object]]:
+        return self.population
 
     def predict(self, batch: ForecastMatrix) -> np.ndarray:
         model_offset = MODEL_NAMES.index(self.model_name) * 1000.0
@@ -411,6 +448,9 @@ def test_completed_oof_is_a_validated_cache_hit_without_fitting(tmp_path: Path) 
 
 def test_stream_caches_resume_publication_without_refitting(tmp_path: Path) -> None:
     first = _run_oof(tmp_path)
+    first_populations = json.loads(first.manifest_path.read_text(encoding="utf-8"))[
+        "stages"
+    ]["oof"]["preprocessing_populations"]
     first.members_path.unlink()
     first.point_path.unlink()
     first.manifest_path.unlink()
@@ -423,6 +463,10 @@ def test_stream_caches_resume_publication_without_refitting(tmp_path: Path) -> N
     assert resumed.members_path.is_file()
     assert resumed.point_path.is_file()
     assert all(factory.calls == [] for factory in factories.values())
+    resumed_populations = json.loads(
+        resumed.manifest_path.read_text(encoding="utf-8")
+    )["stages"]["oof"]["preprocessing_populations"]
+    assert resumed_populations == first_populations
 
 
 def test_manifest_binds_inputs_models_seeds_feature_schemas_and_streams(tmp_path: Path) -> None:
@@ -488,6 +532,88 @@ def test_manifest_binds_inputs_models_seeds_feature_schemas_and_streams(tmp_path
     assert len(manifest["stages"]["oof"]["streams"]) == 10
     assert manifest["stages"]["oof"]["expected_coverage"]["count"] == 5_952
     assert len(manifest["stages"]["oof"]["expected_coverage"]["sha256"]) == 64
+    first_cache_metadata = json.loads(
+        (
+            tmp_path
+            / "stream-cache"
+            / f"{cache_key('xgboost', 'B0', 7, expanding_oof_folds()[0])}.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert first_cache_metadata["population_contract"] == populations[0]["scalers"]
+
+
+def test_stage_rejects_fitted_adapter_that_misreports_population(tmp_path: Path) -> None:
+    def misreport(
+        population: dict[str, dict[str, object]], seed: int
+    ) -> dict[str, dict[str, object]]:
+        del seed
+        return {
+            **population,
+            "x": {**population["x"], "count": int(population["x"]["count"]) + 1},
+        }
+
+    factory = RecordingFactory("xgboost", population_mutator=misreport)
+
+    def builder(config: object, model: str, **_: object) -> RecordingFactory:
+        del config
+        assert model == "xgboost"
+        return factory
+
+    with pytest.raises(DataContractError, match="actual preprocessing population.*expected"):
+        run_paper_oof_stage(
+            matrices={"B0": _matrix("B0")},
+            config=load_paper_baselines(MODEL_CONFIG),
+            run_dir=tmp_path,
+            cache_dir=tmp_path / "stream-cache",
+            artifact_hashes=HASHES,
+            classical_seed=7,
+            factory_builder=builder,
+            models=("xgboost",),
+            feature_sets=("B0",),
+            profile="smoke",
+            oof_years=(2020,),
+        )
+
+    assert not (tmp_path / "predictions/baseline_manifest.json").exists()
+
+
+def test_stage_requires_all_neural_seeds_to_report_same_population(tmp_path: Path) -> None:
+    def disagree(
+        population: dict[str, dict[str, object]], seed: int
+    ) -> dict[str, dict[str, object]]:
+        if seed != PAPER_SEEDS[-1]:
+            return population
+        return {
+            **population,
+            "weather": {
+                **population["weather"],
+                "count": int(population["weather"]["count"]) + 1,
+            },
+        }
+
+    factory = RecordingFactory("seq2seq_lstm", population_mutator=disagree)
+
+    def builder(config: object, model: str, **_: object) -> RecordingFactory:
+        del config
+        assert model == "seq2seq_lstm"
+        return factory
+
+    with pytest.raises(DataContractError, match="neural seeds.*population"):
+        run_paper_oof_stage(
+            matrices={"B0": _matrix("B0")},
+            config=load_paper_baselines(MODEL_CONFIG),
+            run_dir=tmp_path,
+            cache_dir=tmp_path / "stream-cache",
+            artifact_hashes=HASHES,
+            classical_seed=7,
+            factory_builder=builder,
+            models=("seq2seq_lstm",),
+            feature_sets=("B0",),
+            profile="smoke",
+            oof_years=(2020,),
+        )
+
+    assert not (tmp_path / "predictions/baseline_manifest.json").exists()
 
 
 @pytest.mark.parametrize("mutation", ["missing", "version", "future_path", "scaler"])

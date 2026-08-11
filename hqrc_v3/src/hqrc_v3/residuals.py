@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -16,7 +17,7 @@ from pathlib import Path
 import polars as pl
 
 from hqrc_v3.contracts import PREDICTION_COLUMNS, DataContractError
-from hqrc_v3.provenance import ArtifactMismatch
+from hqrc_v3.provenance import ArtifactMismatch, file_sha256
 from hqrc_v3.splits import is_oof_split_id
 
 _RESIDUAL_COLUMNS = ("is_event", "residual_mw")
@@ -31,6 +32,14 @@ class ResidualContext:
     feature_set: str
     seed: int
     split_id: str
+
+
+@dataclass(frozen=True)
+class PredictionCacheEntry:
+    """A prediction frame and the fitted preprocessing population that owns it."""
+
+    frame: pl.DataFrame
+    population_contract: dict[str, dict[str, object]] | None
 
 
 class FoldScale(float):
@@ -112,7 +121,22 @@ class PredictionCache:
         with self._lock(key, exclusive=False):
             return self._read_unlocked(key, expected_hashes)
 
+    def read_entry(
+        self, key: str, expected_hashes: Mapping[str, str]
+    ) -> PredictionCacheEntry | None:
+        """Read a frame together with integrity-bound fitted population provenance."""
+
+        self._paths(key)
+        with self._lock(key, exclusive=False):
+            return self._read_entry_unlocked(key, expected_hashes)
+
     def _read_unlocked(self, key: str, expected_hashes: Mapping[str, str]) -> pl.DataFrame | None:
+        entry = self._read_entry_unlocked(key, expected_hashes)
+        return None if entry is None else entry.frame
+
+    def _read_entry_unlocked(
+        self, key: str, expected_hashes: Mapping[str, str]
+    ) -> PredictionCacheEntry | None:
         parquet_path, metadata_path = self._paths(key)
         parquet_exists, metadata_exists = parquet_path.is_file(), metadata_path.is_file()
         if not parquet_exists and not metadata_exists:
@@ -121,6 +145,35 @@ class PredictionCache:
             raise ArtifactMismatch(f"partial prediction cache artifact for key {key!r}")
         metadata = self._read_metadata(metadata_path)
         self._assert_hashes(metadata, expected_hashes)
+        required = {
+            "schema_version",
+            "hashes",
+            "parquet_sha256",
+            "population_contract",
+            "entry_sha256",
+        }
+        if (
+            set(metadata) != required
+            or type(metadata.get("schema_version")) is not int
+            or metadata["schema_version"] != 2
+            or not isinstance(metadata.get("parquet_sha256"), str)
+            or not isinstance(metadata.get("entry_sha256"), str)
+        ):
+            raise ArtifactMismatch(f"invalid cache metadata {metadata_path.name}")
+        unsigned = {name: metadata[name] for name in sorted(required - {"entry_sha256"})}
+        if metadata["entry_sha256"] != self._entry_digest(unsigned):
+            raise ArtifactMismatch(
+                f"prediction cache metadata entry digest differs for key {key!r}"
+            )
+        try:
+            parquet_digest = file_sha256(parquet_path)
+        except OSError as error:
+            raise ArtifactMismatch(
+                f"unable to hash cached prediction artifact {key!r}: {error}"
+            ) from error
+        if parquet_digest != metadata["parquet_sha256"]:
+            raise ArtifactMismatch(f"prediction cache parquet digest differs for key {key!r}")
+        population = self._normalize_population(metadata["population_contract"])
         try:
             frame = pl.read_parquet(parquet_path)
         except (OSError, pl.exceptions.PolarsError) as error:
@@ -129,7 +182,10 @@ class PredictionCache:
             ) from error
         from hqrc_v3.contracts import validate_prediction_frame
 
-        return validate_prediction_frame(frame)
+        return PredictionCacheEntry(
+            frame=validate_prediction_frame(frame),
+            population_contract=population,
+        )
 
     def write(self, key: str, frame: pl.DataFrame, hashes: Mapping[str, str]) -> pl.DataFrame:
         """Atomically persist a validated frame and return it without overwriting mismatches."""
@@ -145,6 +201,40 @@ class PredictionCache:
             if existing is not None:
                 return existing
             return self._publish_unlocked(key, normalized, hashes_dict)
+
+    def write_entry(
+        self,
+        key: str,
+        frame: pl.DataFrame,
+        hashes: Mapping[str, str],
+        *,
+        population_contract: Mapping[str, Mapping[str, object]],
+    ) -> PredictionCacheEntry:
+        """Atomically persist predictions and their actual fitted population."""
+
+        from hqrc_v3.contracts import validate_prediction_frame
+
+        normalized_frame = validate_prediction_frame(frame)
+        normalized_hashes = self._normalize_hashes(hashes)
+        normalized_population = self._normalize_population(population_contract)
+        if normalized_population is None:  # pragma: no cover - mapping cannot normalize to None
+            raise DataContractError("fitted preprocessing population must not be null")
+        self._paths(key)
+        with self._lock(key, exclusive=True):
+            self._cleanup_stale_partial(key)
+            existing = self._read_entry_unlocked(key, expected_hashes=normalized_hashes)
+            if existing is not None:
+                if existing.population_contract != normalized_population:
+                    raise ArtifactMismatch(
+                        "fitted preprocessing population differs from the cached artifact"
+                    )
+                return existing
+            return self._publish_entry_unlocked(
+                key,
+                normalized_frame,
+                normalized_hashes,
+                normalized_population,
+            )
 
     def _paths(self, key: str) -> tuple[Path, Path]:
         if not isinstance(key, str) or not _CACHE_KEY.fullmatch(key) or key in {".", ".."}:
@@ -186,6 +276,17 @@ class PredictionCache:
     ) -> pl.DataFrame:
         """Publish a new pair while its exclusive key lock prevents observation gaps."""
 
+        return self._publish_entry_unlocked(key, frame, hashes, None).frame
+
+    def _publish_entry_unlocked(
+        self,
+        key: str,
+        frame: pl.DataFrame,
+        hashes: Mapping[str, str],
+        population_contract: dict[str, dict[str, object]] | None,
+    ) -> PredictionCacheEntry:
+        """Publish one integrity-bound prediction/provenance pair."""
+
         parquet_path, metadata_path = self._paths(key)
         parquet_temp = self._temporary_path(key, ".parquet")
         metadata_temp = self._temporary_path(key, ".json")
@@ -193,7 +294,17 @@ class PredictionCache:
         try:
             frame.write_parquet(parquet_temp)
             self._fsync_file(parquet_temp)
-            self._write_metadata(metadata_temp, hashes)
+            unsigned_metadata: dict[str, object] = {
+                "schema_version": 2,
+                "hashes": dict(hashes),
+                "parquet_sha256": file_sha256(parquet_temp),
+                "population_contract": population_contract,
+            }
+            metadata = {
+                **unsigned_metadata,
+                "entry_sha256": self._entry_digest(unsigned_metadata),
+            }
+            self._write_metadata(metadata_temp, metadata)
             os.replace(parquet_temp, parquet_path)
             published_parquet = True
             os.replace(metadata_temp, metadata_path)
@@ -205,7 +316,10 @@ class PredictionCache:
                 parquet_path.unlink(missing_ok=True)
                 metadata_path.unlink(missing_ok=True)
             raise
-        return frame
+        return PredictionCacheEntry(
+            frame=frame,
+            population_contract=population_contract,
+        )
 
     @staticmethod
     def _normalize_hashes(hashes: Mapping[str, str]) -> dict[str, str]:
@@ -222,7 +336,7 @@ class PredictionCache:
             metadata = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise ArtifactMismatch(f"invalid cache metadata {path.name}: {error}") from error
-        if not isinstance(metadata, dict) or not isinstance(metadata.get("hashes"), dict):
+        if not isinstance(metadata, dict):
             raise ArtifactMismatch(f"invalid cache metadata {path.name}")
         return metadata
 
@@ -230,12 +344,32 @@ class PredictionCache:
         self, metadata: Mapping[str, object], expected_hashes: Mapping[str, str]
     ) -> None:
         expected = self._normalize_hashes(expected_hashes)
-        stored = metadata["hashes"]
-        if not isinstance(stored, dict):  # guarded by _read_metadata; retained for type narrowing
+        stored = metadata.get("hashes")
+        if not isinstance(stored, dict):
             raise ArtifactMismatch("invalid cache metadata hashes")
         for name in sorted(set(stored) | set(expected)):
             if stored.get(name) != expected.get(name):
                 raise ArtifactMismatch(f"{name} hash differs from the cached artifact")
+
+    @staticmethod
+    def _normalize_population(
+        value: object,
+    ) -> dict[str, dict[str, object]] | None:
+        if value is None:
+            return None
+        from hqrc_v3.baselines.preprocessing import validate_population_contract
+
+        try:
+            return validate_population_contract(value)
+        except DataContractError as error:
+            raise ArtifactMismatch("invalid fitted preprocessing population metadata") from error
+
+    @staticmethod
+    def _entry_digest(metadata: Mapping[str, object]) -> str:
+        payload = json.dumps(
+            dict(metadata), sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
     @staticmethod
     def _fsync_file(path: Path) -> None:
@@ -243,9 +377,9 @@ class PredictionCache:
             os.fsync(artifact.fileno())
 
     @staticmethod
-    def _write_metadata(path: Path, hashes: Mapping[str, str]) -> None:
+    def _write_metadata(path: Path, metadata: Mapping[str, object]) -> None:
         with path.open("w", encoding="utf-8") as artifact:
-            json.dump({"hashes": hashes}, artifact, sort_keys=True, separators=(",", ":"))
+            json.dump(metadata, artifact, sort_keys=True, separators=(",", ":"))
             artifact.flush()
             os.fsync(artifact.fileno())
 

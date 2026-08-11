@@ -124,6 +124,11 @@ class HorizonRegressor:
     future_columns: tuple[str, ...]
     preprocessor: FittedClassicalPreprocessor
 
+    def population_contract(self) -> dict[str, dict[str, object]]:
+        """Report the scaler populations observed by the fitted preprocessor."""
+
+        return self.preprocessor.population_contract()
+
     def predict(self, batch: ForecastMatrix) -> np.ndarray:
         if len(self.estimators) != 24:
             raise RuntimeError("a horizon regressor must contain exactly 24 estimators")

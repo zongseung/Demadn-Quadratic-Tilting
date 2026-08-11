@@ -145,6 +145,11 @@ class FittedTorchBaseline:
     epochs_completed: int
     best_validation_loss: float | None
 
+    def population_contract(self) -> dict[str, dict[str, object]]:
+        """Report the scaler populations observed by the fitted preprocessor."""
+
+        return self.preprocessor.population_contract()
+
     @property
     def target_scaler(self) -> FittedStandardScaler:
         return self.preprocessor.target_scaler

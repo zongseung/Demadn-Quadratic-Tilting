@@ -39,11 +39,23 @@ def _matrix(
     )
 
 
+def _population(times: np.ndarray, *, unit: str) -> dict[str, object]:
+    unique = np.unique(np.asarray(times).reshape(-1).astype("datetime64[ns]"))
+    return {
+        "count": int(unique.size),
+        "start": np.datetime_as_string(unique[0], unit="s"),
+        "end": np.datetime_as_string(unique[-1], unit="s"),
+        "unit": unit,
+    }
 @dataclass
 class _Fitted:
     factory: RecordingFactory
     train_years: tuple[int, ...]
+    population: dict[str, dict[str, object]]
     model_name: str = "recording"
+
+    def population_contract(self) -> dict[str, dict[str, object]]:
+        return self.population
 
     def predict(self, batch: ForecastMatrix) -> np.ndarray:
         self.factory.calls.append((self.train_years, int(str(batch.origins[0])[:4])))
@@ -59,7 +71,14 @@ class RecordingFactory:
     def fit(self, train: ForecastMatrix, validation: ForecastMatrix | None, seed: int) -> _Fitted:
         assert validation is None
         train_years = tuple(sorted({int(str(value)[:4]) for value in train.origins}))
-        return _Fitted(self, train_years)
+        return _Fitted(
+            self,
+            train_years,
+            {
+                "x": _population(train.origins, unit="daily-sample"),
+                "target": _population(train.target_times, unit="unique-hour"),
+            },
+        )
 
 
 @pytest.fixture

@@ -152,6 +152,7 @@ def test_sequence_fit_uses_train_only_standardization(tiny_forecast_matrix):
     )
     np.testing.assert_allclose(fitted.future_scaler.mean, train.future.mean(axis=(0, 1)))
     np.testing.assert_allclose(fitted.target_scaler.mean, train.target.mean())
+    assert fitted.population_contract() == fitted.preprocessor.population_contract()
     assert fitted.predict(validation).shape == (8, 24)
 
 

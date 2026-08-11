@@ -25,5 +25,8 @@ class FittedBaseline(Protocol):
 
     model_name: str
 
+    def population_contract(self) -> dict[str, dict[str, object]]:
+        """Return the actual timestamp populations used to fit all scalers."""
+
     def predict(self, batch: ForecastMatrix) -> np.ndarray:
         """Return finite predictions shaped ``(n_samples, 24)``."""

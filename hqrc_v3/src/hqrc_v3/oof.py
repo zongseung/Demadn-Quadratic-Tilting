@@ -19,9 +19,14 @@ import numpy as np
 import polars as pl
 
 from hqrc_v3.baselines.classical import predictions_to_frame
+from hqrc_v3.baselines.preprocessing import (
+    PopulationContract,
+    validate_population_contract,
+)
 from hqrc_v3.baselines.protocol import BaselineFactory, FittedBaseline
 from hqrc_v3.contracts import DataContractError, ForecastMatrix, validate_prediction_frame
 from hqrc_v3.features import feature_columns
+from hqrc_v3.provenance import ArtifactMismatch
 from hqrc_v3.residuals import PredictionCache
 from hqrc_v3.splits import AnnualFold, expanding_oof_folds, final_fold, select_fold_samples
 
@@ -89,6 +94,29 @@ def _factory_name(factory: BaselineFactory) -> str:
     if not isinstance(name, str) or not name.strip():
         raise DataContractError("BaselineFactory.name must be a non-blank string")
     return name
+
+
+def _fitted_population_contract(fitted: FittedBaseline) -> PopulationContract:
+    reporter = getattr(fitted, "population_contract", None)
+    if not callable(reporter):
+        raise DataContractError(
+            "fitted baseline must report its actual preprocessing population"
+        )
+    try:
+        reported = reporter()
+    except (TypeError, ValueError) as error:
+        raise DataContractError(
+            "fitted baseline returned an invalid preprocessing population"
+        ) from error
+    return validate_population_contract(reported)
+
+
+def _cached_population_contract(value: object) -> PopulationContract:
+    if value is None:
+        raise ArtifactMismatch(
+            "cached prediction artifact is missing fitted preprocessing population"
+        )
+    return validate_population_contract(value)
 
 
 def _require_hashes(artifact_hashes: Mapping[str, str]) -> dict[str, str]:
@@ -187,6 +215,7 @@ class OOFRunSummary:
 
     frames: tuple[pl.DataFrame, ...]
     combined_frame: pl.DataFrame
+    population_contracts: tuple[PopulationContract, ...]
     eval_years: tuple[int, ...]
     fit_count: int
     cache_hit_count: int
@@ -200,6 +229,10 @@ class OOFRunSummary:
             raise DataContractError("OOF summary eval_years must be exactly 2020 through 2023")
         if len(self.frames) != len(expected_folds):
             raise DataContractError("OOF summary requires exactly four prediction frames")
+        if len(self.population_contracts) != len(expected_folds):
+            raise DataContractError("OOF summary requires one population per fold")
+        for population in self.population_contracts:
+            validate_population_contract(population)
         if (
             isinstance(self.fit_count, bool)
             or isinstance(self.cache_hit_count, bool)
@@ -248,10 +281,13 @@ class OOFRunSummary:
         seed: int,
         fit_count: int,
         cache_hit_count: int,
+        population_contracts: list[PopulationContract],
     ) -> OOFRunSummary:
         expected_folds = expanding_oof_folds()
         if len(frames) != len(expected_folds):
             raise DataContractError("OOF summary requires exactly four prediction frames")
+        if len(population_contracts) != len(expected_folds):
+            raise DataContractError("OOF summary requires one population per fold")
         by_split: dict[str, pl.DataFrame] = {}
         for frame in frames:
             validated = validate_prediction_frame(frame)
@@ -282,6 +318,10 @@ class OOFRunSummary:
         return cls(
             frames=tuple(ordered),
             combined_frame=combined,
+            population_contracts=tuple(
+                validate_population_contract(population)
+                for population in population_contracts
+            ),
             eval_years=tuple(fold.eval_year for fold in expected_folds),
             fit_count=fit_count,
             cache_hit_count=cache_hit_count,
@@ -297,6 +337,7 @@ class OOFStreamResult:
 
     frames: tuple[pl.DataFrame, ...]
     combined_frame: pl.DataFrame
+    population_contracts: tuple[PopulationContract, ...]
     folds: tuple[AnnualFold, ...]
     fit_count: int
     cache_hit_count: int
@@ -311,6 +352,7 @@ class FinalBaselineResult:
 
     model: FittedBaseline
     frame: pl.DataFrame
+    population_contract: PopulationContract
 
     @property
     def fitted_model(self) -> FittedBaseline:
@@ -348,6 +390,7 @@ def generate_expanding_oof(
         seed=stream.seed,
         fit_count=stream.fit_count,
         cache_hit_count=stream.cache_hit_count,
+        population_contracts=list(stream.population_contracts),
     )
 
 
@@ -381,20 +424,24 @@ def generate_oof_stream(
         raise DataContractError("OOF stream folds must be a unique immutable OOF subset")
 
     frames: list[pl.DataFrame] = []
+    population_contracts: list[PopulationContract] = []
     fit_count = 0
     cache_hit_count = 0
     for fold in folds:
         key = cache_key(model, selected_feature_set, selected_seed, fold)
-        cached = cache.read(key, expected_hashes=hashes)
+        cached = cache.read_entry(key, expected_hashes=hashes)
         if cached is not None:
             frames.append(
                 _validate_context(
-                    cached,
+                    cached.frame,
                     fold=fold,
                     model=model,
                     feature_set=selected_feature_set,
                     seed=selected_seed,
                 )
+            )
+            population_contracts.append(
+                _cached_population_contract(cached.population_contract)
             )
             cache_hit_count += 1
             continue
@@ -403,6 +450,7 @@ def generate_oof_stream(
             outer_train, factory, validation_days
         )
         fitted = factory.fit(train, validation=validation, seed=selected_seed)
+        population = _fitted_population_contract(fitted)
         prediction = fitted.predict(evaluation)
         frame = predictions_to_frame(
             evaluation,
@@ -412,19 +460,29 @@ def generate_oof_stream(
             seed=selected_seed,
             fold=fold,
         )
+        cached_entry = cache.write_entry(
+            key,
+            frame,
+            hashes=hashes,
+            population_contract=population,
+        )
         frames.append(
             _validate_context(
-                cache.write(key, frame, hashes=hashes),
+                cached_entry.frame,
                 fold=fold,
                 model=model,
                 feature_set=selected_feature_set,
                 seed=selected_seed,
             )
         )
+        population_contracts.append(
+            _cached_population_contract(cached_entry.population_contract)
+        )
         fit_count += 1
     return OOFStreamResult(
         frames=tuple(frames),
         combined_frame=pl.concat(frames, how="vertical"),
+        population_contracts=tuple(population_contracts),
         folds=folds,
         model=model,
         feature_set=selected_feature_set,
@@ -452,6 +510,7 @@ def fit_final_baseline(
     outer_train, evaluation = _select_nonempty(matrix, fold)
     train, validation = _training_partitions(outer_train, factory, validation_days)
     fitted = factory.fit(train, validation=validation, seed=selected_seed)
+    population = _fitted_population_contract(fitted)
     frame = predictions_to_frame(
         evaluation,
         fitted.predict(evaluation),
@@ -469,6 +528,7 @@ def fit_final_baseline(
             feature_set=selected_feature_set,
             seed=selected_seed,
         ),
+        population_contract=population,
     )
 
 
@@ -477,6 +537,7 @@ class CachedFinalResult:
     """One final prediction frame with explicit fit/cache accounting."""
 
     frame: pl.DataFrame
+    population_contract: PopulationContract
     fit_count: int
     cache_hit_count: int
     model: str
@@ -493,6 +554,7 @@ class CachedFinalResult:
             feature_set=_require_feature_set(self.feature_set),
             seed=_require_seed(self.seed),
         )
+        validate_population_contract(self.population_contract)
 
 
 def generate_cached_final(
@@ -516,15 +578,18 @@ def generate_cached_final(
         raise TypeError("cache must be a PredictionCache")
     fold = final_fold()
     key = cache_key(model, selected_feature_set, selected_seed, fold)
-    cached = cache.read(key, expected_hashes=hashes)
+    cached = cache.read_entry(key, expected_hashes=hashes)
     if cached is not None:
         return CachedFinalResult(
             frame=_validate_context(
-                cached,
+                cached.frame,
                 fold=fold,
                 model=model,
                 feature_set=selected_feature_set,
                 seed=selected_seed,
+            ),
+            population_contract=_cached_population_contract(
+                cached.population_contract
             ),
             fit_count=0,
             cache_hit_count=1,
@@ -539,14 +604,22 @@ def generate_cached_final(
         seed=selected_seed,
         validation_days=validation_days,
     )
-    frame = cache.write(key, result.frame, hashes=hashes)
+    cached_entry = cache.write_entry(
+        key,
+        result.frame,
+        hashes=hashes,
+        population_contract=result.population_contract,
+    )
     return CachedFinalResult(
         frame=_validate_context(
-            frame,
+            cached_entry.frame,
             fold=fold,
             model=model,
             feature_set=selected_feature_set,
             seed=selected_seed,
+        ),
+        population_contract=_cached_population_contract(
+            cached_entry.population_contract
         ),
         fit_count=1,
         cache_hit_count=0,

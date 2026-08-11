@@ -30,6 +30,7 @@ from hqrc_v3.baselines.config import (
     PaperBaselineConfig,
     PaperBaselineConfigError,
 )
+from hqrc_v3.baselines.preprocessing import validate_population_contract
 from hqrc_v3.baselines.protocol import BaselineFactory
 from hqrc_v3.baselines.sequence import SequenceTrainingConfig, TorchBaselineFactory
 from hqrc_v3.contracts import (
@@ -557,7 +558,7 @@ def _timestamp_population(times: np.ndarray, *, unit: str) -> dict[str, object]:
     }
 
 
-def _preprocessing_populations(
+def _expected_preprocessing_populations(
     matrix: ForecastMatrix,
     folds: tuple[AnnualFold, ...],
     *,
@@ -565,7 +566,7 @@ def _preprocessing_populations(
     feature_sets: tuple[FeatureSet, ...],
     validation_days: int,
 ) -> list[dict[str, object]]:
-    """Derive the exact timestamp populations every fitted scaler must use."""
+    """Derive expectations used to audit fitted adapters' reported populations."""
 
     records: list[dict[str, object]] = []
     for model in models:
@@ -614,6 +615,89 @@ def _preprocessing_populations(
                     }
                 )
     return records
+
+
+def _verified_actual_preprocessing_populations(
+    actual_records: list[dict[str, object]],
+    expected_records: list[dict[str, object]],
+    *,
+    classical_seed: int,
+) -> list[dict[str, object]]:
+    """Verify fitted reports, then return actual populations for publication."""
+
+    expected_by_key: dict[tuple[str, str, str], dict[str, object]] = {}
+    for expected in expected_records:
+        if set(expected) != {"model", "feature_set", "split_id", "scalers"}:
+            raise DataContractError("expected preprocessing population schema is invalid")
+        key = (
+            str(expected["model"]),
+            str(expected["feature_set"]),
+            str(expected["split_id"]),
+        )
+        if key in expected_by_key:
+            raise DataContractError("expected preprocessing populations contain duplicates")
+        expected_by_key[key] = expected
+
+    actual_by_key: dict[
+        tuple[str, str, str], list[tuple[int, dict[str, dict[str, object]]]]
+    ] = {}
+    for actual in actual_records:
+        if set(actual) != {"model", "feature_set", "split_id", "seed", "scalers"}:
+            raise DataContractError("actual preprocessing population schema is invalid")
+        seed = actual["seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise DataContractError("actual preprocessing population seed is invalid")
+        key = (
+            str(actual["model"]),
+            str(actual["feature_set"]),
+            str(actual["split_id"]),
+        )
+        actual_by_key.setdefault(key, []).append(
+            (seed, validate_population_contract(actual["scalers"]))
+        )
+
+    if set(actual_by_key) != set(expected_by_key):
+        raise DataContractError(
+            "actual preprocessing population coverage differs from expected streams"
+        )
+
+    verified: list[dict[str, object]] = []
+    for expected in expected_records:
+        key = (
+            str(expected["model"]),
+            str(expected["feature_set"]),
+            str(expected["split_id"]),
+        )
+        reports = actual_by_key[key]
+        expected_seeds = PAPER_SEEDS if key[0] in _NEURAL_MODELS else (classical_seed,)
+        if sorted(seed for seed, _ in reports) != sorted(expected_seeds):
+            raise DataContractError(
+                "actual preprocessing population seeds differ from the requested streams"
+            )
+        first_population = reports[0][1]
+        if any(population != first_population for _, population in reports[1:]):
+            if key[0] in _NEURAL_MODELS:
+                raise DataContractError(
+                    "neural seeds report inconsistent preprocessing population"
+                )
+            raise DataContractError(
+                "repeated baseline fits report inconsistent preprocessing population"
+            )
+        expected_population = validate_population_contract(expected["scalers"])
+        if first_population != expected_population:
+            raise DataContractError(
+                "actual preprocessing population differs from the "
+                "matrix-derived expected population"
+            )
+        verified.append(
+            {
+                "model": key[0],
+                "feature_set": key[1],
+                "split_id": key[2],
+                "scalers": first_population,
+            }
+        )
+    return verified
 
 
 def _require_expected_coverage(value: object) -> dict[str, object]:
@@ -1254,7 +1338,7 @@ def _stage_preflight(
                 recorded_populations = (
                     expected_preprocessing_populations
                     if recorded_stage == stage
-                    else _preprocessing_populations(
+                    else _expected_preprocessing_populations(
                         matrix,
                         recorded_folds,
                         models=models,
@@ -1365,7 +1449,7 @@ def _run_paper_stage(
     expected_coverage = _expected_stage_coverage(
         normalized_matrices[selected_features[0]], folds
     )
-    expected_preprocessing_populations = _preprocessing_populations(
+    expected_preprocessing_populations = _expected_preprocessing_populations(
         normalized_matrices[selected_features[0]],
         folds,
         models=selected_models,
@@ -1413,6 +1497,7 @@ def _run_paper_stage(
         manifest, _, _, _ = preflight
         point_frames: list[pl.DataFrame] = []
         member_frames: list[pl.DataFrame] = []
+        actual_population_records: list[dict[str, object]] = []
         fit_count = 0
         cache_hit_count = 0
         for model in selected_models:
@@ -1457,6 +1542,24 @@ def _run_paper_stage(
                         )
                     fit_count += result.fit_count
                     cache_hit_count += result.cache_hit_count
+                    result_folds = result.folds if stage == "oof" else (final_fold(),)
+                    result_populations = (
+                        result.population_contracts
+                        if stage == "oof"
+                        else (result.population_contract,)
+                    )
+                    for fitted_fold, population in zip(
+                        result_folds, result_populations, strict=True
+                    ):
+                        actual_population_records.append(
+                            {
+                                "model": model,
+                                "feature_set": feature_set,
+                                "split_id": fitted_fold.split_id,
+                                "seed": seed,
+                                "scalers": population,
+                            }
+                        )
                     frame = result.combined_frame if stage == "oof" else result.frame
                     if model in _NEURAL_MODELS:
                         stream_members.append(frame)
@@ -1478,6 +1581,13 @@ def _run_paper_stage(
             else _empty_prediction_frame()
         )
         point = pl.concat(point_frames, how="vertical")
+        verified_preprocessing_populations = (
+            _verified_actual_preprocessing_populations(
+                actual_population_records,
+                expected_preprocessing_populations,
+                classical_seed=classical_seed,
+            )
+        )
         _validate_published_frames(
             members,
             point,
@@ -1491,7 +1601,7 @@ def _run_paper_stage(
         stage_record: dict[str, Any] = {
             "eval_years": list(eval_years),
             "expected_coverage": expected_coverage,
-            "preprocessing_populations": expected_preprocessing_populations,
+            "preprocessing_populations": verified_preprocessing_populations,
             "split_ids": list(split_ids),
             "streams": _stream_records(
                 selected_models, selected_features, classical_seed

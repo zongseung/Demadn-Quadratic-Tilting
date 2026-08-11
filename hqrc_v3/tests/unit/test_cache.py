@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import multiprocessing
 import os
 from contextlib import contextmanager
@@ -203,6 +204,40 @@ def test_cache_returns_the_existing_frame_only_for_identical_hashes(tmp_path):
     assert repeated.equals(written)
     assert (tmp_path / "xgb-B0-2020.parquet").is_file()
     assert (tmp_path / "xgb-B0-2020.json").is_file()
+
+
+def test_cache_rejects_parquet_rewrite_even_when_metadata_is_untouched(tmp_path):
+    cache = PredictionCache(tmp_path)
+    cache.write("bound", _prediction_frame(), hashes={"config": "a", "data": "d"})
+    parquet_path = tmp_path / "bound.parquet"
+    pl.read_parquet(parquet_path).with_columns(
+        (pl.col("predicted_mw") + 1.0).alias("predicted_mw")
+    ).write_parquet(parquet_path)
+
+    with pytest.raises(ArtifactMismatch, match="parquet digest"):
+        cache.read("bound", expected_hashes={"config": "a", "data": "d"})
+
+
+@pytest.mark.parametrize("mutation", ["missing-population", "old-schema"])
+def test_cache_rejects_missing_population_field_and_old_metadata_schema(
+    tmp_path, mutation
+):
+    cache = PredictionCache(tmp_path)
+    hashes = {"config": "a", "data": "d"}
+    cache.write("schema", _prediction_frame(), hashes=hashes)
+    metadata_path = tmp_path / "schema.json"
+    if mutation == "missing-population":
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        del metadata["population_contract"]
+        metadata_path.write_text(
+            json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    else:
+        metadata_path.write_text('{"hashes":{"config":"a","data":"d"}}', encoding="utf-8")
+
+    with pytest.raises(ArtifactMismatch, match="metadata"):
+        cache.read("schema", expected_hashes=hashes)
 
 
 @pytest.mark.parametrize("key", ["../escape", "nested/key", "..", ""])

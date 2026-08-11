@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -18,6 +19,22 @@ TARGET_SCALER_KIND = "standard-population"
 FEATURE_SCALER_KIND = "standard-population-featurewise"
 SCALER_FIT_PARTITION = "estimator-fit-only"
 
+PopulationContract = dict[str, dict[str, object]]
+
+
+def _canonical_population_timestamp(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise DataContractError("scaler population timestamp must be a non-empty string")
+    try:
+        parsed = np.datetime64(value, "ns")
+    except (TypeError, ValueError) as error:
+        raise DataContractError("scaler population timestamp must be an ISO datetime") from error
+    if np.isnat(parsed) or np.datetime_as_string(parsed, unit="s") != value:
+        raise DataContractError(
+            "scaler population timestamp must use canonical second-resolution ISO format"
+        )
+    return value
+
 
 @dataclass(frozen=True)
 class ScalerPopulation:
@@ -31,7 +48,9 @@ class ScalerPopulation:
     def __post_init__(self) -> None:
         if isinstance(self.count, bool) or not isinstance(self.count, int) or self.count <= 0:
             raise DataContractError("scaler population count must be a positive integer")
-        if not self.start or not self.end or self.start > self.end:
+        start = _canonical_population_timestamp(self.start)
+        end = _canonical_population_timestamp(self.end)
+        if start > end:
             raise DataContractError("scaler population range must be non-empty and ordered")
         if self.unit not in {"daily-sample", "unique-hour"}:
             raise DataContractError("unknown scaler population unit")
@@ -43,6 +62,39 @@ class ScalerPopulation:
             "end": self.end,
             "unit": self.unit,
         }
+
+
+def validate_population_contract(value: object) -> PopulationContract:
+    """Return a detached canonical scaler-population contract.
+
+    This validates the value reported by the fitted adapter itself.  Callers
+    must not reconstruct this record from a candidate training matrix and call
+    the reconstruction an observed fit population.
+    """
+
+    if not isinstance(value, Mapping) or not value:
+        raise DataContractError("fitted preprocessing population must be a non-empty mapping")
+    if any(not isinstance(name, str) or not name.strip() for name in value):
+        raise DataContractError("preprocessing scaler names must be non-blank strings")
+    canonical: PopulationContract = {}
+    for scaler_name, raw_population in sorted(value.items()):
+        if not isinstance(raw_population, Mapping) or set(raw_population) != {
+            "count",
+            "start",
+            "end",
+            "unit",
+        }:
+            raise DataContractError(
+                f"preprocessing population for {scaler_name!r} has an invalid schema"
+            )
+        population = ScalerPopulation(
+            count=raw_population["count"],  # type: ignore[arg-type]
+            start=raw_population["start"],  # type: ignore[arg-type]
+            end=raw_population["end"],  # type: ignore[arg-type]
+            unit=raw_population["unit"],  # type: ignore[arg-type]
+        )
+        canonical[scaler_name] = population.to_dict()
+    return canonical
 
 
 def _timestamp_string(value: np.datetime64) -> str:
@@ -255,11 +307,13 @@ class FittedClassicalPreprocessor:
     x_population: ScalerPopulation
     target_population: ScalerPopulation
 
-    def population_contract(self) -> dict[str, dict[str, object]]:
-        return {
-            "x": self.x_population.to_dict(),
-            "target": self.target_population.to_dict(),
-        }
+    def population_contract(self) -> PopulationContract:
+        return validate_population_contract(
+            {
+                "x": self.x_population.to_dict(),
+                "target": self.target_population.to_dict(),
+            }
+        )
 
     def transform_features(self, matrix: ForecastMatrix) -> np.ndarray:
         self._require_schema(matrix)
@@ -354,12 +408,14 @@ class FittedSequencePreprocessor:
 
         return self.calendar_scaler
 
-    def population_contract(self) -> dict[str, dict[str, object]]:
-        return {
-            "target": self.target_population.to_dict(),
-            "weather": self.weather_population.to_dict(),
-            "calendar": self.calendar_population.to_dict(),
-        }
+    def population_contract(self) -> PopulationContract:
+        return validate_population_contract(
+            {
+                "target": self.target_population.to_dict(),
+                "weather": self.weather_population.to_dict(),
+                "calendar": self.calendar_population.to_dict(),
+            }
+        )
 
     def transform_inputs(self, matrix: ForecastMatrix) -> tuple[np.ndarray, np.ndarray]:
         _require_matching_schema(
@@ -463,10 +519,12 @@ __all__ = [
     "FittedSequencePreprocessor",
     "FittedStandardScaler",
     "HISTORY_HOURS",
+    "PopulationContract",
     "SCALER_FIT_PARTITION",
     "ScalerPopulation",
     "TARGET_SCALER_KIND",
     "fit_classical_preprocessor",
     "fit_sequence_preprocessor",
     "full_path_design",
+    "validate_population_contract",
 ]

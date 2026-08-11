@@ -161,6 +161,25 @@ def test_real_causal_matrix_lightgbm_inverse_mw_and_manifest_reload(tmp_path: Pa
         }
     ]
 
+    cache_metadata_paths = list((tmp_path / "cache").glob("prediction-*.json"))
+    assert len(cache_metadata_paths) == 1
+    cache_metadata = json.loads(cache_metadata_paths[0].read_text(encoding="utf-8"))
+    assert cache_metadata["schema_version"] == 2
+    assert len(cache_metadata["parquet_sha256"]) == 64
+    assert cache_metadata["population_contract"] == manifest["stages"]["oof"][
+        "preprocessing_populations"
+    ][0]["scalers"]
+
+    first.members_path.unlink()
+    first.point_path.unlink()
+    first.manifest_path.unlink()
+
     reloaded = run_paper_oof_stage(**arguments)
     assert reloaded.fit_count == 0
     assert reloaded.cache_hit_count == 1
+    reloaded_manifest = json.loads(
+        reloaded.manifest_path.read_text(encoding="utf-8")
+    )
+    assert reloaded_manifest["stages"]["oof"][
+        "preprocessing_populations"
+    ] == manifest["stages"]["oof"]["preprocessing_populations"]
