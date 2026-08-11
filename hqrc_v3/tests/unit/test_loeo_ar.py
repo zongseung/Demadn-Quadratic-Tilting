@@ -9,10 +9,13 @@ from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 
-import hqrc_v3.diagnostics.loeo_ar as loeo_ar_module
 import numpy as np
 import polars as pl
 import pytest
+from test_loeo_diagnostics import CONTEXT
+from test_loeo_diagnostics import source as source_fixture
+
+import hqrc_v3.diagnostics.loeo_ar as loeo_ar_module
 from hqrc_v3.correction_source import ValidatedCorrectionSource
 from hqrc_v3.diagnostics.ar import (
     calibrate_beta_prior,
@@ -27,8 +30,6 @@ from hqrc_v3.diagnostics.loeo_ar import (
     prepare_loeo_ar_proposal_set,
 )
 from hqrc_v3.provenance import file_sha256
-from test_loeo_diagnostics import CONTEXT
-from test_loeo_diagnostics import source as source_fixture
 
 base_source = source_fixture
 
@@ -108,6 +109,115 @@ def _prepare(source: ValidatedCorrectionSource, tmp_path: Path):
     publication = publish_loeo_universe(source, CONTEXT, output_dir=loeo_dir)
     proposal = prepare_loeo_ar_proposal_set(source, publication, output_dir=tmp_path / "loeo-ar")
     return publication, proposal
+
+
+def _tree_snapshot(root: Path) -> dict[str, tuple[object, ...]]:
+    snapshot: dict[str, tuple[object, ...]] = {}
+
+    def record(path: Path) -> None:
+        relative = path.relative_to(root).as_posix() if path != root else "."
+        identity = path.lstat()
+        if stat.S_ISDIR(identity.st_mode):
+            snapshot[relative] = ("directory", identity.st_ino)
+            for child in sorted(path.iterdir(), key=lambda item: item.name):
+                record(child)
+        elif stat.S_ISREG(identity.st_mode):
+            snapshot[relative] = ("regular", identity.st_ino, path.read_bytes())
+        elif stat.S_ISLNK(identity.st_mode):
+            snapshot[relative] = ("symlink", os.readlink(path))
+        else:
+            snapshot[relative] = ("special", stat.S_IFMT(identity.st_mode))
+
+    record(root)
+    return snapshot
+
+
+def _single_stage(root: Path, prefix: str) -> Path:
+    stages = [path for path in root.iterdir() if path.name.startswith(prefix)]
+    assert len(stages) == 1
+    return stages[0]
+
+
+def _leave_proposal_stage(
+    source: ValidatedCorrectionSource,
+    publication,
+    output: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    complete: bool,
+) -> Path:
+    output.mkdir()
+    if complete:
+        original_replace = loeo_ar_module.os.replace
+
+        def interrupt_generation(source_path, destination_path):
+            if Path(destination_path).name == "generation":
+                raise OSError("leave complete proposal stage")
+            return original_replace(source_path, destination_path)
+
+        monkeypatch.setattr(loeo_ar_module.os, "replace", interrupt_generation)
+    else:
+        original_writer = loeo_ar_module.write_ar_diagnostics
+        calls = 0
+
+        def interrupt_second_proposal(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("leave incomplete proposal stage")
+            return original_writer(*args, **kwargs)
+
+        monkeypatch.setattr(loeo_ar_module, "write_ar_diagnostics", interrupt_second_proposal)
+    with pytest.raises(OSError, match="leave .* proposal stage"):
+        prepare_loeo_ar_proposal_set(source, publication, output_dir=output)
+    if complete:
+        monkeypatch.setattr(loeo_ar_module.os, "replace", original_replace)
+    else:
+        monkeypatch.setattr(loeo_ar_module, "write_ar_diagnostics", original_writer)
+    return _single_stage(output, ".staging-")
+
+
+def _leave_approval_stage(
+    source: ValidatedCorrectionSource,
+    publication,
+    proposal,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    complete: bool,
+) -> Path:
+    if complete:
+        original_replace = loeo_ar_module.os.replace
+
+        def interrupt_approval(source_path, destination_path):
+            if Path(destination_path).name == "approval":
+                raise OSError("leave complete approval stage")
+            return original_replace(source_path, destination_path)
+
+        monkeypatch.setattr(loeo_ar_module.os, "replace", interrupt_approval)
+    else:
+        original_approve = loeo_ar_module.approve_calibration
+        calls = 0
+
+        def interrupt_second_approval(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("leave incomplete approval stage")
+            return original_approve(*args, **kwargs)
+
+        monkeypatch.setattr(loeo_ar_module, "approve_calibration", interrupt_second_approval)
+    with pytest.raises(OSError, match="leave .* approval stage"):
+        approve_loeo_ar_proposal_set(
+            source,
+            publication,
+            output_dir=proposal.output_dir,
+            confirm_proposal_set_sha256=proposal.proposal_set_sha256,
+        )
+    if complete:
+        monkeypatch.setattr(loeo_ar_module.os, "replace", original_replace)
+    else:
+        monkeypatch.setattr(loeo_ar_module, "approve_calibration", original_approve)
+    return _single_stage(proposal.generation_dir, ".approval-staging-")
 
 
 def test_prepare_publishes_exactly_ten_training_only_unapproved_proposals_and_plots(
@@ -488,3 +598,194 @@ def test_approval_interruption_retries_and_missing_confirmation_is_a_type_error(
     assert approved_path.is_file()
     approved = load_approved_loeo_ar_set(source, publication, output_dir=proposal.output_dir)
     assert len(approved.calibrations) == 10
+
+
+@pytest.mark.parametrize("target_exists", [False, True])
+def test_publication_lock_rejects_symlink_without_touching_target(
+    tmp_path: Path, target_exists: bool
+):
+    root = tmp_path / "publication"
+    root.mkdir()
+    target = tmp_path / "outside-lock"
+    if target_exists:
+        target.write_bytes(b"outside evidence")
+    (root / ".loeo-ar.lock").symlink_to(target)
+    before = target.read_bytes() if target_exists else None
+
+    with pytest.raises(LOEOARProposalError, match="lock|unsafe"):
+        with loeo_ar_module._publication_lock(root):
+            pytest.fail("symlink lock was acquired")
+
+    assert target.exists() is target_exists
+    if target_exists:
+        assert target.read_bytes() == before
+
+
+@pytest.mark.parametrize("target_exists", [False, True])
+def test_approval_entry_symlink_is_preserved_and_target_untouched(
+    source: ValidatedCorrectionSource,
+    tmp_path: Path,
+    target_exists: bool,
+):
+    publication, proposal = _prepare(source, tmp_path)
+    target = tmp_path / "outside-approval"
+    if target_exists:
+        target.mkdir()
+        (target / "evidence").write_bytes(b"outside evidence")
+    approval = proposal.generation_dir / "approval"
+    approval.symlink_to(target, target_is_directory=True)
+    target_state = _tree_snapshot(target) if target_exists else None
+
+    with pytest.raises(LOEOARProposalError, match="approval|unsafe"):
+        approve_loeo_ar_proposal_set(
+            source,
+            publication,
+            output_dir=proposal.output_dir,
+            confirm_proposal_set_sha256=proposal.proposal_set_sha256,
+        )
+
+    assert approval.is_symlink()
+    assert target.exists() is target_exists
+    if target_exists:
+        assert _tree_snapshot(target) == target_state
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_fresh_prepare_resumes_matching_stage_without_deleting_verified_files(
+    source: ValidatedCorrectionSource,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    complete: bool,
+):
+    publication = publish_loeo_universe(source, CONTEXT, output_dir=tmp_path / "loeo")
+    output = tmp_path / "loeo-ar"
+    stage = _leave_proposal_stage(source, publication, output, monkeypatch, complete=complete)
+    identity_raw = (stage / "STAGE.json").read_bytes()
+    assert identity_raw == _canonical(json.loads(identity_raw))
+    preserved = next((stage / "proposals").glob("*.json"))
+    preserved_inode = preserved.stat().st_ino
+    preserved_bytes = preserved.read_bytes()
+
+    recovered = prepare_loeo_ar_proposal_set(source, publication, output_dir=output)
+
+    recovered_path = recovered.generation_dir / "proposals" / preserved.name
+    assert recovered_path.stat().st_ino == preserved_inode
+    assert recovered_path.read_bytes() == preserved_bytes
+    assert not any(path.name.startswith(".staging-") for path in output.iterdir())
+
+
+@pytest.mark.parametrize("mutation", ["foreign", "unknown", "symlink"])
+def test_fresh_prepare_preserves_foreign_or_unsafe_stage(
+    source: ValidatedCorrectionSource,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+):
+    publication = publish_loeo_universe(source, CONTEXT, output_dir=tmp_path / "loeo")
+    output = tmp_path / "loeo-ar"
+    stage = _leave_proposal_stage(source, publication, output, monkeypatch, complete=False)
+    if mutation == "foreign":
+        identity = json.loads((stage / "STAGE.json").read_bytes())
+        identity["stage_identity_sha256"] = "0" * 64
+        _write_canonical(stage / "STAGE.json", identity)
+    elif mutation == "unknown":
+        (stage / "unexpected").write_bytes(b"foreign evidence")
+    else:
+        target = tmp_path / "outside-stage"
+        target.write_bytes(b"outside evidence")
+        (stage / "COMPLETE").symlink_to(target)
+    before = _tree_snapshot(stage)
+
+    with pytest.raises(LOEOARProposalError, match="stage|staging|identity|unsafe|preserved"):
+        prepare_loeo_ar_proposal_set(source, publication, output_dir=output)
+
+    assert _tree_snapshot(stage) == before
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_fresh_approval_resumes_matching_stage_without_deleting_verified_files(
+    source: ValidatedCorrectionSource,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    complete: bool,
+):
+    publication, proposal = _prepare(source, tmp_path)
+    stage = _leave_approval_stage(source, publication, proposal, monkeypatch, complete=complete)
+    identity_raw = (stage / "STAGE.json").read_bytes()
+    assert identity_raw == _canonical(json.loads(identity_raw))
+    preserved = next(stage.glob("*.json"))
+    while preserved.name in {"STAGE.json", "approved-set.json"}:
+        preserved = next(
+            path
+            for path in stage.glob("*.json")
+            if path.name
+            not in {
+                "STAGE.json",
+                "approved-set.json",
+            }
+        )
+    preserved_inode = preserved.stat().st_ino
+    preserved_bytes = preserved.read_bytes()
+
+    approved_path = approve_loeo_ar_proposal_set(
+        source,
+        publication,
+        output_dir=proposal.output_dir,
+        confirm_proposal_set_sha256=proposal.proposal_set_sha256,
+    )
+
+    recovered_path = approved_path.parent / preserved.name
+    assert recovered_path.stat().st_ino == preserved_inode
+    assert recovered_path.read_bytes() == preserved_bytes
+
+
+def test_wrong_confirmation_preserves_preexisting_approval_stage(
+    source: ValidatedCorrectionSource,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    publication, proposal = _prepare(source, tmp_path)
+    stage = _leave_approval_stage(source, publication, proposal, monkeypatch, complete=False)
+    before = _tree_snapshot(stage)
+
+    with pytest.raises(LOEOARProposalError, match="confirmation"):
+        approve_loeo_ar_proposal_set(
+            source,
+            publication,
+            output_dir=proposal.output_dir,
+            confirm_proposal_set_sha256="0" * 64,
+        )
+
+    assert _tree_snapshot(stage) == before
+
+
+@pytest.mark.parametrize("mutation", ["foreign", "unknown", "symlink"])
+def test_fresh_approval_preserves_foreign_or_unsafe_stage(
+    source: ValidatedCorrectionSource,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+):
+    publication, proposal = _prepare(source, tmp_path)
+    stage = _leave_approval_stage(source, publication, proposal, monkeypatch, complete=False)
+    if mutation == "foreign":
+        identity = json.loads((stage / "STAGE.json").read_bytes())
+        identity["stage_identity_sha256"] = "0" * 64
+        _write_canonical(stage / "STAGE.json", identity)
+    elif mutation == "unknown":
+        (stage / "unexpected").write_bytes(b"foreign evidence")
+    else:
+        target = tmp_path / "outside-approval-stage"
+        target.write_bytes(b"outside evidence")
+        (stage / "COMPLETE").symlink_to(target)
+    before = _tree_snapshot(stage)
+
+    with pytest.raises(LOEOARProposalError, match="stage|staging|identity|unsafe|preserved"):
+        approve_loeo_ar_proposal_set(
+            source,
+            publication,
+            output_dir=proposal.output_dir,
+            confirm_proposal_set_sha256=proposal.proposal_set_sha256,
+        )
+
+    assert _tree_snapshot(stage) == before

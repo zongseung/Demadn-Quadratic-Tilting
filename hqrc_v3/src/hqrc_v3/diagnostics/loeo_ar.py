@@ -5,7 +5,7 @@ from __future__ import annotations
 import fcntl
 import os
 import re
-import tempfile
+import stat
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -65,9 +65,14 @@ from hqrc_v3.provenance import ArtifactMismatch, file_sha256
 
 _SCHEMA_VERSION = "hqrc-v3.loeo-ar-set.v1"
 _APPROVED_SCHEMA_VERSION = "hqrc-v3.loeo-ar-approved-set.v1"
+_PROPOSAL_STAGE_SCHEMA_VERSION = "hqrc-v3.loeo-ar-proposal-stage.v1"
+_APPROVAL_STAGE_SCHEMA_VERSION = "hqrc-v3.loeo-ar-approval-stage.v1"
+_STAGE_FILENAME = "STAGE.json"
 _ROOT_NAMESPACE = frozenset({".loeo-ar.lock", "generation", "current.json", ".current.tmp"})
-_GENERATION_NAMESPACE = frozenset({"proposals", "plots", "proposal-set.json", "COMPLETE"})
-_APPROVAL_NAMESPACE = frozenset({"approved-set.json", "COMPLETE"})
+_GENERATION_NAMESPACE = frozenset(
+    {"proposals", "plots", "proposal-set.json", "COMPLETE", _STAGE_FILENAME}
+)
+_APPROVAL_NAMESPACE = frozenset({"approved-set.json", "COMPLETE", _STAGE_FILENAME})
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 _SET_TOKEN = object()
 
@@ -257,6 +262,49 @@ def _source_context(
         loeo_manifest_sha256=file_sha256(publication.manifest_path),
         universe_sha256=publication.universe_sha256,
     )
+
+
+def _stage_payload(unsigned: dict[str, object]) -> dict[str, object]:
+    return {**unsigned, "stage_identity_sha256": _sha_json(unsigned)}
+
+
+def _proposal_stage_identity(publication: LOEOPublication) -> dict[str, object]:
+    return _stage_payload(
+        {
+            "causal": False,
+            "context": _context_payload(publication.context),
+            "loeo_generation_dir": publication.generation_dir.resolve().as_posix(),
+            "loeo_manifest_path": publication.manifest_path.resolve().as_posix(),
+            "loeo_manifest_sha256": file_sha256(publication.manifest_path),
+            "loeo_output_dir": publication.output_dir.resolve().as_posix(),
+            "occurrence_ids": list(publication.occurrence_ids),
+            "schema_version": _PROPOSAL_STAGE_SCHEMA_VERSION,
+            "stage_kind": "proposal",
+            "universe_sha256": publication.universe_sha256,
+        }
+    )
+
+
+def _approval_stage_identity(prepared: LOEOARProposalSet) -> dict[str, object]:
+    return _stage_payload(
+        {
+            "occurrence_ids": list(prepared.occurrence_ids),
+            "proposal_generation_dir": prepared.generation_dir.resolve().as_posix(),
+            "proposal_set_sha256": prepared.proposal_set_sha256,
+            "schema_version": _APPROVAL_STAGE_SCHEMA_VERSION,
+            "stage_kind": "approval",
+        }
+    )
+
+
+def _stage_path(parent: Path, prefix: str, identity: dict[str, object]) -> Path:
+    return parent / f"{prefix}{identity['stage_identity_sha256']}"
+
+
+def _validate_stage_identity(path: Path, expected: dict[str, object], label: str) -> None:
+    actual = _read_json(path / _STAGE_FILENAME, f"{label} identity")
+    if actual != expected:
+        raise LOEOARProposalError(f"{label} identity differs and is preserved")
 
 
 def _summary(
@@ -464,14 +512,29 @@ def _calibration_from_summary(value: object) -> ARCalibration:
         raise LOEOARProposalError("LOEO AR calibration summary is invalid") from error
 
 
-def _validate_generation_namespace(generation: Path) -> None:
+def _validate_generation_namespace(
+    generation: Path, *, allow_approval_staging: bool = False
+) -> None:
     _require_directory(generation, "LOEO AR generation")
     entries = {path.name: path for path in generation.iterdir()}
-    allowed = _GENERATION_NAMESPACE | {"approval"}
-    if set(entries) not in {_GENERATION_NAMESPACE, allowed}:
+    approval_staging = {name for name in entries if name.startswith(".approval-staging-")}
+    stable = set(entries) - approval_staging
+    allowed = set(_GENERATION_NAMESPACE) | {"approval"}
+    if (
+        (stable != set(_GENERATION_NAMESPACE) and stable != allowed)
+        or len(approval_staging) > 1
+        or (approval_staging and not allow_approval_staging)
+        or (approval_staging and "approval" in stable)
+    ):
         raise LOEOARProposalError("LOEO AR generation contains unknown or partial entries")
-    for name in ("proposal-set.json", "COMPLETE"):
+    for name in ("proposal-set.json", "COMPLETE", _STAGE_FILENAME):
         _require_file(generation / name, f"LOEO AR generation {name}")
+    for name in ("proposals", "plots"):
+        _require_directory(generation / name, f"LOEO AR generation {name}")
+    if "approval" in entries:
+        _require_directory(entries["approval"], "LOEO AR approval namespace")
+    for name in approval_staging:
+        _require_directory(entries[name], "LOEO AR approval staging")
 
 
 def _validate_generation(
@@ -480,8 +543,12 @@ def _validate_generation(
     generation: Path,
     *,
     recompute: bool,
+    allow_approval_staging: bool = False,
 ) -> LOEOARProposalSet:
-    _validate_generation_namespace(generation)
+    _validate_generation_namespace(generation, allow_approval_staging=allow_approval_staging)
+    _validate_stage_identity(
+        generation, _proposal_stage_identity(publication), "LOEO AR proposal stage"
+    )
     payload = _read_json(generation / "proposal-set.json", "LOEO AR proposal set")
     complete = _read_json(generation / "COMPLETE", "LOEO AR completion marker")
     _validate_set_schema(payload)
@@ -619,14 +686,35 @@ def _root_entries(root: Path) -> dict[str, Path]:
 @contextmanager
 def _publication_lock(root: Path) -> Iterator[None]:
     lock_path = root / ".loeo-ar.lock"
-    if lock_path.exists():
-        _require_file(lock_path, "LOEO AR publication lock")
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    try:
+        existing_mode = lock_path.lstat().st_mode
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise LOEOARProposalError("LOEO AR publication lock is unsafe") from error
+    else:
+        if stat.S_ISLNK(existing_mode) or not stat.S_ISREG(existing_mode):
+            raise LOEOARProposalError("LOEO AR publication lock is unsafe")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise LOEOARProposalError("LOEO AR publication lock is unsafe") from error
+    locked = False
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise LOEOARProposalError("LOEO AR publication lock is unsafe")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
         try:
             yield
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            locked = False
+    finally:
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _write_pointer(root: Path, proposal_set_sha256: str) -> None:
@@ -651,43 +739,6 @@ def _validate_pointer(root: Path, proposal_set_sha256: str) -> None:
         raise LOEOARProposalError("LOEO AR current pointer differs")
 
 
-def _safe_remove_staging(path: Path, occurrence_ids: tuple[str, ...]) -> None:
-    """Remove only a fully inspected, incomplete staging tree created by this module."""
-
-    _require_directory(path, "LOEO AR staging directory")
-    entries = {child.name: child for child in path.iterdir()}
-    if not set(entries).issubset(_GENERATION_NAMESPACE):
-        raise LOEOARProposalError("LOEO AR staging evidence is invalid and preserved")
-    files: list[Path] = []
-    directories: list[Path] = []
-    for name in ("proposal-set.json", "COMPLETE"):
-        if child := entries.get(name):
-            _require_file(child, f"LOEO AR staging {name}")
-            files.append(child)
-    expected_names = {
-        "proposals": {f"{item}.json" for item in occurrence_ids}
-        | {_proposal_lock_name(item) for item in occurrence_ids},
-        "plots": {f"{item}.svg" for item in occurrence_ids},
-    }
-    for name, allowed_names in expected_names.items():
-        child = entries.get(name)
-        if child is None:
-            continue
-        _require_directory(child, f"LOEO AR staging {name}")
-        artifacts = {artifact.name: artifact for artifact in child.iterdir()}
-        if not set(artifacts).issubset(allowed_names):
-            raise LOEOARProposalError("LOEO AR staging evidence is invalid and preserved")
-        for artifact in artifacts.values():
-            _require_file(artifact, f"LOEO AR staging {name} artifact")
-            files.append(artifact)
-        directories.append(child)
-    for artifact in files:
-        artifact.unlink()
-    for directory in directories:
-        directory.rmdir()
-    path.rmdir()
-
-
 def _load_prepared_internal(
     source: ValidatedCorrectionSource,
     publication: LOEOPublication,
@@ -695,6 +746,7 @@ def _load_prepared_internal(
     *,
     recompute: bool,
     require_pointer: bool,
+    allow_approval_staging: bool = False,
 ) -> LOEOARProposalSet:
     entries = _root_entries(root)
     staging = [path for name, path in entries.items() if name.startswith(".staging-")]
@@ -704,7 +756,13 @@ def _load_prepared_internal(
     if require_pointer and set(entries) != allowed:
         raise LOEOARProposalError("LOEO AR publication is partial")
     generation = root / "generation"
-    prepared = _validate_generation(source, publication, generation, recompute=recompute)
+    prepared = _validate_generation(
+        source,
+        publication,
+        generation,
+        recompute=recompute,
+        allow_approval_staging=allow_approval_staging,
+    )
     if require_pointer:
         _validate_pointer(root, prepared.proposal_set_sha256)
     return prepared
@@ -714,11 +772,36 @@ def _build_generation(
     source: ValidatedCorrectionSource,
     publication: LOEOPublication,
     staging: Path,
+    identity: dict[str, object],
 ) -> str:
+    _require_directory(staging, "LOEO AR staging directory")
+    _validate_stage_identity(staging, identity, "LOEO AR proposal stage")
+    staging_entries = {path.name: path for path in staging.iterdir()}
+    if not set(staging_entries).issubset(_GENERATION_NAMESPACE):
+        raise LOEOARProposalError("LOEO AR staging evidence is invalid and preserved")
+    for name in ("proposal-set.json", "COMPLETE"):
+        if name in staging_entries:
+            _require_file(staging_entries[name], f"LOEO AR staging {name}")
     proposals = staging / "proposals"
     plots = staging / "plots"
-    proposals.mkdir(mode=0o700)
-    plots.mkdir(mode=0o700)
+    for directory, label in ((proposals, "proposals"), (plots, "plots")):
+        if directory.name in staging_entries:
+            _require_directory(directory, f"LOEO AR staging {label}")
+        else:
+            directory.mkdir(mode=0o700)
+    proposal_names = {f"{item}.json" for item in publication.occurrence_ids} | {
+        _proposal_lock_name(item) for item in publication.occurrence_ids
+    }
+    plot_names = {f"{item}.svg" for item in publication.occurrence_ids}
+    for directory, allowed, label in (
+        (proposals, proposal_names, "proposal"),
+        (plots, plot_names, "plot"),
+    ):
+        artifacts = {path.name: path for path in directory.iterdir()}
+        if not set(artifacts).issubset(allowed):
+            raise LOEOARProposalError("LOEO AR staging evidence is invalid and preserved")
+        for artifact in artifacts.values():
+            _require_file(artifact, f"LOEO AR staging {label} artifact")
     entries: list[dict[str, object]] = []
     diagnostic_context: EventResidualContext | None = None
     for held_out in publication.occurrence_ids:
@@ -738,17 +821,33 @@ def _build_generation(
             context=material.diagnostic_context,
         )
         plot_path = plots / f"{held_out}.svg"
-        with plot_path.open("xb") as destination:
-            destination.write(material.plot)
-            destination.flush()
-            os.fsync(destination.fileno())
+        if plot_path.exists():
+            _require_file(plot_path, f"LOEO AR staged plot {held_out}")
+            if plot_path.read_bytes() != material.plot:
+                raise LOEOARProposalError("LOEO AR staged plot differs and is preserved")
+        else:
+            with plot_path.open("xb") as destination:
+                destination.write(material.plot)
+                destination.flush()
+                os.fsync(destination.fileno())
         entries.append(_proposal_entry(material, proposal_path, plot_path))
     assert diagnostic_context is not None
     _fsync_directory(proposals)
     _fsync_directory(plots)
     payload = _set_payload(publication, diagnostic_context, entries)
-    _write_json(staging / "proposal-set.json", payload)
-    _write_json(staging / "COMPLETE", {"proposal_set_sha256": payload["proposal_set_sha256"]})
+    proposal_set_path = staging / "proposal-set.json"
+    if proposal_set_path.exists():
+        if _read_json(proposal_set_path, "LOEO AR staged proposal set") != payload:
+            raise LOEOARProposalError("LOEO AR staged proposal set differs and is preserved")
+    else:
+        _write_json(proposal_set_path, payload)
+    complete_payload = {"proposal_set_sha256": payload["proposal_set_sha256"]}
+    complete_path = staging / "COMPLETE"
+    if complete_path.exists():
+        if _read_json(complete_path, "LOEO AR staged completion marker") != complete_payload:
+            raise LOEOARProposalError("LOEO AR staged completion differs and is preserved")
+    else:
+        _write_json(complete_path, complete_payload)
     _fsync_directory(staging)
     return str(payload["proposal_set_sha256"])
 
@@ -768,36 +867,42 @@ def prepare_loeo_ar_proposal_set(
     else:
         root.mkdir(parents=True, mode=0o700)
     with _publication_lock(root):
+        identity = _proposal_stage_identity(publication)
+        staging_path = _stage_path(root, ".staging-", identity)
         entries = _root_entries(root)
         staging = [path for name, path in entries.items() if name.startswith(".staging-")]
         if len(staging) > 1:
             raise LOEOARProposalError("LOEO AR publication has ambiguous staging evidence")
-        if staging:
-            _safe_remove_staging(staging[0], publication.occurrence_ids)
-            entries = _root_entries(root)
-        if (root / "generation").exists():
+        if staging and staging[0] != staging_path:
+            raise LOEOARProposalError("LOEO AR staging identity differs and is preserved")
+        if "generation" in entries:
+            if staging:
+                raise LOEOARProposalError("LOEO AR staging evidence is ambiguous and preserved")
             prepared = _validate_generation(
                 source, publication, root / "generation", recompute=True
             )
-            if (root / "current.json").exists():
+            if "current.json" in entries:
                 _validate_pointer(root, prepared.proposal_set_sha256)
             else:
                 _write_pointer(root, prepared.proposal_set_sha256)
             return _load_prepared_internal(
                 source, publication, root, recompute=True, require_pointer=True
             )
-        if set(entries) - {".loeo-ar.lock", ".current.tmp"}:
+        if set(entries) - {".loeo-ar.lock", ".current.tmp", staging_path.name}:
             raise LOEOARProposalError("LOEO AR publication is partial or incompatible")
-        staging_path = Path(tempfile.mkdtemp(prefix=".staging-", dir=root))
-        try:
-            proposal_set_sha256 = _build_generation(source, publication, staging_path)
-            os.replace(staging_path, root / "generation")
+        if staging:
+            _require_directory(staging_path, "LOEO AR staging directory")
+            _validate_stage_identity(staging_path, identity, "LOEO AR proposal stage")
+        else:
+            staging_path.mkdir(mode=0o700)
+            _write_json(staging_path / _STAGE_FILENAME, identity)
+            _fsync_directory(staging_path)
             _fsync_directory(root)
-            _write_pointer(root, proposal_set_sha256)
-        except Exception:
-            if staging_path.exists():
-                _safe_remove_staging(staging_path, publication.occurrence_ids)
-            raise
+        proposal_set_sha256 = _build_generation(source, publication, staging_path, identity)
+        _validate_generation(source, publication, staging_path, recompute=False)
+        os.replace(staging_path, root / "generation")
+        _fsync_directory(root)
+        _write_pointer(root, proposal_set_sha256)
     return _load_prepared_internal(source, publication, root, recompute=True, require_pointer=True)
 
 
@@ -866,6 +971,7 @@ def _load_approved_internal(
     )
     approval = prepared.generation_dir / "approval"
     _validate_approval_namespace(approval, prepared.occurrence_ids)
+    _validate_stage_identity(approval, _approval_stage_identity(prepared), "LOEO AR approval stage")
     payload = _read_json(approval / "approved-set.json", "LOEO AR approved set")
     complete = _read_json(approval / "COMPLETE", "LOEO AR approval completion marker")
     required = {
@@ -962,21 +1068,50 @@ def _load_approved_internal(
     )
 
 
-def _safe_remove_approval_staging(path: Path, occurrence_ids: tuple[str, ...]) -> None:
-    _require_directory(path, "LOEO AR approval staging")
-    entries = {child.name: child for child in path.iterdir()}
+def _build_approval(
+    prepared: LOEOARProposalSet,
+    staging: Path,
+    identity: dict[str, object],
+) -> None:
+    _require_directory(staging, "LOEO AR approval staging")
+    _validate_stage_identity(staging, identity, "LOEO AR approval stage")
+    entries = {path.name: path for path in staging.iterdir()}
     allowed = (
         _APPROVAL_NAMESPACE
-        | {f"{item}.json" for item in occurrence_ids}
-        | {_proposal_lock_name(item) for item in occurrence_ids}
+        | {f"{item}.json" for item in prepared.occurrence_ids}
+        | {_proposal_lock_name(item) for item in prepared.occurrence_ids}
     )
     if not set(entries).issubset(allowed):
         raise LOEOARProposalError("LOEO AR approval staging evidence is invalid and preserved")
     for child in entries.values():
         _require_file(child, "LOEO AR approval staging artifact")
-    for child in entries.values():
-        child.unlink()
-    path.rmdir()
+
+    set_entries = _read_json(prepared.proposal_set_path, "LOEO AR proposal set")["folds"]
+    by_held = {entry["held_out_occurrence_id"]: entry for entry in set_entries}
+    for held_out in prepared.occurrence_ids:
+        entry = by_held[held_out]
+        approve_calibration(
+            prepared.proposal_paths[held_out],
+            staging / f"{held_out}.json",
+            current_residual_sha256=prepared.training_sha256[held_out],
+            current_config_sha256=str(entry["config_sha256"]),
+            current_event_sha256=str(entry["event_sha256"]),
+        )
+    approved_payload = _approved_set_payload(prepared, _approved_fold_payload(prepared, staging))
+    approved_set_path = staging / "approved-set.json"
+    if approved_set_path.exists():
+        if _read_json(approved_set_path, "LOEO AR staged approved set") != approved_payload:
+            raise LOEOARProposalError("LOEO AR staged approved set differs and is preserved")
+    else:
+        _write_json(approved_set_path, approved_payload)
+    complete_payload = {"approved_set_sha256": approved_payload["approved_set_sha256"]}
+    complete_path = staging / "COMPLETE"
+    if complete_path.exists():
+        if _read_json(complete_path, "LOEO AR staged approval completion") != complete_payload:
+            raise LOEOARProposalError("LOEO AR staged approval differs and is preserved")
+    else:
+        _write_json(complete_path, complete_payload)
+    _fsync_directory(staging)
 
 
 def approve_loeo_ar_proposal_set(
@@ -997,53 +1132,43 @@ def approve_loeo_ar_proposal_set(
     root = Path(output_dir)
     _require_directory(root, "LOEO AR publication directory")
     with _publication_lock(root):
-        generation = root / "generation"
-        _require_directory(generation, "LOEO AR generation")
-        staging_entries = [
-            path for path in generation.iterdir() if path.name.startswith(".approval-staging-")
-        ]
-        if len(staging_entries) > 1:
-            raise LOEOARProposalError("LOEO AR approval has ambiguous staging evidence")
-        if staging_entries:
-            _safe_remove_approval_staging(staging_entries[0], publication.occurrence_ids)
         prepared = _load_prepared_internal(
-            source, publication, root, recompute=False, require_pointer=True
+            source,
+            publication,
+            root,
+            recompute=False,
+            require_pointer=True,
+            allow_approval_staging=True,
         )
         if confirm_proposal_set_sha256 != prepared.proposal_set_sha256:
             raise LOEOARProposalError("proposal-set confirmation differs")
         generation = prepared.generation_dir
         approval = generation / "approval"
-        if approval.exists():
+        generation_entries = {path.name: path for path in generation.iterdir()}
+        staging_entries = [
+            path
+            for name, path in generation_entries.items()
+            if name.startswith(".approval-staging-")
+        ]
+        if "approval" in generation_entries:
             approved = _load_approved_internal(source, publication, root, recompute=False)
             return approved.approved_set_path
-        staging = Path(tempfile.mkdtemp(prefix=".approval-staging-", dir=generation))
-        try:
-            set_entries = _read_json(prepared.proposal_set_path, "LOEO AR proposal set")["folds"]
-            by_held = {entry["held_out_occurrence_id"]: entry for entry in set_entries}
-            for held_out in prepared.occurrence_ids:
-                entry = by_held[held_out]
-                approve_calibration(
-                    prepared.proposal_paths[held_out],
-                    staging / f"{held_out}.json",
-                    current_residual_sha256=prepared.training_sha256[held_out],
-                    current_config_sha256=str(entry["config_sha256"]),
-                    current_event_sha256=str(entry["event_sha256"]),
-                )
-            approved_payload = _approved_set_payload(
-                prepared, _approved_fold_payload(prepared, staging)
-            )
-            _write_json(staging / "approved-set.json", approved_payload)
-            _write_json(
-                staging / "COMPLETE",
-                {"approved_set_sha256": approved_payload["approved_set_sha256"]},
-            )
+        identity = _approval_stage_identity(prepared)
+        staging = _stage_path(generation, ".approval-staging-", identity)
+        if staging_entries and staging_entries[0] != staging:
+            raise LOEOARProposalError("LOEO AR approval staging identity differs and is preserved")
+        if staging_entries:
+            _validate_stage_identity(staging, identity, "LOEO AR approval stage")
+        else:
+            staging.mkdir(mode=0o700)
+            _write_json(staging / _STAGE_FILENAME, identity)
             _fsync_directory(staging)
-            os.replace(staging, approval)
             _fsync_directory(generation)
-        except Exception:
-            if staging.exists():
-                _safe_remove_approval_staging(staging, prepared.occurrence_ids)
-            raise
+        _build_approval(prepared, staging, identity)
+        _validate_approval_namespace(staging, prepared.occurrence_ids)
+        _validate_stage_identity(staging, identity, "LOEO AR approval stage")
+        os.replace(staging, approval)
+        _fsync_directory(generation)
     approved = _load_approved_internal(source, publication, root, recompute=False)
     return approved.approved_set_path
 
