@@ -116,3 +116,36 @@ Commit: `5031417` (`fix(hqrc-v3): harden correction publication reuse`)
   paper inputs remained hash-identical and all correction output stayed in pytest temporary space.
 - Full paper sampling and actual paper correction publication remain prohibited pending a fresh
   independent READY verdict.
+
+## Independent-review fix round 2 — RED evidence
+
+- Added direct reviewer reproductions for a self-rehashed logical-output alias and for partial
+  resume with current-generation NPZ/metadata symlinks plus unknown regular/symlink namespace
+  entries. The tests also require zero new sampler calls and no invalid `COMPLETE` publication.
+- Exact RED command:
+  `uv run --project hqrc_v3 --locked pytest -c hqrc_v3/pyproject.toml
+  hqrc_v3/tests/unit/test_correction_stage.py -q`.
+- Result: `5 failed, 25 passed, 35 warnings in 3.27s`. All five unsafe states were accepted before
+  production changes, reproducing both fresh re-review findings.
+
+### Fix round 2 GREEN
+
+Commit: `bd911ac` (`fix(hqrc-v3): bind correction output identities`)
+
+- Complete validation now reconstructs the canonical output record for every logical key,
+  including the current HQRCData pointer/generation files, posterior/checkpoint, and four fixed
+  Parquet filenames. The recorded key/path/type/hash map must equal it exactly, so an aliased and
+  fully rehashed manifest fails closed before reuse.
+- Partial and complete validation now inspect the generation namespace and its current NPZ and
+  metadata using `lstat`. Both current files must be real regular files, and the namespace must
+  contain exactly those two files; current symlinks plus unknown regular/symlink entries fail
+  before downstream cleanup or `COMPLETE` publication and without sampling.
+- Valid downstream-boundary checkpoint resume remains zero-sampler and deterministic.
+- Focused approval/correction/CLI suite: `42 passed, 30 expected tiny-draw warnings in 3.66s`.
+- Full non-slow suite: `431 passed, 8 deselected, 77 expected tiny-draw warnings in 63.64s`.
+- Full project Ruff and `git diff --check`: clean. Protected nested lock SHA remains
+  `f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`.
+- Real paper-source/reduced-PyMC fit plus NetCDF semantic reuse passed in temporary output:
+  `1 passed, 36 expected reduced-draw warnings in 13.57s`; protected paper input hashes remained
+  unchanged and no paper correction output was written.
+- Full paper sampling remains prohibited pending a fresh scoped READY verdict.
