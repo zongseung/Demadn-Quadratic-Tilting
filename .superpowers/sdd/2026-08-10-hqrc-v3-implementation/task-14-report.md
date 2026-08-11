@@ -149,3 +149,39 @@ Commit: `bd911ac` (`fix(hqrc-v3): bind correction output identities`)
   `1 passed, 36 expected reduced-draw warnings in 13.57s`; protected paper input hashes remained
   unchanged and no paper correction output was written.
 - Full paper sampling remains prohibited pending a fresh scoped READY verdict.
+
+## Diagnostic-driven fix round 3 — RED evidence
+
+- Simulated a strict diagnostic rejection that leaves only HQRCData, then retried the same
+  profile/RNG seed with independently changed draws, tune, or chains. Coverage includes the real
+  paper retry contract from 1,000 to 2,000 retained draws and verifies eventual same-contract
+  reuse. Added an exact CLI-help contract for smoke requirements and paper overrides.
+- Exact RED command:
+  `uv run --project hqrc_v3 --locked pytest -c hqrc_v3/pyproject.toml
+  hqrc_v3/tests/unit/test_correction_stage.py
+  hqrc_v3/tests/integration/test_cli_corrections.py -q`.
+- Result: `5 failed, 33 passed, 30 warnings in 3.67s`: all four sampler-size retries collided with
+  the prior partial namespace, and CLI help described the limits as smoke-only.
+
+### Fix round 3 GREEN
+
+Commit: `b254d13` (`fix(hqrc-v3): isolate sampler-size retries`)
+
+- Added the deterministic leaf `draws-<D>-tune-<T>-chains-<C>` below the sampler profile/RNG
+  namespace, using the resolved sampler contract. Baseline and sampler seeds remain separate.
+- A diagnostic-rejected attempt and a retry changing any one of draws, tune, or chains now occupy
+  independent directories. Tests include the paper 1,000-to-2,000 retained-draw retry and prove
+  the failed directory is retained untouched while the retry completes; repeating the exact retry
+  contract reuses with no additional sampler call. Existing same-contract checkpoint-resume tests
+  remain green.
+- CLI help and README now state that smoke requires all three explicit limits, while paper accepts
+  optional overrides only with at least 1,000 tune/draws and exactly four chains. The README gives
+  the intended `--draws 2000 --tune 1000 --chains 4` retry and the full deterministic path layout.
+- Focused approval/correction/CLI suite: `47 passed, 30 expected tiny-draw warnings in 4.48s`.
+- Full non-slow suite: `436 passed, 8 deselected, 77 expected tiny-draw warnings in 65.97s`.
+- Full project Ruff and `git diff --check`: clean. Protected nested lock SHA remains
+  `f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`.
+- Real paper-source/reduced-PyMC fit plus same-contract NetCDF semantic reuse passed in temporary
+  output: `1 passed, 36 expected reduced-draw warnings in 14.21s`; protected inputs were unchanged.
+- Diagnostic thresholds were not changed. The failed real paper attempt was not deleted or
+  modified, no full fit was run, and no actual paper correction output was published.
