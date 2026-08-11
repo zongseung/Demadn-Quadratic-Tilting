@@ -66,6 +66,7 @@ def test_real_causal_correction_reuses_final_and_runs_reduced_pymc(tmp_path):
 
     assert result.sampler_fit_count == 1 and not result.reused
     assert result.output_dir.is_relative_to(tmp_path)
+    assert result.output_dir.parts[-2:] == ("smoke", "sampler-seed-20260811")
     event = pl.read_parquet(result.event_predictions_path)
     full = pl.read_parquet(result.full_period_point_predictions_path)
     assert event.height == 264
@@ -77,4 +78,17 @@ def test_real_causal_correction_reuses_final_and_runs_reduced_pymc(tmp_path):
     manifest = json.loads(result.manifest_path.read_bytes())
     assert manifest["identity"]["source_profile"] == source_profile
     assert manifest["identity"]["sampler_profile"] == "smoke"
+    reused = fit_causal_2024_correction(
+        run_dir=run,
+        config_path=config_path,
+        approved_ar_path=approved,
+        sampler_seed=20260811,
+        profile="smoke",
+        draws=5,
+        tune=5,
+        chains=2,
+        output_root=tmp_path,
+    )
+    assert reused.reused and reused.sampler_fit_count == 0
+    assert reused.output_dir == result.output_dir
     assert {path: file_sha256(path) for path in protected} == before

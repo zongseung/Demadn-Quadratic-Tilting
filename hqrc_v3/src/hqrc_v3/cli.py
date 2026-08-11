@@ -14,6 +14,7 @@ import polars as pl
 
 from hqrc_v3.baselines.config import MODEL_NAMES, load_paper_baselines
 from hqrc_v3.baselines.paper import run_paper_final_stage, run_paper_oof_stage
+from hqrc_v3.bayes.samplers import SamplingError
 from hqrc_v3.config import ConfigError, load_config
 from hqrc_v3.contracts import DataContractError
 from hqrc_v3.correction_stage import fit_causal_2024_correction
@@ -487,7 +488,14 @@ def main(
         if error.code == 0:
             raise
         return int(error.code)
-    except (ConfigError, DataContractError, OSError, StageInputError, ValueError) as error:
+    except (
+        ConfigError,
+        DataContractError,
+        OSError,
+        SamplingError,
+        StageInputError,
+        ValueError,
+    ) as error:
         print(f"hqrc: {error}", file=sys.stderr)
         return 2
     return 0

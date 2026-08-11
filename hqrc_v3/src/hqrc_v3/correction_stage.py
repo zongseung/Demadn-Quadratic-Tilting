@@ -763,6 +763,13 @@ _PRODUCT_FILENAMES = {
     "event_metrics": "event_metrics.parquet",
     "full_period_point_metrics": "full_period_point_metrics.parquet",
 }
+_CHECKPOINT_ENTRIES = {
+    "hqrc_data.current.json",
+    ".hqrc_data.generations",
+    "posterior.nc",
+    "posterior.checkpoint.json",
+}
+_DOWNSTREAM_FILENAMES = (*_PRODUCT_FILENAMES.values(), "manifest.json")
 
 
 def _publication_boundary(_: str) -> None:
@@ -1110,13 +1117,25 @@ def _same_hqrc_data(left: HQRCData, right: HQRCData) -> bool:
     )
 
 
-def _write_products(directory: Path, products: CausalCorrectionProducts) -> None:
-    frames = {
+def _product_frames(products: CausalCorrectionProducts) -> dict[str, pl.DataFrame]:
+    return {
         "event_predictions": products.event_predictions,
         "full_period_point_predictions": products.full_period_point_predictions,
         "event_metrics": products.event_metrics,
         "full_period_point_metrics": products.full_period_point_metrics,
     }
+
+
+def _frames_exact(left: pl.DataFrame, right: pl.DataFrame) -> bool:
+    return (
+        left.columns == right.columns
+        and left.schema == right.schema
+        and left.equals(right, null_equal=True)
+    )
+
+
+def _write_products(directory: Path, products: CausalCorrectionProducts) -> None:
+    frames = _product_frames(products)
     temporaries: dict[str, Path] = {}
     try:
         for name, frame in frames.items():
@@ -1264,31 +1283,79 @@ def _validate_complete(
         "model": identity["model"],
     }:
         raise CausalCorrectionError("published HQRCData differs")
-    _load_posterior_checkpoint(
+    idata = _load_posterior_checkpoint(
         directory,
         inputs=inputs,
         sampler=sampler,
         identity_sha256=identity_sha256,
     )
-    event = pl.read_parquet(directory / _PRODUCT_FILENAMES["event_predictions"])
-    full = pl.read_parquet(directory / _PRODUCT_FILENAMES["full_period_point_predictions"])
-    if (
-        event.height != 264
-        or full.height != 7_320
-        or manifest.get("rows")
-        != {
-            "event_predictions": 264,
-            "full_period_point_predictions": 7_320,
-            "event_metrics": 2,
-            "full_period_point_metrics": 1,
-        }
-        or not np.array_equal(
-            full.filter(~pl.col("is_hqrc_event"))["baseline_mw"].to_numpy(),
-            full.filter(~pl.col("is_hqrc_event"))["corrected_point_mw"].to_numpy(),
-        )
-    ):
+    recorded_sampler = manifest["identity"].get("sampler")
+    if not isinstance(recorded_sampler, dict) or recorded_sampler != dict(sampler):
+        raise CausalCorrectionError("published sampler identity differs")
+    expected = generate_causal_products(
+        inputs,
+        idata,
+        seed=int(recorded_sampler["seed"]),
+        predictive_draws=int(recorded_sampler["draws"]) * int(recorded_sampler["chains"]),
+    )
+    expected_frames = _product_frames(expected)
+    if manifest.get("rows") != {
+        name: frame.height for name, frame in expected_frames.items()
+    }:
         raise CausalCorrectionError("published correction semantics differ")
+    for name, expected_frame in expected_frames.items():
+        try:
+            published_frame = pl.read_parquet(directory / _PRODUCT_FILENAMES[name])
+        except (OSError, pl.exceptions.PolarsError) as error:
+            raise CausalCorrectionError("published correction semantics differ") from error
+        if not _frames_exact(published_frame, expected_frame):
+            raise CausalCorrectionError("published correction semantics differ")
     return _result(directory, reused=True, sampler_fit_count=0)
+
+
+def _load_resumable_checkpoint(
+    directory: Path,
+    *,
+    identity: Mapping[str, Any],
+    identity_sha256: str,
+    inputs: CausalCorrectionInputs,
+    sampler: Mapping[str, object],
+):
+    entries = {
+        path.name: path for path in directory.iterdir() if path.name != ".correction.lock"
+    }
+    allowed = _CHECKPOINT_ENTRIES | set(_DOWNSTREAM_FILENAMES)
+    if set(entries) - allowed or not _CHECKPOINT_ENTRIES.issubset(entries):
+        raise CausalCorrectionError("unsafe partial correction publication")
+    for name, path in entries.items():
+        if path.is_symlink():
+            raise CausalCorrectionError("unsafe partial correction publication")
+        if name == ".hqrc_data.generations":
+            if not path.is_dir():
+                raise CausalCorrectionError("unsafe partial correction publication")
+        elif not path.is_file():
+            raise CausalCorrectionError("unsafe partial correction publication")
+    try:
+        data, settings = load_hqrc_data(directory / "hqrc_data.npz")
+    except (OSError, ValueError) as error:
+        raise CausalCorrectionError("checkpoint HQRCData differs") from error
+    if not _same_hqrc_data(data, inputs.hqrc_data) or settings != {
+        "identity_sha256": identity_sha256,
+        "model": identity["model"],
+    }:
+        raise CausalCorrectionError("checkpoint HQRCData differs")
+    idata = _load_posterior_checkpoint(
+        directory,
+        inputs=inputs,
+        sampler=sampler,
+        identity_sha256=identity_sha256,
+    )
+    for filename in _DOWNSTREAM_FILENAMES:
+        path = entries.get(filename)
+        if path is not None:
+            path.unlink()
+    _fsync_directory(directory)
+    return idata
 
 
 def fit_causal_2024_correction(
@@ -1324,38 +1391,29 @@ def fit_causal_2024_correction(
         / context.model
         / context.feature_set
         / f"seed-{context.seed}"
+        / profile
+        / f"sampler-seed-{sampler_seed}"
     )
     identity = _input_identity(inputs, sampler)
     identity_sha256 = hashlib.sha256(_canonical_json(identity)).hexdigest()
     with _context_lock(directory):
-        complete_exists = (directory / "COMPLETE").exists()
-        manifest_exists = (directory / "manifest.json").exists()
-        if complete_exists or manifest_exists:
-            if not complete_exists or not manifest_exists:
+        complete_path = directory / "COMPLETE"
+        manifest_path = directory / "manifest.json"
+        complete_exists = complete_path.exists() or complete_path.is_symlink()
+        manifest_exists = manifest_path.exists() or manifest_path.is_symlink()
+        if complete_exists:
+            if not manifest_exists:
                 raise CausalCorrectionError("partial correction publication")
             return _validate_complete(directory, identity=identity, inputs=inputs, sampler=sampler)
 
         existing = {path.name for path in directory.iterdir() if path.name != ".correction.lock"}
-        resumable = {
-            "hqrc_data.current.json",
-            ".hqrc_data.generations",
-            "posterior.nc",
-            "posterior.checkpoint.json",
-        }
-        if existing and existing != resumable:
-            raise CausalCorrectionError("unsafe partial correction publication")
         if existing:
-            data, settings = load_hqrc_data(directory / "hqrc_data.npz")
-            if not _same_hqrc_data(data, inputs.hqrc_data) or settings != {
-                "identity_sha256": identity_sha256,
-                "model": identity["model"],
-            }:
-                raise CausalCorrectionError("checkpoint HQRCData differs")
-            idata = _load_posterior_checkpoint(
+            idata = _load_resumable_checkpoint(
                 directory,
+                identity=identity,
+                identity_sha256=identity_sha256,
                 inputs=inputs,
                 sampler=sampler,
-                identity_sha256=identity_sha256,
             )
             sampler_fit_count = 0
         else:

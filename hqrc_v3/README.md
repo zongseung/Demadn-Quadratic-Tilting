@@ -210,6 +210,11 @@ The command profile is the sampler profile. The source profile is inferred from
 the immutable residual and baseline manifests and recorded separately: a paper
 sampler requires paper sources, while a smoke sampler may read either paper or
 smoke sources without relabeling those source artifacts.
+Each completed context is namespaced as
+`corrections/causal-2024/<model>/<feature-set>/seed-<baseline-seed>/<sampler-profile>/sampler-seed-<rng-seed>/`.
+The first seed remains exclusively the baseline seed from the approved AR
+context; the final seed is the CLI `--seed`. Consequently smoke/paper runs and
+different sampler seeds never reuse or invalidate one another.
 
 The boundary calendar dates are documented by the official Korea Astronomy and
 Space Science Institute almanac releases for

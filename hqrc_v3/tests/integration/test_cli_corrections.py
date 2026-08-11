@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from hqrc_v3.bayes.samplers import SamplingError
+
 from hqrc_v3 import cli
 
 
@@ -72,3 +74,30 @@ def test_loeo_cli_fails_before_loading_causal_approval(capsys, monkeypatch):
 
     assert result == 2 and not called
     assert "fold-specific approved calibrations" in capsys.readouterr().err
+
+
+def test_sampling_diagnostic_failure_uses_cli_exit_two(capsys, monkeypatch):
+    def fail_sampling(**_kwargs):
+        raise SamplingError("posterior diagnostics failed")
+
+    monkeypatch.setattr(cli, "fit_causal_2024_correction", fail_sampling)
+    result = cli.main(
+        [
+            "fit-corrections",
+            "--run-dir",
+            "run",
+            "--config",
+            "experiment.toml",
+            "--approved-ar",
+            "approved.json",
+            "--evaluation",
+            "causal-2024",
+            "--seed",
+            "19",
+            "--profile",
+            "paper",
+        ]
+    )
+
+    assert result == 2
+    assert capsys.readouterr().err == "hqrc: posterior diagnostics failed\n"

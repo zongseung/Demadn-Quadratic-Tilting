@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, time, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import arviz as az
+import hqrc_v3.correction_stage as stage
 import numpy as np
 import polars as pl
 import pytest
@@ -247,7 +250,7 @@ def test_causal_products_use_q_plus_event_reset_e_and_leave_other_hours_bitwise_
     assert event.height == 264 and products.event_metrics.height == 2
 
 
-def _stage_inputs(tmp_path: Path) -> CausalCorrectionInputs:
+def _stage_inputs(tmp_path: Path, *, source_profile: str = "smoke") -> CausalCorrectionInputs:
     events = load_event_registry(EVENTS)
     training = _training_frame()
     approved = _approved(tmp_path, tuple(sorted(training["occurrence_id"].unique().to_list())))
@@ -265,7 +268,7 @@ def _stage_inputs(tmp_path: Path) -> CausalCorrectionInputs:
         path.write_text(name, encoding="utf-8")
     return CausalCorrectionInputs(
         run_dir=run,
-        source_profile="smoke",
+        source_profile=source_profile,
         approved=approved,
         hqrc_data=build_causal_hqrc_data(training, approved, events=events),
         training_frame=training,
@@ -283,7 +286,15 @@ def _stage_inputs(tmp_path: Path) -> CausalCorrectionInputs:
     )
 
 
-def _fake_sample(approved, *, draws: int, chains: int, tune: int, seed: int):
+def _fake_sample(
+    approved,
+    *,
+    draws: int,
+    chains: int,
+    tune: int,
+    seed: int,
+    paper_profile: bool = False,
+):
     mu = np.zeros((chains, draws, 2, 3))
     mu[:, :, 0, 0] = 1.0
     mu[:, :, 1, 0] = 2.0
@@ -340,8 +351,8 @@ def _fake_sample(approved, *, draws: int, chains: int, tune: int, seed: int):
                     "tune": tune,
                     "chains": chains,
                     "seed": seed,
-                    "target_accept": 0.9,
-                    "paper_profile": False,
+                    "target_accept": 0.99 if paper_profile else 0.9,
+                    "paper_profile": paper_profile,
                 },
                 sort_keys=True,
             ),
@@ -350,12 +361,8 @@ def _fake_sample(approved, *, draws: int, chains: int, tune: int, seed: int):
     return idata
 
 
-def test_post_sampling_checkpoint_resumes_without_sampling_twice(tmp_path, monkeypatch):
-    import hqrc_v3.correction_stage as stage
-
-    inputs = _stage_inputs(tmp_path)
-    calls = []
-
+def _install_fake_stage(monkeypatch, inputs: CausalCorrectionInputs) -> list[dict[str, object]]:
+    calls: list[dict[str, object]] = []
     monkeypatch.setattr(stage, "prepare_causal_correction_inputs", lambda **_: inputs)
 
     def fake_sampler(_data, approved, **kwargs):
@@ -366,26 +373,94 @@ def test_post_sampling_checkpoint_resumes_without_sampling_twice(tmp_path, monke
             chains=kwargs["chains"],
             tune=kwargs["tune"],
             seed=kwargs["seed"],
+            paper_profile=kwargs["paper_profile"],
         )
 
     monkeypatch.setattr(stage, "sample_hqrc", fake_sampler)
+    return calls
+
+
+def _stage_arguments(
+    tmp_path: Path,
+    inputs: CausalCorrectionInputs,
+    *,
+    sampler_seed: int = 19,
+    profile: str = "smoke",
+    draws: int = 3,
+    tune: int = 3,
+    chains: int = 2,
+) -> dict[str, object]:
+    return {
+        "run_dir": inputs.run_dir,
+        "config_path": tmp_path / "experiment.toml",
+        "approved_ar_path": inputs.approved.artifact_path,
+        "sampler_seed": sampler_seed,
+        "profile": profile,
+        "draws": draws,
+        "tune": tune,
+        "chains": chains,
+        "output_root": tmp_path / "output",
+    }
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def _rebind_completed_publication(result, output_name: str) -> None:
+    manifest = json.loads(result.manifest_path.read_bytes())
+    output_path = result.output_dir / manifest["outputs"][output_name]["path"]
+    manifest["outputs"][output_name]["sha256"] = hashlib.sha256(
+        output_path.read_bytes()
+    ).hexdigest()
+    unsigned = {
+        key: manifest[key] for key in ("schema_version", "state", "identity", "outputs", "rows")
+    }
+    manifest["manifest_digest"] = hashlib.sha256(_canonical_json(unsigned)).hexdigest()
+    result.manifest_path.write_bytes(_canonical_json(manifest) + b"\n")
+    complete = {
+        "manifest_sha256": hashlib.sha256(result.manifest_path.read_bytes()).hexdigest(),
+        "state": "COMPLETE",
+    }
+    (result.output_dir / "COMPLETE").write_bytes(_canonical_json(complete) + b"\n")
+
+
+def _tamper_product(result, output_name: str) -> None:
+    manifest = json.loads(result.manifest_path.read_bytes())
+    path = result.output_dir / manifest["outputs"][output_name]["path"]
+    frame = pl.read_parquet(path)
+    if output_name == "event_predictions":
+        changed_draws = [
+            [float(value) + 1.0 for value in values]
+            for values in frame["predictive_draws_mw"].to_list()
+        ]
+        frame = frame.with_columns(
+            (pl.col("corrected_point_mw") + 1.0).alias("corrected_point_mw"),
+            pl.Series("predictive_draws_mw", changed_draws),
+        )
+    elif output_name == "full_period_point_predictions":
+        frame = frame.with_columns(
+            (pl.col("observed_mw") + 1.0).alias("observed_mw"),
+            (pl.col("baseline_mw") + 1.0).alias("baseline_mw"),
+            (pl.col("corrected_point_mw") + 1.0).alias("corrected_point_mw"),
+            pl.lit(True).alias("is_hqrc_event"),
+        )
+    else:
+        frame = frame.with_columns((pl.col("rmse") + 1.0).alias("rmse"))
+    frame.write_parquet(path)
+    _rebind_completed_publication(result, output_name)
+
+
+def test_post_sampling_checkpoint_resumes_without_sampling_twice(tmp_path, monkeypatch):
+    inputs = _stage_inputs(tmp_path)
+    calls = _install_fake_stage(monkeypatch, inputs)
 
     def crash_after_checkpoint(boundary):
         if boundary == "posterior-checkpointed":
             raise RuntimeError("prediction crash")
 
     monkeypatch.setattr(stage, "_publication_boundary", crash_after_checkpoint)
-    arguments = {
-        "run_dir": inputs.run_dir,
-        "config_path": tmp_path / "experiment.toml",
-        "approved_ar_path": inputs.approved.artifact_path,
-        "sampler_seed": 19,
-        "profile": "smoke",
-        "draws": 3,
-        "tune": 3,
-        "chains": 2,
-        "output_root": tmp_path / "output",
-    }
+    arguments = _stage_arguments(tmp_path, inputs)
     with pytest.raises(RuntimeError, match="prediction crash"):
         fit_causal_2024_correction(**arguments)
     assert len(calls) == 1
@@ -397,3 +472,144 @@ def test_post_sampling_checkpoint_resumes_without_sampling_twice(tmp_path, monke
     reused = fit_causal_2024_correction(**arguments)
     assert reused.reused and reused.sampler_fit_count == 0
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "event_predictions-published",
+        "full_period_point_predictions-published",
+        "event_metrics-published",
+        "full_period_point_metrics-published",
+        "manifest-published",
+    ],
+)
+def test_each_downstream_crash_resumes_from_checkpoint_without_resampling(
+    tmp_path, monkeypatch, boundary
+):
+    inputs = _stage_inputs(tmp_path)
+    calls = _install_fake_stage(monkeypatch, inputs)
+    arguments = _stage_arguments(tmp_path, inputs)
+
+    monkeypatch.setattr(
+        stage,
+        "_publication_boundary",
+        lambda current: (_ for _ in ()).throw(RuntimeError(boundary))
+        if current == boundary
+        else None,
+    )
+    with pytest.raises(RuntimeError, match=boundary):
+        fit_causal_2024_correction(**arguments)
+    assert len(calls) == 1
+
+    monkeypatch.setattr(stage, "_publication_boundary", lambda _: None)
+    resumed = fit_causal_2024_correction(**arguments)
+
+    assert resumed.sampler_fit_count == 0 and not resumed.reused
+    assert len(calls) == 1
+    assert (resumed.output_dir / "COMPLETE").is_file()
+
+
+@pytest.mark.parametrize("mutation", ["unknown", "symlink", "hqrc", "posterior"])
+def test_partial_resume_fails_closed_on_unsafe_or_invalid_checkpoint(
+    tmp_path, monkeypatch, mutation
+):
+    inputs = _stage_inputs(tmp_path)
+    calls = _install_fake_stage(monkeypatch, inputs)
+    arguments = _stage_arguments(tmp_path, inputs)
+    monkeypatch.setattr(
+        stage,
+        "_publication_boundary",
+        lambda current: (_ for _ in ()).throw(RuntimeError("product crash"))
+        if current == "event_predictions-published"
+        else None,
+    )
+    with pytest.raises(RuntimeError, match="product crash"):
+        fit_causal_2024_correction(**arguments)
+    output_dir = (
+        tmp_path
+        / "output/corrections/causal-2024/lightgbm/B1/seed-7/smoke/sampler-seed-19"
+    )
+    if mutation == "unknown":
+        (output_dir / "unknown.txt").write_text("unknown", encoding="utf-8")
+    elif mutation == "symlink":
+        product = output_dir / "event_predictions.parquet"
+        product.unlink()
+        product.symlink_to(output_dir / "posterior.nc")
+    elif mutation == "hqrc":
+        (output_dir / "hqrc_data.current.json").write_bytes(b"{}")
+    else:
+        (output_dir / "posterior.checkpoint.json").write_bytes(b"{}")
+
+    monkeypatch.setattr(stage, "_publication_boundary", lambda _: None)
+    with pytest.raises(CausalCorrectionError):
+        fit_causal_2024_correction(**arguments)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "output_name",
+    [
+        "event_predictions",
+        "full_period_point_predictions",
+        "event_metrics",
+        "full_period_point_metrics",
+    ],
+)
+def test_complete_reuse_rejects_rehashed_semantic_parquet_tampering(
+    tmp_path, monkeypatch, output_name
+):
+    inputs = _stage_inputs(tmp_path)
+    calls = _install_fake_stage(monkeypatch, inputs)
+    arguments = _stage_arguments(tmp_path, inputs)
+    completed = fit_causal_2024_correction(**arguments)
+    assert len(calls) == 1
+    _tamper_product(completed, output_name)
+
+    with pytest.raises(CausalCorrectionError, match="semantics"):
+        fit_causal_2024_correction(**arguments)
+    assert len(calls) == 1
+
+
+def test_sampler_profile_and_rng_seed_have_distinct_namespaces(tmp_path, monkeypatch):
+    inputs = _stage_inputs(tmp_path, source_profile="paper")
+    calls = _install_fake_stage(monkeypatch, inputs)
+    monkeypatch.setattr(
+        stage,
+        "validate_inference_data",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            max_rhat=1.0,
+            min_bulk_ess=1_000.0,
+            min_tail_ess=1_000.0,
+            divergences=0,
+        ),
+    )
+
+    smoke_19 = fit_causal_2024_correction(**_stage_arguments(tmp_path, inputs))
+    smoke_23 = fit_causal_2024_correction(
+        **_stage_arguments(tmp_path, inputs, sampler_seed=23)
+    )
+    paper_29 = fit_causal_2024_correction(
+        **_stage_arguments(
+            tmp_path,
+            inputs,
+            sampler_seed=29,
+            profile="paper",
+            draws=1_000,
+            tune=1_000,
+            chains=4,
+        )
+    )
+
+    assert len({smoke_19.output_dir, smoke_23.output_dir, paper_29.output_dir}) == 3
+    assert all("seed-7" in result.output_dir.parts for result in (smoke_19, smoke_23, paper_29))
+    assert "smoke" in smoke_19.output_dir.parts
+    assert "sampler-seed-19" in smoke_19.output_dir.parts
+    assert "sampler-seed-23" in smoke_23.output_dir.parts
+    assert "paper" in paper_29.output_dir.parts
+    assert "sampler-seed-29" in paper_29.output_dir.parts
+    assert all(
+        (result.output_dir / "COMPLETE").is_file()
+        for result in (smoke_19, smoke_23, paper_29)
+    )
+    assert len(calls) == 3
