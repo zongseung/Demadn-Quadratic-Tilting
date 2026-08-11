@@ -13,6 +13,7 @@ from hqrc_v3.baselines.classical import (
     predictions_to_frame,
     select_fixed_baseline_config,
 )
+from hqrc_v3.baselines.preprocessing import fit_classical_preprocessor
 from hqrc_v3.contracts import DataContractError, ForecastMatrix
 from hqrc_v3.splits import AnnualFold
 
@@ -82,7 +83,7 @@ def test_horizon_regressor_builds_distinct_estimators(tiny_forecast_matrix):
     )
 
     assert len({id(model) for model in fitted.estimators}) == 24
-    assert {model.n_features_in_ for model in fitted.estimators} == {168 * 2 + 2}
+    assert {model.n_features_in_ for model in fitted.estimators} == {168 * 2 + 24 * 2}
 
 
 def test_one_shot_selection_returns_lowest_validation_rmse(
@@ -163,11 +164,13 @@ def test_classical_baseline_requires_exactly_168_history_hours(
         baseline.fit(malformed.take(np.arange(20)), validation=None, seed=7)
 
     fitted = baseline.fit(tiny_forecast_matrix.take(np.arange(20)), validation=None, seed=7)
-    with pytest.raises(ValueError, match="168 history hours"):
+    with pytest.raises(ValueError, match="168 history hours|feature shape"):
         fitted.predict(malformed.take(np.arange(20, 24)))
 
 
-def test_horizon_regressor_uses_only_its_matching_future_covariates(tiny_forecast_matrix):
+def test_horizon_regressor_uses_the_same_complete_future_path_for_every_horizon(
+    tiny_forecast_matrix,
+):
     class RecordingEstimator:
         def __init__(self):
             self.inputs: list[np.ndarray] = []
@@ -177,6 +180,7 @@ def test_horizon_regressor_uses_only_its_matching_future_covariates(tiny_forecas
             return np.zeros(features.shape[0])
 
     batch = tiny_forecast_matrix.take(np.arange(2))
+    preprocessor = fit_classical_preprocessor(tiny_forecast_matrix.take(np.arange(20)))
     estimators = tuple(RecordingEstimator() for _ in range(24))
     fitted = HorizonRegressor(
         model_name="recording",
@@ -185,12 +189,15 @@ def test_horizon_regressor_uses_only_its_matching_future_covariates(tiny_forecas
         future_width=2,
         history_columns=batch.history_columns,
         future_columns=batch.future_columns,
+        preprocessor=preprocessor,
     )
 
     fitted.predict(batch)
 
-    for horizon, estimator in enumerate(estimators):
-        np.testing.assert_array_equal(estimator.inputs[0][:, -2:], batch.future[:, horizon, :])
+    expected = preprocessor.transform_features(batch)
+    for estimator in estimators:
+        np.testing.assert_array_equal(estimator.inputs[0], expected)
+        assert estimator.inputs[0].shape[1] == 168 * 2 + 24 * 2
 
 
 @pytest.mark.parametrize("stream", ["history", "future"])

@@ -16,7 +16,13 @@ from hqrc_v3.baselines.config import MODEL_NAMES, load_paper_baselines
 from hqrc_v3.baselines.paper import run_paper_final_stage, run_paper_oof_stage
 from hqrc_v3.config import ConfigError, load_config
 from hqrc_v3.contracts import DataContractError
-from hqrc_v3.data import audit_hourly_data, read_hourly_data
+from hqrc_v3.data import (
+    FIXED_PUBLIC_HOLIDAY_DATES,
+    FIXED_SUBSTITUTE_OR_TEMPORARY_DATES,
+    audit_hourly_data,
+    load_temporary_holiday_availability,
+    read_hourly_data,
+)
 from hqrc_v3.diagnostics.ar import (
     approve_calibration,
     calibrate_beta_prior,
@@ -31,6 +37,9 @@ StageHandler = Callable[[argparse.Namespace], object]
 _EXPECTED_START = "2019-01-01T00:00:00"
 _EXPECTED_END = "2024-10-31T23:00:00"
 _EXPECTED_ROWS = 51_144
+_DEFAULT_TEMPORARY_AVAILABILITY = (
+    Path(__file__).resolve().parents[2] / "configs/temporary_holiday_availability.csv"
+)
 
 
 class StageInputError(ValueError):
@@ -53,6 +62,13 @@ def audit_data_handler(arguments: argparse.Namespace) -> object:
             "expected_start": datetime.fromisoformat(_EXPECTED_START),
             "expected_end": datetime.fromisoformat(_EXPECTED_END),
             "expected_rows": _EXPECTED_ROWS,
+            "expected_public_holiday_dates": FIXED_PUBLIC_HOLIDAY_DATES,
+            "expected_substitute_or_temporary_dates": (
+                FIXED_SUBSTITUTE_OR_TEMPORARY_DATES
+            ),
+            "temporary_holiday_availability": load_temporary_holiday_availability(
+                Path(arguments.temporary_holiday_availability)
+            ),
         }
     return audit_hourly_data(read_hourly_data(Path(arguments.data)), **expected)
 
@@ -84,9 +100,14 @@ def _paper_stage_inputs(arguments: argparse.Namespace) -> dict[str, object]:
     config_directory = experiment_path.parent
     event_path = Path(arguments.event_registry or config_directory / "events.csv")
     holiday_path = Path(arguments.holiday_calendar or config_directory / "holiday_calendar.csv")
+    availability_path = Path(
+        arguments.temporary_holiday_availability
+        or config_directory / "temporary_holiday_availability.csv"
+    )
     load_config(experiment_path)
     load_event_registry(event_path)
     calendar = load_holiday_calendar(holiday_path)
+    temporary_availability = load_temporary_holiday_availability(availability_path)
     baseline_config = load_paper_baselines(
         model_path,
         expected_sha256=arguments.frozen_model_hash,
@@ -96,9 +117,19 @@ def _paper_stage_inputs(arguments: argparse.Namespace) -> dict[str, object]:
             "expected_start": datetime.fromisoformat(_EXPECTED_START),
             "expected_end": datetime.fromisoformat(_EXPECTED_END),
             "expected_rows": _EXPECTED_ROWS,
+            "expected_public_holiday_dates": FIXED_PUBLIC_HOLIDAY_DATES,
+            "expected_substitute_or_temporary_dates": (
+                FIXED_SUBSTITUTE_OR_TEMPORARY_DATES
+            ),
+            "temporary_holiday_availability": temporary_availability,
         }
         if arguments.profile == "paper"
-        else {"expected_start": None, "expected_end": None, "expected_rows": None}
+        else {
+            "expected_start": None,
+            "expected_end": None,
+            "expected_rows": None,
+            "temporary_holiday_availability": temporary_availability,
+        }
     )
     audited = audit_hourly_data(read_hourly_data(data_path), **paper_bounds)
     featured = attach_calendar_features(audited, calendar)
@@ -125,6 +156,7 @@ def _paper_stage_inputs(arguments: argparse.Namespace) -> dict[str, object]:
             "model_config_sha256": file_sha256(model_path),
             "event_registry_sha256": file_sha256(event_path),
             "holiday_calendar_sha256": file_sha256(holiday_path),
+            "temporary_holiday_availability_sha256": file_sha256(availability_path),
         },
         "classical_seed": arguments.seed,
         "models": selected_models,
@@ -209,6 +241,10 @@ def _add_frozen_model_inputs(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--holiday-calendar", help="holiday feature calendar CSV; defaults beside --config"
     )
+    parser.add_argument(
+        "--temporary-holiday-availability",
+        help="temporary-holiday availability CSV; defaults beside --config",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -225,6 +261,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="fixed_expected_bounds",
         action="store_true",
         help="supply the fixed 2019-01-01 through 2024-10-31 / 51,144-row contract",
+    )
+    audit.add_argument(
+        "--temporary-holiday-availability",
+        default=str(_DEFAULT_TEMPORARY_AVAILABILITY),
+        help="versioned exceptional-holiday availability CSV",
     )
 
     tune = subcommands.add_parser("tune-baselines", help="run one explicit selection stage")

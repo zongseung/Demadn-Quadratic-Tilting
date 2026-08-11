@@ -24,16 +24,36 @@ def tiny_forecast_matrix():
     target_times = origins[:, None] + np.arange(24).astype("timedelta64[h]")
     sample = np.arange(count, dtype=float)[:, None, None]
     hour = np.arange(24, dtype=float)[None, :, None]
-    history_hour = np.arange(168, dtype=float)[None, :, None]
+    history_hour = np.arange(-168, 0, dtype=float)[None, :, None]
+    absolute_history_hour = sample * 24.0 + history_hour
     history = np.concatenate(
-        (sample + history_hour / 100, np.broadcast_to(history_hour / 10, (count, 168, 1))), axis=2
+        (
+            50_000.0 + absolute_history_hour,
+            10.0 + absolute_history_hour / 168.0,
+            50.0 + absolute_history_hour / 336.0,
+            np.mod(absolute_history_hour, 24.0),
+            absolute_history_hour / 24.0,
+        ),
+        axis=2,
     )
     future = np.concatenate(
         (np.broadcast_to(hour / 24, (count, 24, 1)), sample + hour / 50), axis=2
     )
-    target = sample[:, 0, 0, None] + hour[:, :, 0] + 0.5
+    target = 51_000.0 + sample[:, 0, 0, None] * 24.0 + hour[:, :, 0]
     return ForecastMatrix(
-        origins, target_times, history, future, target, ("load", "temperature"), ("hour", "weather")
+        origins,
+        target_times,
+        history,
+        future,
+        target,
+        (
+            "load_mw",
+            "temperature_c",
+            "relative_humidity",
+            "hour",
+            "annual_sin",
+        ),
+        ("hour", "annual_sin"),
     )
 
 
@@ -123,7 +143,13 @@ def test_sequence_fit_uses_train_only_standardization(tiny_forecast_matrix):
     )
     fitted = TorchBaselineFactory("lstm", config).fit(train, validation, seed=3)
 
-    np.testing.assert_allclose(fitted.history_scaler.mean, train.history.mean(axis=(0, 1)))
+    unique_history_weather = np.concatenate(
+        (train.history[0, :, 1:3], train.history[1:, -24:, 1:3].reshape(-1, 2)),
+        axis=0,
+    )
+    np.testing.assert_allclose(
+        fitted.weather_scaler.mean, unique_history_weather.mean(axis=0)
+    )
     np.testing.assert_allclose(fitted.future_scaler.mean, train.future.mean(axis=(0, 1)))
     np.testing.assert_allclose(fitted.target_scaler.mean, train.target.mean())
     assert fitted.predict(validation).shape == (8, 24)
@@ -179,7 +205,13 @@ def test_sequence_predict_rejects_changed_feature_columns(
         fitted.predict(batch)
 
 
-@pytest.mark.parametrize("columns", [("load", "load"), ("load", " ")])
+@pytest.mark.parametrize(
+    "columns",
+    [
+        ("load_mw", "temperature_c", "relative_humidity", "hour", "hour"),
+        ("load_mw", "temperature_c", "relative_humidity", "hour", " "),
+    ],
+)
 def test_sequence_fit_rejects_duplicate_or_blank_feature_columns(
     tiny_forecast_matrix, columns
 ):

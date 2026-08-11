@@ -39,9 +39,10 @@ from hqrc_v3.contracts import (
     validate_forecast_feature_columns,
     validate_prediction_frame,
 )
-from hqrc_v3.features import feature_columns
+from hqrc_v3.features import feature_columns, history_columns
 from hqrc_v3.oof import (
     FeatureSet,
+    chronological_validation_tail,
     generate_cached_final,
     generate_oof_stream,
 )
@@ -61,6 +62,7 @@ PAPER_HASH_KEYS = (
     "model_config_sha256",
     "event_registry_sha256",
     "holiday_calendar_sha256",
+    "temporary_holiday_availability_sha256",
 )
 _FEATURE_SETS: tuple[FeatureSet, ...] = ("B0", "B1")
 _NEURAL_MODELS = frozenset(("seq2seq_lstm", "transformer"))
@@ -83,6 +85,7 @@ _MANIFEST_IDENTITY_KEYS = {
     "neural_seeds",
     "ensemble_seed",
     "feature_schemas",
+    "preprocessing",
     "execution_overrides",
 }
 _FactoryBuilder = Callable[..., BaselineFactory]
@@ -171,7 +174,8 @@ def _require_artifact_hashes(
     if not isinstance(hashes, Mapping) or set(hashes) != set(PAPER_HASH_KEYS):
         raise DataContractError(
             "paper artifact hashes must contain exactly data, experiment, model config, "
-            "event registry, and holiday calendar SHA-256 values"
+            "event registry, holiday calendar, and temporary-holiday availability "
+            "SHA-256 values"
         )
     normalized = dict(hashes)
     for name, value in normalized.items():
@@ -218,7 +222,10 @@ def _feature_schema(matrix: ForecastMatrix, feature_set: FeatureSet) -> dict[str
     if not isinstance(matrix, ForecastMatrix):
         raise TypeError(f"{feature_set} matrix must be a ForecastMatrix")
     validate_forecast_feature_columns(matrix)
-    if matrix.future_columns != feature_columns(feature_set):
+    if (
+        matrix.history_columns != history_columns(feature_set)
+        or matrix.future_columns != feature_columns(feature_set)
+    ):
         raise DataContractError(f"{feature_set} matrix does not match its frozen feature schema")
     return {
         "history": list(matrix.history_columns),
@@ -277,6 +284,9 @@ def _cache_hashes(
         "experiment_sha256": hashes["experiment_sha256"],
         "model_config_sha256": hashes["model_config_sha256"],
         "holiday_calendar_sha256": hashes["holiday_calendar_sha256"],
+        "temporary_holiday_availability_sha256": hashes[
+            "temporary_holiday_availability_sha256"
+        ],
         "feature_schema_sha256": _schema_digest(schema),
         "execution_profile_sha256": hashlib.sha256(
             json.dumps(
@@ -378,9 +388,10 @@ def _manifest_identity(
     classical_seed: int,
     schemas: Mapping[str, Mapping[str, list[str]]],
     execution_overrides: Mapping[str, int],
+    config: PaperBaselineConfig,
 ) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": profile,
         "input_hashes": dict(hashes),
         "models": list(models),
@@ -389,6 +400,7 @@ def _manifest_identity(
         "neural_seeds": list(PAPER_SEEDS),
         "ensemble_seed": ENSEMBLE_SEED,
         "feature_schemas": dict(schemas),
+        "preprocessing": config.preprocessing.to_manifest(),
         "execution_overrides": dict(execution_overrides),
     }
 
@@ -532,6 +544,78 @@ def _expected_stage_coverage(
     return _coverage_record(pl.concat(frames, how="vertical"))
 
 
+def _timestamp_population(times: np.ndarray, *, unit: str) -> dict[str, object]:
+    values = np.asarray(times).reshape(-1).astype("datetime64[ns]")
+    if not values.size or np.isnat(values).any():
+        raise DataContractError("preprocessing population timestamps must be complete")
+    unique = np.unique(values)
+    return {
+        "count": int(unique.size),
+        "start": np.datetime_as_string(unique[0], unit="s"),
+        "end": np.datetime_as_string(unique[-1], unit="s"),
+        "unit": unit,
+    }
+
+
+def _preprocessing_populations(
+    matrix: ForecastMatrix,
+    folds: tuple[AnnualFold, ...],
+    *,
+    models: tuple[str, ...],
+    feature_sets: tuple[FeatureSet, ...],
+    validation_days: int,
+) -> list[dict[str, object]]:
+    """Derive the exact timestamp populations every fitted scaler must use."""
+
+    records: list[dict[str, object]] = []
+    for model in models:
+        for feature_set in feature_sets:
+            for fold in folds:
+                train_indices, _ = select_fold_samples(matrix, fold)
+                outer_train = matrix.take(train_indices)
+                fit_train = (
+                    outer_train
+                    if model == "svr"
+                    else chronological_validation_tail(
+                        outer_train, days=validation_days
+                    )[0]
+                )
+                fit_daily = _timestamp_population(
+                    fit_train.origins, unit="daily-sample"
+                )
+                target = _timestamp_population(
+                    fit_train.target_times, unit="unique-hour"
+                )
+                if target["count"] != len(fit_train.origins) * 24:
+                    raise DataContractError(
+                        "estimator-fit targets must be non-overlapping complete days"
+                    )
+                if model in _NEURAL_MODELS:
+                    history_offsets = np.arange(-168, 0).astype("timedelta64[h]")
+                    history_times = (
+                        fit_train.origins[:, None].astype("datetime64[ns]")
+                        + history_offsets[None, :]
+                    )
+                    scalers = {
+                        "target": target,
+                        "weather": _timestamp_population(
+                            history_times, unit="unique-hour"
+                        ),
+                        "calendar": target,
+                    }
+                else:
+                    scalers = {"x": fit_daily, "target": target}
+                records.append(
+                    {
+                        "model": model,
+                        "feature_set": feature_set,
+                        "split_id": fold.split_id,
+                        "scalers": scalers,
+                    }
+                )
+    return records
+
+
 def _require_expected_coverage(value: object) -> dict[str, object]:
     if (
         not isinstance(value, dict)
@@ -670,6 +754,7 @@ def _validate_completed_stage(
     eval_years: tuple[int, ...],
     classical_seed: int,
     expected_coverage: Mapping[str, object],
+    expected_preprocessing_populations: list[dict[str, object]],
 ) -> tuple[Path, Path]:
     record = manifest["stages"].get(stage)
     if not isinstance(record, dict):
@@ -678,6 +763,7 @@ def _validate_completed_stage(
         "artifacts",
         "eval_years",
         "expected_coverage",
+        "preprocessing_populations",
         "split_ids",
         "streams",
     }
@@ -690,6 +776,10 @@ def _validate_completed_stage(
     recorded_coverage = _require_expected_coverage(record["expected_coverage"])
     if recorded_coverage != dict(expected_coverage):
         raise ArtifactMismatch(f"{stage} expected coverage differs from the supplied matrix")
+    if record["preprocessing_populations"] != expected_preprocessing_populations:
+        raise ArtifactMismatch(
+            f"{stage} preprocessing scaler populations differ from the supplied matrix"
+        )
     members_path, point_path = _verify_artifact_hashes(run_dir, stage, record)
     _validate_published_frames(
         _read_parquet(members_path, description=f"{stage} member"),
@@ -1118,7 +1208,9 @@ def _stage_preflight(
     folds: tuple[AnnualFold, ...],
     classical_seed: int,
     expected_coverage: Mapping[str, object],
+    expected_preprocessing_populations: list[dict[str, object]],
     profile: Literal["paper", "smoke"],
+    validation_days: int,
 ) -> PaperStageResult | tuple[dict[str, Any], Path, Path, Path]:
     members_path, point_path, manifest_path = _artifact_paths(run_dir, stage)
     manifest = _load_manifest(manifest_path, identity)
@@ -1159,6 +1251,17 @@ def _stage_preflight(
                     if recorded_stage == stage
                     else _expected_stage_coverage(matrix, recorded_folds)
                 )
+                recorded_populations = (
+                    expected_preprocessing_populations
+                    if recorded_stage == stage
+                    else _preprocessing_populations(
+                        matrix,
+                        recorded_folds,
+                        models=models,
+                        feature_sets=feature_sets,
+                        validation_days=validation_days,
+                    )
+                )
             except DataContractError as error:
                 raise ArtifactMismatch(
                     f"{recorded_stage} expected coverage cannot be derived"
@@ -1173,6 +1276,7 @@ def _stage_preflight(
                 eval_years=recorded_eval_years,
                 classical_seed=classical_seed,
                 expected_coverage=recorded_coverage,
+                expected_preprocessing_populations=recorded_populations,
             )
     stage_exists = members_path.exists() or point_path.exists() or stage in manifest["stages"]
     if not stage_exists:
@@ -1261,6 +1365,13 @@ def _run_paper_stage(
     expected_coverage = _expected_stage_coverage(
         normalized_matrices[selected_features[0]], folds
     )
+    expected_preprocessing_populations = _preprocessing_populations(
+        normalized_matrices[selected_features[0]],
+        folds,
+        models=selected_models,
+        feature_sets=selected_features,
+        validation_days=config.validation_days,
+    )
     identity = _manifest_identity(
         profile=profile,
         hashes=hashes,
@@ -1269,6 +1380,7 @@ def _run_paper_stage(
         classical_seed=classical_seed,
         schemas=schemas,
         execution_overrides=execution_overrides,
+        config=config,
     )
     run = Path(run_dir)
     cache = PredictionCache(Path(cache_dir))
@@ -1287,7 +1399,9 @@ def _run_paper_stage(
                 folds=folds,
                 classical_seed=classical_seed,
                 expected_coverage=expected_coverage,
+                expected_preprocessing_populations=expected_preprocessing_populations,
                 profile=profile,
+                validation_days=config.validation_days,
             )
 
         recovered = _recover_publication(
@@ -1377,6 +1491,7 @@ def _run_paper_stage(
         stage_record: dict[str, Any] = {
             "eval_years": list(eval_years),
             "expected_coverage": expected_coverage,
+            "preprocessing_populations": expected_preprocessing_populations,
             "split_ids": list(split_ids),
             "streams": _stream_records(
                 selected_models, selected_features, classical_seed

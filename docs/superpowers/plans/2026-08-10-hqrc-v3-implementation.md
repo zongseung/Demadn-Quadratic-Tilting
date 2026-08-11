@@ -34,7 +34,7 @@
 - `hqrc_v3/pyproject.toml`: standalone package metadata, pytest/ruff configuration, slow-test marker.
 - `hqrc_v3/configs/experiment.toml`: input mapping, fixed folds, model/sampler defaults.
 - `hqrc_v3/configs/events.csv`: versioned ten-occurrence event registry.
-- `hqrc_v3/configs/holiday_calendar.csv`: 2019--2024 Seollal/Chuseok calendar used only for B1 feature distances.
+- `hqrc_v3/configs/holiday_calendar.csv`: 2019--2024 Seollal/Chuseok plus 2018/2025 boundary support, used only for B1 feature distances/official positions.
 - `hqrc_v3/configs/model_spaces.toml`: fixed paper baseline parameters and optional one-shot candidate sets.
 - `hqrc_v3/src/hqrc_v3/config.py`: typed TOML loading and cross-field validation.
 - `hqrc_v3/src/hqrc_v3/contracts.py`: forecast arrays and long-form prediction schema.
@@ -102,9 +102,10 @@ def test_feature_calendar_includes_2019_but_correction_registry_does_not():
     events = load_event_registry(PROJECT_ROOT / "configs/events.csv")
     calendar = load_holiday_calendar(PROJECT_ROOT / "configs/holiday_calendar.csv")
     assert min(event.central_date.year for event in events) == 2020
-    assert min(event.central_date.year for event in calendar) == 2019
+    assert min(event.central_date.year for event in calendar) == 2018
+    assert max(event.central_date.year for event in calendar) == 2025
     assert len(events) == 10
-    assert len(calendar) == 12
+    assert len(calendar) == 14
 
 def test_manifest_rejects_changed_data_hash(tmp_path):
     manifest = RunManifest(data_sha256="aaa", config_sha256="bbb", event_sha256="ccc")
@@ -149,7 +150,7 @@ class EventOccurrence:
         return self.official_end + timedelta(days=1)
 ```
 
-Write all ten correction rows and all twelve feature-calendar rows exactly as specified in the approved design. Reject duplicate ids/dates, invalid ordering, overlapping event windows, non-binary restriction values, or a type/year count other than one. The 2019 calendar rows must never be returned by `load_event_registry`.
+Write all ten correction rows and all fourteen feature-calendar rows exactly as specified in the approved design. Reject duplicate ids/dates, invalid ordering, overlapping event windows, non-binary restriction values, or a type/year count other than one. The 2018/2019/2025 feature-support rows must never be returned by `load_event_registry`.
 
 - [ ] **Step 4: Run focused tests and lint**
 
@@ -180,7 +181,7 @@ git commit -m "feat(hqrc-v3): add configuration and event contracts"
 - Create: `hqrc_v3/tests/unit/test_samples.py`
 
 **Interfaces:**
-- Consumes: `ExperimentConfig`, the 12-row feature calendar, and the 10-row correction registry from Task 1.
+- Consumes: `ExperimentConfig`, the 14-row feature calendar, and the 10-row correction registry from Task 1.
 - Produces: `ForecastMatrix`, `read_hourly_data`, `audit_hourly_data`, `attach_calendar_features`, `feature_columns(feature_set)`, `assert_no_holiday_leakage`, and `build_daily_forecast_matrix`.
 
 - [ ] **Step 1: Write audit, leakage, and shape tests**
@@ -1122,6 +1123,7 @@ READY verdict.
 - Modify: `hqrc_v3/src/hqrc_v3/baselines/config.py`
 - Modify: `hqrc_v3/src/hqrc_v3/baselines/paper.py`
 - Modify: `hqrc_v3/configs/model_spaces.toml`
+- Create: `hqrc_v3/configs/temporary_holiday_availability.csv`
 - Modify: `hqrc_v3/README.md`
 - Modify: `docs/superpowers/specs/2026-08-10-hqrc-v3-design.md`
 - Modify: relevant feature/classical/sequence/paper integration tests
@@ -1138,15 +1140,24 @@ B0_FUTURE = (
 B1_ONLY = (
     "is_public_holiday", "official_sequence_position",
     "seollal_distance", "chuseok_distance",
-    "is_substitute_or_temporary_holiday", "holiday_type",
+    "is_substitute_or_temporary_holiday", "is_seollal", "is_chuseok",
 )
-HISTORY = ("load_mw", "temperature_c", "relative_humidity")
+OBSERVED = ("load_mw", "temperature_c", "relative_humidity")
+
+def history_columns(feature_set):
+    return OBSERVED + future_columns(feature_set)
 ```
 
 `day_of_week` is an ordinary weekly predictor and belongs to B0; B1 inherits it. The paper's
-feature table must not list it as a B1-only family. No `oracle_*`, target-window weather, or
+feature table must not list it as a B1-only family. `holiday type` remains one conceptual family
+but is physically encoded by the mutually exclusive `is_seollal`/`is_chuseok` columns; scalar
+0/1/2 encoding is forbidden. No `oracle_*`, target-window weather, or
 degree-hour column is allowed in the main paper matrix. Degree hours may be revisited only in a
 separately labelled oracle/weather-forecast sensitivity with a source-vintage contract.
+
+The 168-hour history contains the three observed variables followed by the feature set's exact
+known-calendar schema. B0 history/future widths are 10/7 and B1 widths are 17/14. Past and future
+calendar channels use the same semantic order; only history contains observed load/weather.
 
 The fixed real source must map `holiday_name` and `is_holiday_dummies` to canonical source
 columns and validate date-level/hour-level consistency. From 2019-01-01 through 2024-10-31 it
@@ -1154,11 +1165,18 @@ contains exactly 107 public-holiday dates. The deterministic
 `is_substitute_or_temporary_holiday` flag is one only for a public-holiday row whose source name
 begins `Alternative holiday`, equals `Temporary Public Holiday`, or is `Armed Forces Day` on
 2024-10-01; this yields 14 dates in the fixed source. 2024-10-01 is B1 public/temporary holiday
-but has `holiday_type=0` and is not an HQRC event window.
+but has both type one-hot columns zero and is not an HQRC event window.
+
+An ex-post label does not prove forecast-origin availability for an exceptional temporary
+holiday. Version `configs/temporary_holiday_availability.csv` with exactly these source-backed
+rows and require `known_on < holiday_date`: 2020-08-17 known 2020-07-21, 2023-10-02 known
+2023-08-31, and 2024-10-01 known 2024-09-03. Bind its SHA-256 to paper artifacts. The official
+source URLs are Korea Policy Briefing news ids 148874895, 148919605, and 148933400. Every source
+row classified as temporary must have an exact registry match.
 
 **Canonical preprocessing contract:**
 
-- Classical X is `flatten(history[168,3]) + flatten(future[24,p])` for every horizon. Fit one
+- Classical X is `flatten(history[168,h]) + flatten(future[24,p])` for every horizon. Fit one
   `StandardScaler` on this complete X using estimator-fit rows only.
 - Fit one train-only target `StandardScaler` over the estimator-fit 24-hour target values.
   XGBoost, LightGBM, and RBF-SVR all learn standardized targets; inverse-transform every output
@@ -1167,9 +1185,11 @@ but has `holiday_type=0` and is not an HQRC event window.
 - XGBoost/LightGBM and neural models fit scalers on the estimator-fit portion before the
   chronological 61-day early-stopping tail. SVR has no early stopping, so its estimator-fit
   portion is the complete outer training fold.
-- Sequence models share the train-target scaler with the history `load_mw` channel, fit separate
-  train-only featurewise weather-history and future-calendar scalers, and inverse-transform the
-  joint 24-hour output to MW. Validation/evaluation perturbations must not change any scaler.
+- Sequence models share the train-target scaler with the history `load_mw` channel. Weather
+  scaling uses each unique inferred timestamp from estimator-fit observed history once and
+  rejects inconsistent duplicate values. One calendar scaler is fitted on the non-overlapping
+  estimator-fit 24-hour future paths and applied to both history/future calendar channels. The
+  joint output is inverse-transformed to MW. Validation/evaluation cannot change a scaler.
 - Bind preprocessing version, future-path length, scaler kinds, scaler-fit partition rule, and
   exact history/future column order into the frozen model configuration and baseline manifest.
 
@@ -1180,8 +1200,10 @@ Tests must prove all of the following before production edits:
 1. Perturbing actual temperature/humidity inside one target day leaves that origin's future B0
    and B1 arrays byte-identical; no future schema contains `oracle`, `temperature`, `humidity`,
    `heating`, or `cooling`.
-2. B0 has exactly seven known-future columns and no source/event holiday field; B1 appends exactly
-   the six named families above.
+2. B0 has exactly seven known-future columns and no source/event holiday field; B1 appends six
+   conceptual families represented by seven physical columns. B0 history/future widths are 10/7
+   and B1 widths are 17/14. Type one-hot columns are mutually exclusive and both zero for
+   ordinary/other public holidays.
 3. The real fixed source produces 107 public-holiday dates and 14 substitute/temporary dates;
    2024-10-01 is B1-flagged but absent from the Seollal/Chuseok analysis windows.
 4. Changing hour 24 of the future path changes the raw design row seen by every horizon,
@@ -1190,10 +1212,11 @@ Tests must prove all of the following before production edits:
    estimator-fit data does. Predictions are returned in MW.
 6. A recording SVR receives standardized y with configured `epsilon=0.05`; validation-target
    values never enter that scale. XGBoost/LightGBM use the same target coordinate contract.
-7. The sequence history load channel and targets use the same training-target mean/scale while
-   weather and future calendar use their declared train-only feature scalers.
-8. Baseline artifacts fail closed when preprocessing version/path/scaler/schema metadata is
-   changed or omitted.
+7. The sequence history load channel and targets use the same training-target mean/scale;
+   weather uses each unique observed-history hour once; a calendar scaler fitted on unique future
+   hours is shared by history/future calendar channels.
+8. Baseline artifacts fail closed when preprocessing version/path/scaler/schema metadata or the
+   temporary-holiday availability hash is changed or omitted, even after manifest rehashing.
 
 Run the focused tests and preserve the genuine failures in the Task 12 report.
 
@@ -1201,13 +1224,16 @@ Run the focused tests and preserve the genuine failures in the Task 12 report.
 
 Extend ingestion without copying or rewriting the CSV. Require non-null binary source flags,
 one name/flag pair per date replicated consistently across 24 rows, and no non-holiday row with a
-nonblank holiday name. Derive B1 from the source flag/name plus the versioned 12-occurrence lunar
-calendar. Keep B0 isolated from both the raw fields and all derived holiday columns.
+nonblank holiday name. Derive B1 from the source flag/name plus the versioned 14-occurrence lunar
+calendar (including 2018/2025 distance support). Load the three-row temporary availability registry, validate exact classification and
+`known_on < holiday_date`, and bind its hash to stage identity. Keep B0 isolated from both the raw
+fields and all derived holiday columns.
 
 - [ ] **Step 3: Remove realized future weather and freeze the causal matrix schema**
 
 Delete the main-path `oracle_*` and future degree-hour expressions. Retain observed
-temperature/humidity only in the 168-hour history. Add boundary tests for official sequence
+temperature/humidity only in the 168-hour history, and append that feature set's known-calendar
+values to every history step. Add boundary tests for official sequence
 position, signed distances, substitute/temporary dates, and the distinction between the official
 sequence and the wider `official +/- 1 day` HQRC analysis window.
 
@@ -1216,14 +1242,17 @@ sequence and the wider `official +/- 1 day` HQRC analysis window.
 Create immutable fitted scaler objects with finite/nonzero-scale/schema checks. Make all 24
 classical estimators consume the same scaled full-path X and standardized targets, and store the
 scalers and exact schemas in `HorizonRegressor`. Apply the shared target/load contract to both
-neural adapters. Reject changed columns, reordered columns, changed widths, nonfinite values, or
-attempted fitting with validation/evaluation rows.
+neural adapters, deduplicate weather-scaler hours by inferred timestamp, and share one
+future-fitted calendar scaler across past/future calendar channels. Reject changed columns,
+reordered columns, inconsistent duplicate hours, changed widths, nonfinite values, or attempted
+fitting with validation/evaluation rows.
 
 - [ ] **Step 5: Bind the contract into config, manifests, and operator documentation**
 
 Add an exact `[preprocessing]` table to `model_spaces.toml`; parse and validate it as part of the
 frozen SHA-bound registry. Add the canonical preprocessing object to baseline manifest identity
-and semantic reload validation. Document that weather forecast vintages are unavailable, future
+and semantic reload validation, including actual scaler population counts/ranges and the
+availability-registry hash. Document that weather forecast vintages are unavailable, future
 weather is therefore excluded from the main analysis, 2024 evaluation ends on October 31, and
 the exact daily sample counts are 2,124 total, 1,461 OOF, 1,819 outer-final-train (1,758
 estimator-fit plus 61 validation for early-stopped models), and 305 final-evaluation samples.

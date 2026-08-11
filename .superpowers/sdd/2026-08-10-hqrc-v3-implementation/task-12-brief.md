@@ -36,16 +36,22 @@ training is the expected bottleneck.
 
 Key invariants:
 
-- history: load/temperature/humidity, 168 observed hours;
+- history: 168 hours of load/temperature/humidity plus the feature set's known-calendar columns;
 - B0 future: exactly seven calendar/Fourier columns;
-- B1 future: B0 plus exactly six source/calendar holiday families;
+- B1 future: B0 plus six source/calendar holiday families represented by seven columns, with
+  holiday type encoded as `is_seollal`/`is_chuseok` one-hot rather than scalar 0/1/2;
 - no realized future weather or degree-hour feature in the main matrix;
 - classical design: one full-path X per sample, shared by all 24 estimators;
 - X/target scalers fit estimator-fit rows only; output is always MW;
-- neural history load and y share the target scale;
+- neural history load and y share the target scale; unique inferred history hours fit weather,
+  while future unique hours fit one calendar scaler shared by past/future calendar channels;
 - preprocessing contract is frozen in TOML SHA and baseline manifest;
 - real source: 51,144 hours, 107 public-holiday dates, 14 substitute/temporary dates;
 - October 1, 2024 is B1 holiday/temporary but not an HQRC event.
+- exceptional temporary dates match a versioned three-row availability registry and were known
+  before their holiday date; its hash is part of artifact identity.
+- the feature calendar has 14 rows: 2018 Chuseok and 2025 Seollal are distance-only support;
+  nearest-distance ties choose the earlier central date independent of input row order.
 
 ## Delivery and review
 

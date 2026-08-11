@@ -1,6 +1,24 @@
-schema_version = 1
+schema_version = 2
 models = ["xgboost", "lightgbm", "svr", "seq2seq_lstm", "transformer"]
 validation_days = 61
+
+[preprocessing]
+version = "causal-v1"
+history_hours = 168
+future_path_hours = 24
+observed_columns = ["load_mw", "temperature_c", "relative_humidity"]
+b0_future_columns = ["hour", "day_of_week", "is_weekend", "annual_sin", "annual_cos", "weekly_sin", "weekly_cos"]
+b1_only_columns = ["is_public_holiday", "official_sequence_position", "seollal_distance", "chuseok_distance", "is_substitute_or_temporary_holiday", "is_seollal", "is_chuseok"]
+classical_input_scaler = "standard-population-featurewise"
+target_scaler = "standard-population"
+sequence_weather_scaler = "standard-population-featurewise"
+sequence_calendar_scaler = "standard-population-featurewise"
+scaler_fit_partition = "estimator-fit-only"
+classical_future_path = "full"
+classical_x_population = "daily-sample-rows"
+target_population = "unique-target-hours"
+sequence_weather_population = "unique-inferred-history-hours"
+sequence_calendar_population = "unique-future-hours-shared-history-future"
 
 [xgboost]
 objective = "reg:squarederror"

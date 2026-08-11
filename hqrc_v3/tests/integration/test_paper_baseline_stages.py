@@ -16,7 +16,7 @@ import pytest
 from hqrc_v3.baselines.config import MODEL_NAMES, PAPER_SEEDS, load_paper_baselines
 from hqrc_v3.baselines.paper import run_paper_final_stage, run_paper_oof_stage
 from hqrc_v3.contracts import DataContractError, ForecastMatrix
-from hqrc_v3.features import feature_columns
+from hqrc_v3.features import feature_columns, history_columns
 from hqrc_v3.oof import cache_key
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
 from hqrc_v3.splits import expanding_oof_folds
@@ -31,6 +31,7 @@ HASHES = {
     "model_config_sha256": file_sha256(MODEL_CONFIG),
     "event_registry_sha256": "d" * 64,
     "holiday_calendar_sha256": "e" * 64,
+    "temporary_holiday_availability_sha256": "6" * 64,
 }
 
 
@@ -57,10 +58,12 @@ def _matrix(feature_set: str) -> ForecastMatrix:
     return ForecastMatrix(
         origins=origins,
         target_times=target_times,
-        history=np.broadcast_to(values[:, None, None], (count, 168, 1)).copy(),
+        history=np.broadcast_to(
+            values[:, None, None], (count, 168, len(history_columns(feature_set)))
+        ).copy(),
         future=np.zeros((count, 24, len(columns)), dtype=float),
         target=values[:, None] + np.arange(24, dtype=float)[None, :],
-        history_columns=("load_mw",),
+        history_columns=history_columns(feature_set),  # type: ignore[arg-type]
         future_columns=columns,
     )
 
@@ -79,6 +82,8 @@ def _write_short_cli_source(tmp_path: Path) -> Path:
             "hm": np.full(len(timestamps), 50.0),
             "ta": np.full(len(timestamps), 15.0),
             "power demand(MW)": np.full(len(timestamps), 100.0),
+            "holiday_name": [""] * len(timestamps),
+            "is_holiday_dummies": np.zeros(len(timestamps), dtype=np.int8),
         }
     ).write_csv(source)
     return source
@@ -425,15 +430,117 @@ def test_manifest_binds_inputs_models_seeds_feature_schemas_and_streams(tmp_path
 
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
 
-    assert manifest["schema_version"] == 1
+    assert manifest["schema_version"] == 2
     assert manifest["input_hashes"] == HASHES
     assert tuple(manifest["models"]) == MODEL_NAMES
     assert tuple(manifest["neural_seeds"]) == PAPER_SEEDS
     assert manifest["ensemble_seed"] == 0
     assert set(manifest["feature_schemas"]) == {"B0", "B1"}
+    assert manifest["preprocessing"]["version"] == "causal-v1"
+    populations = manifest["stages"]["oof"]["preprocessing_populations"]
+    assert len(populations) == 40
+    assert populations[0] == {
+        "model": "xgboost",
+        "feature_set": "B0",
+        "split_id": "oof-2020",
+        "scalers": {
+            "x": {
+                "count": 1,
+                "start": "2019-10-31T00:00:00",
+                "end": "2019-10-31T00:00:00",
+                "unit": "daily-sample",
+            },
+            "target": {
+                "count": 24,
+                "start": "2019-10-31T00:00:00",
+                "end": "2019-10-31T23:00:00",
+                "unit": "unique-hour",
+            },
+        },
+    }
+    sequence_population = next(
+        row
+        for row in populations
+        if row["model"] == "seq2seq_lstm"
+        and row["feature_set"] == "B0"
+        and row["split_id"] == "oof-2020"
+    )
+    assert sequence_population["scalers"] == {
+        "target": {
+            "count": 24,
+            "start": "2019-10-31T00:00:00",
+            "end": "2019-10-31T23:00:00",
+            "unit": "unique-hour",
+        },
+        "weather": {
+            "count": 168,
+            "start": "2019-10-24T00:00:00",
+            "end": "2019-10-30T23:00:00",
+            "unit": "unique-hour",
+        },
+        "calendar": {
+            "count": 24,
+            "start": "2019-10-31T00:00:00",
+            "end": "2019-10-31T23:00:00",
+            "unit": "unique-hour",
+        },
+    }
     assert len(manifest["stages"]["oof"]["streams"]) == 10
     assert manifest["stages"]["oof"]["expected_coverage"]["count"] == 5_952
     assert len(manifest["stages"]["oof"]["expected_coverage"]["sha256"]) == 64
+
+
+@pytest.mark.parametrize("mutation", ["missing", "version", "future_path", "scaler"])
+def test_completed_stage_rejects_changed_or_omitted_preprocessing_identity(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    result = _run_oof(tmp_path)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    if mutation == "missing":
+        del manifest["preprocessing"]
+    elif mutation == "version":
+        manifest["preprocessing"]["version"] = "causal-v2"
+    elif mutation == "future_path":
+        manifest["preprocessing"]["future_path_hours"] = 23
+    else:
+        manifest["preprocessing"]["target_scaler"] = "different-scaler"
+    result.manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+
+    with pytest.raises(ArtifactMismatch, match="manifest schema|preprocessing"):
+        _run_oof(tmp_path)
+
+
+def test_completed_stage_rejects_rewritten_scaler_population(tmp_path: Path) -> None:
+    result = _run_oof(tmp_path)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    manifest["stages"]["oof"]["preprocessing_populations"][0]["scalers"]["x"][
+        "count"
+    ] += 1
+    result.manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+
+    with pytest.raises(ArtifactMismatch, match="preprocessing scaler populations"):
+        _run_oof(tmp_path)
+
+
+def test_completed_stage_rejects_omitted_temporary_availability_hash(
+    tmp_path: Path,
+) -> None:
+    result = _run_oof(tmp_path)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    del manifest["input_hashes"]["temporary_holiday_availability_sha256"]
+    result.manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+
+    with pytest.raises(
+        ArtifactMismatch, match="temporary_holiday_availability_sha256"
+    ):
+        _run_oof(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -893,6 +1000,9 @@ def test_concrete_cli_loads_both_feature_matrices_and_hash_bound_inputs(
         "holiday_calendar_sha256": file_sha256(
             PROJECT_ROOT / "configs/holiday_calendar.csv"
         ),
+        "temporary_holiday_availability_sha256": file_sha256(
+            PROJECT_ROOT / "configs/temporary_holiday_availability.csv"
+        ),
     }
 
 
@@ -933,13 +1043,14 @@ def test_paper_cli_passes_exact_fixed_bounds_to_the_audit(
     monkeypatch.setattr(cli, "audit_hourly_data", record_and_stop)
 
     assert cli.main(_baseline_cli_arguments(source, tmp_path)) == 2
-    assert received == [
-        {
-            "expected_start": datetime(2019, 1, 1),
-            "expected_end": datetime(2024, 10, 31, 23),
-            "expected_rows": 51_144,
-        }
-    ]
+    assert len(received) == 1
+    expected = received[0]
+    assert expected["expected_start"] == datetime(2019, 1, 1)
+    assert expected["expected_end"] == datetime(2024, 10, 31, 23)
+    assert expected["expected_rows"] == 51_144
+    assert expected["expected_public_holiday_dates"] == 107
+    assert expected["expected_substitute_or_temporary_dates"] == 14
+    assert len(expected["temporary_holiday_availability"]) == 3
 
 
 def test_readme_hqrc_commands_are_executable_from_the_repository_root() -> None:

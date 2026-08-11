@@ -20,16 +20,36 @@ def tiny_forecast_matrix():
     target_times = origins[:, None] + np.arange(24).astype("timedelta64[h]")
     sample = np.arange(count, dtype=float)[:, None, None]
     hour = np.arange(24, dtype=float)[None, :, None]
-    history_hour = np.arange(168, dtype=float)[None, :, None]
+    history_hour = np.arange(-168, 0, dtype=float)[None, :, None]
+    absolute_history_hour = sample * 24.0 + history_hour
     history = np.concatenate(
-        (sample + history_hour / 100, np.broadcast_to(history_hour / 10, (count, 168, 1))), axis=2
+        (
+            50_000.0 + absolute_history_hour,
+            10.0 + absolute_history_hour / 168.0,
+            50.0 + absolute_history_hour / 336.0,
+            np.mod(absolute_history_hour, 24.0),
+            absolute_history_hour / 24.0,
+        ),
+        axis=2,
     )
     future = np.concatenate(
         (np.broadcast_to(hour / 24, (count, 24, 1)), sample + hour / 50), axis=2
     )
-    target = sample[:, 0, 0, None] + hour[:, :, 0] + 0.5
+    target = 51_000.0 + sample[:, 0, 0, None] * 24.0 + hour[:, :, 0]
     return ForecastMatrix(
-        origins, target_times, history, future, target, ("load", "temperature"), ("hour", "weather")
+        origins,
+        target_times,
+        history,
+        future,
+        target,
+        (
+            "load_mw",
+            "temperature_c",
+            "relative_humidity",
+            "hour",
+            "annual_sin",
+        ),
+        ("hour", "annual_sin"),
     )
 
 

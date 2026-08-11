@@ -19,6 +19,25 @@ MODEL_NAMES = (
 )
 PAPER_SEEDS = (11, 23, 37, 41, 53)
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_OBSERVED_COLUMNS = ("load_mw", "temperature_c", "relative_humidity")
+_B0_FUTURE_COLUMNS = (
+    "hour",
+    "day_of_week",
+    "is_weekend",
+    "annual_sin",
+    "annual_cos",
+    "weekly_sin",
+    "weekly_cos",
+)
+_B1_ONLY_COLUMNS = (
+    "is_public_holiday",
+    "official_sequence_position",
+    "seollal_distance",
+    "chuseok_distance",
+    "is_substitute_or_temporary_holiday",
+    "is_seollal",
+    "is_chuseok",
+)
 
 
 class PaperBaselineConfigError(ValueError):
@@ -188,6 +207,54 @@ class NeuralPaperConfig:
 
 
 @dataclass(frozen=True)
+class PreprocessingPaperConfig:
+    version: str
+    history_hours: int
+    future_path_hours: int
+    observed_columns: tuple[str, ...]
+    b0_future_columns: tuple[str, ...]
+    b1_only_columns: tuple[str, ...]
+    classical_input_scaler: str
+    target_scaler: str
+    sequence_weather_scaler: str
+    sequence_calendar_scaler: str
+    scaler_fit_partition: str
+    classical_future_path: str
+    classical_x_population: str
+    target_population: str
+    sequence_weather_population: str
+    sequence_calendar_population: str
+
+    def __post_init__(self) -> None:
+        expected = {
+            "version": "causal-v1",
+            "history_hours": 168,
+            "future_path_hours": 24,
+            "observed_columns": _OBSERVED_COLUMNS,
+            "b0_future_columns": _B0_FUTURE_COLUMNS,
+            "b1_only_columns": _B1_ONLY_COLUMNS,
+            "classical_input_scaler": "standard-population-featurewise",
+            "target_scaler": "standard-population",
+            "sequence_weather_scaler": "standard-population-featurewise",
+            "sequence_calendar_scaler": "standard-population-featurewise",
+            "scaler_fit_partition": "estimator-fit-only",
+            "classical_future_path": "full",
+            "classical_x_population": "daily-sample-rows",
+            "target_population": "unique-target-hours",
+            "sequence_weather_population": "unique-inferred-history-hours",
+            "sequence_calendar_population": "unique-future-hours-shared-history-future",
+        }
+        for field, value in expected.items():
+            _require_exact(getattr(self, field), value, f"preprocessing.{field}")
+
+    def to_manifest(self) -> dict[str, object]:
+        return {
+            field: list(value) if isinstance(value, tuple) else value
+            for field, value in self.__dict__.items()
+        }
+
+
+@dataclass(frozen=True)
 class PaperBaselineConfig:
     schema_version: int
     models: tuple[str, ...]
@@ -197,10 +264,11 @@ class PaperBaselineConfig:
     svr: SVRPaperConfig
     seq2seq_lstm: NeuralPaperConfig
     transformer: NeuralPaperConfig
+    preprocessing: PreprocessingPaperConfig
     source_sha256: str
 
     def __post_init__(self) -> None:
-        _require_exact(self.schema_version, 1, "schema_version")
+        _require_exact(self.schema_version, 2, "schema_version")
         _require_exact(self.models, MODEL_NAMES, "models")
         _require_exact(self.validation_days, 61, "validation_days")
         if not isinstance(self.source_sha256, str) or _SHA256.fullmatch(self.source_sha256) is None:
@@ -224,6 +292,12 @@ def _models(value: object) -> tuple[str, ...]:
 def _seeds(value: object, name: str) -> tuple[int, ...]:
     if not isinstance(value, list) or any(type(item) is not int for item in value):
         raise PaperBaselineConfigError(f"{name}.seeds must be an array of integers")
+    return tuple(value)
+
+
+def _strings(value: object, name: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise PaperBaselineConfigError(f"{name} must be an array of strings")
     return tuple(value)
 
 
@@ -260,6 +334,7 @@ def load_paper_baselines(
         "svr",
         "seq2seq_lstm",
         "transformer",
+        "preprocessing",
     }
     _require_keys(document, root_fields, "root")
     xgboost_fields = tuple(XGBoostPaperConfig.__dataclass_fields__)
@@ -273,6 +348,8 @@ def load_paper_baselines(
     svr = _table(document, "svr", svr_fields)
     seq2seq_lstm = _table(document, "seq2seq_lstm", neural_fields)
     transformer = _table(document, "transformer", neural_fields)
+    preprocessing_fields = tuple(PreprocessingPaperConfig.__dataclass_fields__)
+    preprocessing = _table(document, "preprocessing", preprocessing_fields)
     return PaperBaselineConfig(
         schema_version=document.get("schema_version"),
         models=_models(document.get("models")),
@@ -289,6 +366,20 @@ def load_paper_baselines(
             model_name="transformer",
             seeds=_seeds(transformer.pop("seeds"), "transformer"),
             **transformer,
+        ),
+        preprocessing=PreprocessingPaperConfig(
+            observed_columns=_strings(
+                preprocessing.pop("observed_columns"), "preprocessing.observed_columns"
+            ),
+            b0_future_columns=_strings(
+                preprocessing.pop("b0_future_columns"),
+                "preprocessing.b0_future_columns",
+            ),
+            b1_only_columns=_strings(
+                preprocessing.pop("b1_only_columns"),
+                "preprocessing.b1_only_columns",
+            ),
+            **preprocessing,
         ),
         source_sha256=actual_sha256,
     )

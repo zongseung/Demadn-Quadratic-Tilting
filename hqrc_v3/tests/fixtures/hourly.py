@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import polars as pl
 import pytest
@@ -15,12 +15,20 @@ def hourly_frame() -> pl.DataFrame:
 
     start = datetime(2023, 1, 1)
     timestamps = [start + timedelta(hours=offset) for offset in range(10 * 24)]
+    official_days = {date(2023, 1, 8), date(2023, 1, 9), date(2023, 1, 10)}
     return pl.DataFrame(
         {
             "timestamp": timestamps,
             "load_mw": [100.0 + (offset % 24) for offset in range(len(timestamps))],
             "temperature_c": [10.0 + (offset % 8) for offset in range(len(timestamps))],
             "relative_humidity": [45.0 + (offset % 10) for offset in range(len(timestamps))],
+            "source_holiday_name": [
+                "Seollal" if timestamp.date() in official_days else ""
+                for timestamp in timestamps
+            ],
+            "source_public_holiday": [
+                int(timestamp.date() in official_days) for timestamp in timestamps
+            ],
         }
     )
 

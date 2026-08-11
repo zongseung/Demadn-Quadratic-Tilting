@@ -133,11 +133,27 @@ def load_event_registry(path: Path) -> tuple[EventOccurrence, ...]:
 
 
 def load_holiday_calendar(path: Path) -> tuple[EventOccurrence, ...]:
-    """Load the feature calendar, including the required 2019 lookback year."""
+    """Load the feature calendar, including two boundary-distance support events."""
 
     events = _load_events(path)
-    years = {event.central_date.year for event in events}
-    if years != {2019, 2020, 2021, 2022, 2023, 2024} or len(events) != 12:
-        raise EventRegistryError("feature calendar must contain one event per type for 2019-2024")
+    required = {
+        *(f"{holiday}-{year}" for holiday in ("seollal", "chuseok") for year in range(2019, 2025)),
+        "chuseok-2018",
+        "seollal-2025",
+    }
+    if {event.occurrence_id for event in events} != required or len(events) != 14:
+        raise EventRegistryError(
+            "feature calendar must contain 2019-2024 plus exact 2018/2025 distance support"
+        )
+    supports = {
+        event.occurrence_id: event.central_date
+        for event in events
+        if event.occurrence_id in {"chuseok-2018", "seollal-2025"}
+    }
+    if supports != {
+        "chuseok-2018": date(2018, 9, 24),
+        "seollal-2025": date(2025, 1, 29),
+    }:
+        raise EventRegistryError("feature distance support central dates differ")
     _validate_restriction_mapping(events)
     return events

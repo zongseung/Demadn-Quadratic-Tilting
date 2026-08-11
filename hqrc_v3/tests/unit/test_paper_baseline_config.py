@@ -69,6 +69,11 @@ def test_versioned_config_loads_only_the_five_exact_paper_models() -> None:
     )
     assert config.models == MODEL_NAMES
     assert config.validation_days == 61
+    assert config.schema_version == 2
+    assert config.preprocessing.version == "causal-v1"
+    assert config.preprocessing.future_path_hours == 24
+    assert len(config.preprocessing.b0_future_columns) == 7
+    assert len(config.preprocessing.b1_only_columns) == 7
     assert config.seq2seq_lstm.seeds == config.transformer.seeds == PAPER_SEEDS
 
 

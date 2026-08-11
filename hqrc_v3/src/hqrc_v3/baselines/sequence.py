@@ -17,6 +17,11 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from hqrc_v3.baselines.preprocessing import (
+    FittedSequencePreprocessor,
+    FittedStandardScaler,
+    fit_sequence_preprocessor,
+)
 from hqrc_v3.contracts import (
     DataContractError,
     ForecastMatrix,
@@ -41,26 +46,6 @@ class SequenceTrainingConfig:
     epochs: int = 60
     patience: int = 8
     seeds: tuple[int, ...] = (11, 23, 37, 41, 53)
-
-
-@dataclass(frozen=True)
-class Standardizer:
-    """Feature-wise standardizer fitted on the training partition only."""
-
-    mean: np.ndarray | float
-    scale: np.ndarray | float
-
-    @classmethod
-    def fit(cls, values: np.ndarray, *, axes: tuple[int, ...]) -> Standardizer:
-        mean = np.mean(values, axis=axes)
-        scale = np.std(values, axis=axes)
-        return cls(mean=mean, scale=np.where(np.asarray(scale) == 0.0, 1.0, scale))
-
-    def transform(self, values: np.ndarray) -> np.ndarray:
-        return (values - self.mean) / self.scale
-
-    def inverse_transform(self, values: np.ndarray) -> np.ndarray:
-        return values * self.scale + self.mean
 
 
 class Seq2SeqLSTM(nn.Module):
@@ -152,15 +137,25 @@ class FittedTorchBaseline:
 
     model_name: str
     model: nn.Module
-    history_scaler: Standardizer
-    future_scaler: Standardizer
-    target_scaler: Standardizer
+    preprocessor: FittedSequencePreprocessor
     history_shape: tuple[int, int]
     future_width: int
     history_columns: tuple[str, ...]
     future_columns: tuple[str, ...]
     epochs_completed: int
     best_validation_loss: float | None
+
+    @property
+    def target_scaler(self) -> FittedStandardScaler:
+        return self.preprocessor.target_scaler
+
+    @property
+    def weather_scaler(self) -> FittedStandardScaler:
+        return self.preprocessor.weather_scaler
+
+    @property
+    def future_scaler(self) -> FittedStandardScaler:
+        return self.preprocessor.calendar_scaler
 
     def predict(self, batch: ForecastMatrix) -> np.ndarray:
         _validate_matrix(batch)
@@ -178,14 +173,15 @@ class FittedTorchBaseline:
             raise DataContractError(
                 "prediction matrix feature columns/order do not match the fitted baseline"
             )
-        history = self.history_scaler.transform(batch.history).astype(np.float32)
-        future = self.future_scaler.transform(batch.future).astype(np.float32)
+        history_values, future_values = self.preprocessor.transform_inputs(batch)
+        history = history_values.astype(np.float32)
+        future = future_values.astype(np.float32)
         self.model.eval()
         with torch.inference_mode():
             standardized = (
                 self.model(torch.from_numpy(history), torch.from_numpy(future)).cpu().numpy()
             )
-        prediction = np.asarray(self.target_scaler.inverse_transform(standardized), dtype=float)
+        prediction = np.asarray(self.preprocessor.inverse_target(standardized), dtype=float)
         if prediction.shape != batch.target.shape or not np.isfinite(prediction).all():
             raise DataContractError(
                 "sequence baseline predictions must be finite with shape (n_samples, 24)"
@@ -264,12 +260,11 @@ def _fit_one(
     config: SequenceTrainingConfig,
     seed: int,
 ) -> FittedTorchBaseline:
-    history_scaler = Standardizer.fit(train.history, axes=(0, 1))
-    future_scaler = Standardizer.fit(train.future, axes=(0, 1))
-    target_scaler = Standardizer.fit(train.target, axes=(0, 1))
-    train_history = torch.from_numpy(history_scaler.transform(train.history).astype(np.float32))
-    train_future = torch.from_numpy(future_scaler.transform(train.future).astype(np.float32))
-    train_target = torch.from_numpy(target_scaler.transform(train.target).astype(np.float32))
+    preprocessor = fit_sequence_preprocessor(train)
+    history_values, future_values = preprocessor.transform_inputs(train)
+    train_history = torch.from_numpy(history_values.astype(np.float32))
+    train_future = torch.from_numpy(future_values.astype(np.float32))
+    train_target = torch.from_numpy(preprocessor.transform_target(train.target).astype(np.float32))
 
     with _deterministic_cpu_context(seed):
         model = _build_model(name, train.history.shape[2], train.future.shape[2], config)
@@ -296,7 +291,7 @@ def _fit_one(
             if validation is None:
                 continue
             validation_loss = _validation_loss(
-                model, validation, history_scaler, future_scaler, target_scaler
+                model, validation, preprocessor
             )
             if best_loss is None or validation_loss < best_loss:
                 best_loss = validation_loss
@@ -313,9 +308,7 @@ def _fit_one(
     return FittedTorchBaseline(
         model_name=name,
         model=fitted_model,
-        history_scaler=history_scaler,
-        future_scaler=future_scaler,
-        target_scaler=target_scaler,
+        preprocessor=preprocessor,
         history_shape=train.history.shape[1:],
         future_width=train.future.shape[2],
         history_columns=tuple(train.history_columns),
@@ -343,13 +336,12 @@ def _build_model(
 def _validation_loss(
     model: nn.Module,
     validation: ForecastMatrix,
-    history_scaler: Standardizer,
-    future_scaler: Standardizer,
-    target_scaler: Standardizer,
+    preprocessor: FittedSequencePreprocessor,
 ) -> float:
-    history = torch.from_numpy(history_scaler.transform(validation.history).astype(np.float32))
-    future = torch.from_numpy(future_scaler.transform(validation.future).astype(np.float32))
-    target = torch.from_numpy(target_scaler.transform(validation.target).astype(np.float32))
+    history_values, future_values = preprocessor.transform_inputs(validation)
+    history = torch.from_numpy(history_values.astype(np.float32))
+    future = torch.from_numpy(future_values.astype(np.float32))
+    target = torch.from_numpy(preprocessor.transform_target(validation.target).astype(np.float32))
     model.eval()
     with torch.inference_mode():
         value = float(torch.mean((model(history, future) - target) ** 2).item())

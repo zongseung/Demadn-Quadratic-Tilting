@@ -197,9 +197,13 @@ B1은 B0 전체에 다음만 추가한다.
 - 설날까지 signed distance
 - 추석까지 signed distance
 - substitute/temporary public-holiday flag
-- holiday type
+- holiday type family, encoded by two mutually exclusive `is_seollal`/`is_chuseok` columns
 
-day-of-week는 일반 주간 예측 변수이므로 B0에 속하며 B1-only 특징으로 중복 기술하지 않는다. substitute/temporary flag는 source public-holiday 행 중 이름이 `Alternative holiday`로 시작하거나 `Temporary Public Holiday`와 같거나, 2024-10-01의 `Armed Forces Day`인 날짜에만 1이다. 고정 자료에서는 14개 날짜다. 2024-10-01은 B1 public/temporary flag에는 포함되지만 holiday type은 0이고 HQRC 보정 창에는 포함되지 않는다.
+day-of-week는 일반 주간 예측 변수이므로 B0에 속하며 B1-only 특징으로 중복 기술하지 않는다. nominal holiday type을 단일 0/1/2 수치로 표현하면 RBF-SVR와 신경망에 거짓 순서와 거리를 부여하므로 금지한다. 두 type one-hot이 모두 0이면 일반일 또는 다른 공휴일이다. substitute/temporary flag는 source public-holiday 행 중 이름이 `Alternative holiday`로 시작하거나 `Temporary Public Holiday`와 같거나, 2024-10-01의 `Armed Forces Day`인 날짜에만 1이다. 고정 자료에서는 14개 날짜다. 2024-10-01은 B1 public/temporary flag에는 포함되지만 두 type one-hot은 0이고 HQRC 보정 창에는 포함되지 않는다.
+
+각 feature set의 168시간 history는 `load_mw, temperature_c, relative_humidity` 뒤에 그 feature set의 known-calendar 열을 같은 순서로 붙인다. B0 history/future 물리 폭은 10/7이고 B1은 17/14다. 과거 seasonal/calendar 공변량도 encoder와 flattened classical input에 포함한다는 계약이며, history를 관측 세 열로만 제한한 prototype과 비교하지 않는다.
+
+임시공휴일의 ex-post source label만으로 forecast-origin 가용성을 주장하지 않는다. `configs/temporary_holiday_availability.csv`는 2020-08-17/2020-07-21, 2023-10-02/2023-08-31, 2024-10-01/2024-09-03의 `(holiday_date, known_on)`과 공식 source URL을 versioning한다. 각각 대한민국 정책브리핑 news id 148874895, 148919605, 148933400에 근거한다. 모든 source temporary label은 정확히 한 registry row와 일치하고 `known_on < holiday_date`여야 하며 이 파일 hash는 baseline artifact에 포함한다.
 
 B0 특징 행렬에 holiday 이름, holiday flag, event-relative time, 이벤트 창 여부가 들어가면 테스트가 실패한다. 이벤트 정보는 B0 예측과 별개로 HQRC window 선택에만 사용한다. 공식 연휴 내 signed day position/type과 `official sequence +/- 1 day`인 HQRC 분석 창은 서로 다른 계약이다.
 
@@ -233,7 +237,7 @@ B0 특징 행렬에 holiday 이름, holiday flag, event-relative time, 이벤트
 
 팬데믹 효과 `Delta_h`는 본 모델에 유지하되, 처리 이벤트가 네 개뿐이라는 약한 식별성을 posterior와 민감도 표에 명시한다. pandemic covariate 제거 모델도 민감도 분석으로 제공한다.
 
-B1의 signed distance와 sequence-position 특징은 baseline 학습 첫해인 2019에도 필요하다. 따라서 `configs/holiday_calendar.csv`는 위 10개 occurrence에 2019 설날(central 2019-02-05, official 2019-02-04--2019-02-06)과 2019 추석(central 2019-09-13, official 2019-09-12--2019-09-14)을 추가한 12개 달력 occurrence를 가진다. 이 파일은 B1 특징 생성에만 사용하며, 2019 occurrence는 OOF residual, HQRC pooling, LOEO 이벤트 수에 포함하지 않는다.
+B1의 signed distance와 sequence-position 특징은 baseline 학습 첫해인 2019에도 필요하다. 따라서 `configs/holiday_calendar.csv`는 위 10개 occurrence에 2019 설날(central 2019-02-05, official 2019-02-04--2019-02-06)과 2019 추석(central 2019-09-13, official 2019-09-12--2019-09-14)을 추가한다. 데이터 양끝의 nearest-distance 왜곡을 막기 위해 Chuseok 2018(center 2018-09-24, official 2018-09-23--2018-09-26)과 Seollal 2025(center 2025-01-29, official 2025-01-28--2025-01-30)도 거리 지원 occurrence로 포함하여 총 14행으로 고정한다. nearest central date는 날짜순으로 정렬한 뒤 선택하고 절대거리가 같은 경우 earlier center를 사용한다. 이 파일은 B1 특징 생성에만 사용하며, 2018/2019/2025 occurrence는 OOF residual, HQRC pooling, LOEO 이벤트 수에 포함하지 않는다.
 
 ## 7. 베이스라인 및 OOF 잔차
 
@@ -246,11 +250,11 @@ predict(fitted, forecast_batch) -> PredictionFrame
 
 `PredictionFrame`은 sample origin, target timestamp, horizon 1--24, observed MW, predicted MW, model, feature set, seed, split id를 가진 long-form 자료다. 중복된 `(model, feature_set, seed, split_id, target_timestamp)`는 허용하지 않는다.
 
-Tree/SVR은 horizon별 estimator 24개를 사용한다. 각 estimator는 동일한 `flatten(168시간 load/weather history) + flatten(24시간 known-future calendar path)`를 받는다. classical X는 estimator-fit 표본에만 적합한 StandardScaler로 변환하고, 모든 classical target은 같은 estimator-fit target StandardScaler로 표준화한 뒤 예측을 MW로 역변환한다. 이 좌표계에서 SVR의 `epsilon=0.05`는 0.05 MW가 아니라 학습 target 표준편차의 0.05다.
+Tree/SVR은 horizon별 estimator 24개를 사용한다. 각 estimator는 동일한 `flatten(168시간 observed+known-calendar history) + flatten(24시간 known-future calendar path)`를 받는다. classical X는 estimator-fit daily sample rows와 flattened-position 열에만 적합한 StandardScaler로 변환하고, 모든 classical target은 estimator-fit의 비중복 24시간 target 값에 적합한 같은 StandardScaler로 표준화한 뒤 예측을 MW로 역변환한다. 이 좌표계에서 SVR의 `epsilon=0.05`는 0.05 MW가 아니라 학습 target 표준편차의 0.05다.
 
-Seq2Seq-LSTM과 Transformer는 24시간을 공동 출력한다. history load와 target은 동일한 estimator-fit target scaler를 사용하고, history weather 및 future calendar는 estimator-fit 표본에만 적합한 featurewise scaler를 사용한다. 61일 early-stopping validation tail이나 evaluation year는 어떤 scaler 통계에도 포함되지 않는다. 신경망은 다섯 seed의 예측 평균을 한 baseline residual stream으로 사용하고 seed별 성능과 분산을 별도로 보존한다.
+Seq2Seq-LSTM과 Transformer는 24시간을 공동 출력한다. history load와 target은 동일한 estimator-fit target scaler를 사용한다. history weather scaler는 inferred timestamp로 중복 제거한 estimator-fit observed history 각 시간을 한 번만 사용하며, 중복 timestamp의 값이 다르면 실패한다. calendar scaler는 비중복 estimator-fit 24시간 future path에 적합하고 history/future calendar 채널에 함께 적용한다. 61일 early-stopping validation tail이나 evaluation year는 어떤 scaler 통계에도 포함되지 않는다. 신경망은 다섯 seed의 예측 평균을 한 baseline residual stream으로 사용하고 seed별 성능과 분산을 별도로 보존한다.
 
-전처리 version, scaler 종류, scaler-fit partition, 24시간 future-path 길이, history/future 열 이름과 순서는 `model_spaces.toml`의 고정 설정과 baseline manifest에 포함한다. 이 중 하나가 없거나 달라지면 cache를 재사용하지 않고 실패한다.
+전처리 version, scaler 종류, scaler-fit partition과 population/range/count, 24시간 future-path 길이, history/future 열 이름과 순서, temporary-holiday availability hash는 `model_spaces.toml`의 고정 설정과 baseline manifest에 포함한다. 이 중 하나가 없거나 달라지면 cache를 재사용하지 않고 실패한다.
 
 하이퍼파라미터는 2019--2022/2023에서 한 번 선택하고 고정한다. 기존 baseline 연구에서 확정된 versioned 설정을 사용하면 탐색을 생략한다. OOF fold마다 다시 탐색하지 않으며, 고정된 설정으로 해당 fold train만 다시 학습한다. final baseline은 동일 설정으로 2019--2023 전체를 다시 학습해 2024를 예측한다.
 

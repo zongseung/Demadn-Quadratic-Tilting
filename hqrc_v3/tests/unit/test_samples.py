@@ -3,7 +3,12 @@ from __future__ import annotations
 from datetime import datetime
 
 import numpy as np
-from hqrc_v3.features import attach_calendar_features, build_daily_forecast_matrix
+from hqrc_v3.features import (
+    attach_calendar_features,
+    build_daily_forecast_matrix,
+    feature_columns,
+    history_columns,
+)
 
 
 def test_daily_matrix_is_168_to_24(hourly_frame, holiday_calendar):
@@ -14,10 +19,14 @@ def test_daily_matrix_is_168_to_24(hourly_frame, holiday_calendar):
     assert matrix.history.shape[1] == 168
     assert matrix.future.shape[1] == 24
     assert matrix.target.shape[1] == 24
+    assert matrix.history.shape[1:] == (168, 17)
+    assert matrix.future.shape[1:] == (24, 14)
+    assert matrix.history_columns == history_columns("B1")
+    assert matrix.future_columns == feature_columns("B1")
     assert np.all(np.diff(matrix.target_times.astype("datetime64[h]"), axis=1) == 1)
 
 
-def test_matrix_keeps_weather_and_load_history_separate_from_future_covariates(
+def test_matrix_keeps_observed_history_and_shared_calendar_schema_distinct(
     hourly_frame, holiday_calendar
 ):
     matrix = build_daily_forecast_matrix(
@@ -26,7 +35,16 @@ def test_matrix_keeps_weather_and_load_history_separate_from_future_covariates(
 
     assert matrix.history.shape[2] == len(matrix.history_columns)
     assert matrix.future.shape[2] == len(matrix.future_columns)
-    assert matrix.history_columns == ("load_mw", "temperature_c", "relative_humidity")
+    assert matrix.history_columns == history_columns("B0")
+    assert matrix.future_columns == feature_columns("B0")
+    assert matrix.history_columns[:3] == (
+        "load_mw",
+        "temperature_c",
+        "relative_humidity",
+    )
+    assert matrix.history_columns[3:] == matrix.future_columns
+    assert matrix.history.shape[1:] == (168, 10)
+    assert matrix.future.shape[1:] == (24, 7)
 
 
 def test_matrix_origin_history_and_target_share_the_midnight_boundary(

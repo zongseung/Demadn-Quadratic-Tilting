@@ -12,10 +12,13 @@ from typing import Any
 import numpy as np
 import polars as pl
 
+from hqrc_v3.baselines.preprocessing import (
+    FittedClassicalPreprocessor,
+    fit_classical_preprocessor,
+)
 from hqrc_v3.contracts import (
     DataContractError,
     ForecastMatrix,
-    validate_forecast_feature_columns,
     validate_prediction_frame,
 )
 from hqrc_v3.splits import AnnualFold
@@ -62,32 +65,6 @@ def _validate_params(name: str, params: Mapping[str, Any]) -> dict[str, Any]:
             f"{', '.join(managed)}"
         )
     return dict(params)
-
-
-def _flatten_history(matrix: ForecastMatrix) -> np.ndarray:
-    """Flatten the 168-hour observed history once per matrix."""
-
-    if matrix.history.ndim != 3 or matrix.future.ndim != 3 or matrix.target.ndim != 2:
-        raise DataContractError("ForecastMatrix arrays must be history/future 3-D and target 2-D")
-    if (
-        matrix.history.shape[0] != matrix.future.shape[0]
-        or matrix.history.shape[0] != matrix.target.shape[0]
-    ):
-        raise DataContractError("ForecastMatrix arrays must have the same sample count")
-    if matrix.history.shape[1] != 168:
-        raise DataContractError("classical baselines require exactly 168 history hours")
-    if matrix.future.shape[1] != 24 or matrix.target.shape[1] != 24:
-        raise DataContractError("classical baselines require exactly 24 future horizons")
-    validate_forecast_feature_columns(matrix)
-    return matrix.history.reshape(matrix.history.shape[0], -1)
-
-
-def _features_for_horizon(
-    flattened_history: np.ndarray, matrix: ForecastMatrix, horizon: int
-) -> np.ndarray:
-    """Append only covariates known at the requested forecast horizon."""
-
-    return np.concatenate((flattened_history, matrix.future[:, horizon, :]), axis=1)
 
 
 def _validate_finite(values: np.ndarray, *, description: str) -> np.ndarray:
@@ -145,11 +122,11 @@ class HorizonRegressor:
     future_width: int
     history_columns: tuple[str, ...]
     future_columns: tuple[str, ...]
+    preprocessor: FittedClassicalPreprocessor
 
     def predict(self, batch: ForecastMatrix) -> np.ndarray:
         if len(self.estimators) != 24:
             raise RuntimeError("a horizon regressor must contain exactly 24 estimators")
-        flattened_history = _flatten_history(batch)
         if (
             batch.history.shape[1:] != self.history_shape
             or batch.future.shape[2] != self.future_width
@@ -164,13 +141,16 @@ class HorizonRegressor:
             raise DataContractError(
                 "prediction matrix feature columns/order do not match the fitted baseline"
             )
-        prediction = np.empty((batch.target.shape[0], 24), dtype=float)
+        features = self.preprocessor.transform_features(batch)
+        standardized = np.empty((batch.target.shape[0], 24), dtype=float)
         for horizon, estimator in enumerate(self.estimators):
-            features = _features_for_horizon(flattened_history, batch, horizon)
-            prediction[:, horizon] = estimator.predict(
+            standardized[:, horizon] = estimator.predict(
                 _estimator_input(self.model_name, features)
             )
-        return _validate_finite(prediction, description="baseline predictions")
+        prediction = self.preprocessor.inverse_target(
+            _validate_finite(standardized, description="standardized baseline predictions")
+        )
+        return _validate_finite(prediction, description="baseline predictions in MW")
 
 
 @dataclass(frozen=True)
@@ -206,31 +186,26 @@ class ClassicalBaseline:
         self, train: ForecastMatrix, validation: ForecastMatrix | None, seed: int
     ) -> HorizonRegressor:
         normalized_seed = _require_integer_seed(seed)
-        target = _validate_finite(train.target, description="training target")
+        preprocessor = fit_classical_preprocessor(train)
+        target = preprocessor.transform_target(
+            _validate_finite(train.target, description="training target")
+        )
         estimator_class = _estimator_class(self.name)
         estimators: list[Any] = []
-        flattened_history = _flatten_history(train)
-        validation_history: np.ndarray | None = None
+        features = _validate_finite(
+            preprocessor.transform_features(train), description="training features"
+        )
+        validation_features: np.ndarray | None = None
         validation_target: np.ndarray | None = None
         if validation is not None and self.name in {"xgboost", "lightgbm"}:
-            validation_history = _flatten_history(validation)
-            validation_target = _validate_finite(
-                validation.target, description="validation target"
+            validation_features = _validate_finite(
+                preprocessor.transform_features(validation),
+                description="validation features",
             )
-            if (
-                validation.history.shape[1:] != train.history.shape[1:]
-                or validation.future.shape[2] != train.future.shape[2]
-                or validation.history_columns != train.history_columns
-                or validation.future_columns != train.future_columns
-            ):
-                raise DataContractError(
-                    "validation matrix feature columns/order must match the training matrix"
-                )
+            validation_target = preprocessor.transform_target(
+                _validate_finite(validation.target, description="validation target")
+            )
         for horizon in range(24):
-            features = _validate_finite(
-                _features_for_horizon(flattened_history, train, horizon),
-                description="training features",
-            )
             estimator_params = dict(self.params)
             available = estimator_class().get_params(deep=False)
             if "random_state" in available:
@@ -245,11 +220,7 @@ class ClassicalBaseline:
                 estimator_params["verbosity"] = -1
             estimator = estimator_class(**estimator_params)
             fit_kwargs: dict[str, Any] = {}
-            if validation_history is not None and validation_target is not None:
-                validation_features = _validate_finite(
-                    _features_for_horizon(validation_history, validation, horizon),
-                    description="validation features",
-                )
+            if validation_features is not None and validation_target is not None:
                 fit_kwargs["eval_set"] = [
                     (
                         _estimator_input(self.name, validation_features),
@@ -273,6 +244,7 @@ class ClassicalBaseline:
             future_width=train.future.shape[2],
             history_columns=tuple(train.history_columns),
             future_columns=tuple(train.future_columns),
+            preprocessor=preprocessor,
         )
 
 

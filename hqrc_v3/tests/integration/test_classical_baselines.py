@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hqrc_v3.baselines.classical as classical
 import numpy as np
 import pytest
 from hqrc_v3.baselines.classical import make_classical_baseline
@@ -104,3 +105,76 @@ def test_boosting_repeated_fits_with_the_same_seed_are_reproducible(name, tiny_f
         {id(model) for model in second.estimators}
     )
     np.testing.assert_allclose(first_prediction, second_prediction, rtol=0.0, atol=1e-12)
+
+
+def test_svr_receives_full_scaled_path_and_standardized_target_then_returns_mw(
+    monkeypatch: pytest.MonkeyPatch, tiny_forecast_matrix: ForecastMatrix
+) -> None:
+    class RecordingSVR:
+        instances: list[RecordingSVR] = []
+
+        def __init__(self, **params: object) -> None:
+            self.params = params
+            self.fit_features: np.ndarray | None = None
+            self.fit_target: np.ndarray | None = None
+            self.predict_features: list[np.ndarray] = []
+            RecordingSVR.instances.append(self)
+
+        def get_params(self, deep: bool = False) -> dict[str, object]:
+            del deep
+            return {"C": None, "epsilon": None, "gamma": None, "cache_size": None}
+
+        def fit(self, features: np.ndarray, target: np.ndarray, **_: object) -> RecordingSVR:
+            self.fit_features = np.asarray(features).copy()
+            self.fit_target = np.asarray(target).copy()
+            return self
+
+        def predict(self, features: np.ndarray) -> np.ndarray:
+            values = np.asarray(features).copy()
+            self.predict_features.append(values)
+            return np.zeros(values.shape[0])
+
+    monkeypatch.setattr(classical, "_estimator_class", lambda _: RecordingSVR)
+    train = tiny_forecast_matrix.take(np.arange(20))
+    validation = tiny_forecast_matrix.take(np.arange(20, 24))
+    baseline = make_classical_baseline(
+        "svr", {"C": 10.0, "epsilon": 0.05, "gamma": "scale"}
+    )
+
+    fitted = baseline.fit(train, validation=validation, seed=7)
+    prediction = fitted.predict(validation)
+
+    estimators = [
+        estimator for estimator in RecordingSVR.instances if estimator.fit_target is not None
+    ]
+    assert len(estimators) == 24
+    assert all(estimator.params["epsilon"] == 0.05 for estimator in estimators)
+    assert all(
+        estimator.fit_features.shape[1] == 168 * train.history.shape[2] + 24 * 2
+        for estimator in estimators
+    )
+    for estimator in estimators[1:]:
+        np.testing.assert_array_equal(estimator.fit_features, estimators[0].fit_features)
+    all_standardized_targets = np.column_stack(
+        [estimator.fit_target for estimator in estimators]
+    )
+    np.testing.assert_allclose(all_standardized_targets.mean(), 0.0, atol=1e-12)
+    np.testing.assert_allclose(all_standardized_targets.std(), 1.0, atol=1e-12)
+    np.testing.assert_allclose(prediction, train.target.mean())
+
+    changed_future = validation.future.copy()
+    changed_future[:, 23, 0] += 9_999.0
+    changed = ForecastMatrix(
+        origins=validation.origins,
+        target_times=validation.target_times,
+        history=validation.history,
+        future=changed_future,
+        target=validation.target,
+        history_columns=validation.history_columns,
+        future_columns=validation.future_columns,
+    )
+    fitted.predict(changed)
+    assert all(
+        not np.array_equal(estimator.predict_features[0], estimator.predict_features[1])
+        for estimator in estimators
+    )
