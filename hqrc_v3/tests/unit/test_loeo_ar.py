@@ -9,13 +9,10 @@ from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 
+import hqrc_v3.diagnostics.loeo_ar as loeo_ar_module
 import numpy as np
 import polars as pl
 import pytest
-from test_loeo_diagnostics import CONTEXT
-from test_loeo_diagnostics import source as source_fixture
-
-import hqrc_v3.diagnostics.loeo_ar as loeo_ar_module
 from hqrc_v3.correction_source import ValidatedCorrectionSource
 from hqrc_v3.diagnostics.ar import (
     calibrate_beta_prior,
@@ -30,6 +27,8 @@ from hqrc_v3.diagnostics.loeo_ar import (
     prepare_loeo_ar_proposal_set,
 )
 from hqrc_v3.provenance import file_sha256
+from test_loeo_diagnostics import CONTEXT
+from test_loeo_diagnostics import source as source_fixture
 
 base_source = source_fixture
 
