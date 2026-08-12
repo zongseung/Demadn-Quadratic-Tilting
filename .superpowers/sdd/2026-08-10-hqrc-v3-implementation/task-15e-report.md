@@ -4,6 +4,85 @@ Status: IMPLEMENTATION AWAITING FRESH INDEPENDENT REVIEW
 
 Code/tests commit: `63f956e`
 
+Fix round 1 code/tests commit: `72b69bf`
+
+## Fix round 1 review response
+
+The reproduced Critical and two Important findings are fixed without changing the H3 statistical
+contract, starting the ten-fold paper fit, or implementing later Task 15 steps.
+
+1. **Aggregate completion now has validation barriers on both sides.** Before `COMPLETE`, the
+   held-dirfd reader revalidates every product's exact semantics, all hashes, manifest identity,
+   rows, and persisted fold execution. After exclusive no-replace `COMPLETE` publication it runs
+   the full completed-publication validator again. A failure removes only the exact newly owned
+   regular COMPLETE inode; a substituted foreign entry is preserved and the call fails closed.
+2. **Paper preflight reloads all physical inputs before the first fold call.** The shared Task 15D
+   source validator completely reloads the current ten-fold LOEO universe/folds and approved AR
+   set. Missing/substituted evidence, plus lower-level `LOEOError`, `TypeError`, and `ValueError`,
+   become public `LOEOPrimaryError` with zero `fit_loeo_fold` calls.
+3. **Fit/reuse status is immutable provenance.** Schema version 2 manifests store one canonical
+   `fold_execution` row per selected fold with `fit_status` and exact `sampler_fit_count`. Initial
+   fit/recovery status is retained byte-for-byte across later zero-fit aggregate reuse instead of
+   being replaced by transient reuse status.
+
+### Fix round 1 RED and GREEN
+
+Four direct regressions were RED before production changes:
+
+```text
+4 failed, 23 deselected in 70.16s
+```
+
+They proved a missing final physical paper fold still reached the first kernel, `fold_execution`
+was absent, and both manifest/COMPLETE prewrite mutations returned a corrupt successful complete
+result. Targeted post-fix GREEN was `4 passed, 23 deselected in 63.15s`; public lower-level error
+wrapping then passed `3 passed, 28 deselected in 34.01s`.
+
+Final focused coverage also includes mutation after hourly publication and after COMPLETE,
+owned-COMPLETE withdrawal, foreign COMPLETE substitution preservation, schema-v2 status
+validation, and byte-stable status reuse:
+
+```text
+31 passed in 281.34s
+```
+
+JUnit: `/private/tmp/hqrc-v3-task15e-r1-focused-final.xml`.
+
+The original reviewer vulnerability reproducer now raises at each formerly successful mutation
+boundary and blocks the paper kernel before its old vulnerable assertions can hold. No corrupt
+owned `COMPLETE` remains.
+
+### Fix round 1 final verification
+
+```text
+adjacent Task 15B/C/D + metrics: 166 passed in 918.46s
+actual XGBoost-B1 two-fold smoke: 1 passed, 124 warnings in 188.01s
+full non-slow: 632 passed, 10 deselected, 77 warnings in 1019.14s
+```
+
+JUnit files are `/private/tmp/hqrc-v3-task15e-r1-adjacent.xml`,
+`/private/tmp/hqrc-v3-task15e-r1-real.xml`, and
+`/private/tmp/hqrc-v3-task15e-r1-full.xml`. The actual run again used only
+`seollal-2024` and `chuseok-2024` under `/private/tmp`, performed real fits and immutable reuse,
+and retained the slow test's exact before/after protected-tree equality assertions. This is not a
+paper estimate.
+
+The actual schema-v2 matrix identity was
+`a91952030657600f72ade6b1a84cd1d802d398507f086bcfca0e04f04b36936e`; manifest digest
+`b49d4b4f101036cbfe5c403c81d32f95f6d8bfe7338dc311b3f813c396f28cf7`. It records both selected
+folds as `fit` with sampler-fit count 1; the second aggregate call returned zero transient fits
+while preserving those manifest bytes.
+
+Final full Ruff passed, all five changed source/test files were already formatted,
+`git diff --check` passed, and the aggregate modules contain zero rename/replace calls. The only
+target unlink is held-dirfd relative and requires exact `(device,inode)` ownership of the newly
+published regular COMPLETE. The protected untracked nested `hqrc_v3/uv.lock` remains 127 bytes,
+inode `97849780`, mtime `2026-08-10T21:28:30+0900`, SHA-256
+`f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`.
+
+Task 15 Step 5 remains unchecked pending fresh independent re-review. No full ten-fold paper
+matrix, Step 6/7/8, CLI, graph, or performance publication was run or implemented.
+
 ## Scope and outcome
 
 Implemented only the immutable primary H3 LOEO matrix. `fit_loeo_primary` composes the reviewed
