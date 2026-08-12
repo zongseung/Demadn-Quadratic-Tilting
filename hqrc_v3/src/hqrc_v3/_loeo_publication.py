@@ -9,6 +9,7 @@ import math
 import os
 import stat
 import tempfile
+import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -28,7 +29,7 @@ from hqrc_v3._loeo_types import (
     LOEOFoldProducts,
     LOEOFoldResult,
 )
-from hqrc_v3.bayes.artifacts import load_hqrc_data
+from hqrc_v3.bayes.artifacts import load_hqrc_data, write_hqrc_data
 from hqrc_v3.bayes.model import CYCLIC_HOUR_PARAMETERIZATION, HQRCData
 from hqrc_v3.bayes.samplers import (
     PYMC_INITIALIZATION,
@@ -284,52 +285,236 @@ def _fsync_file(path: Path) -> None:
         os.fsync(stream.fileno())
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+def _safe_name(name: str) -> str:
+    if not name or name in {".", ".."} or "/" in name:
+        raise LOEOFoldError("LOEO publication filename is unsafe")
+    return name
+
+
+def _relative_file_fd(directory_fd: int, name: str) -> int:
     try:
-        os.fsync(descriptor)
-    finally:
+        descriptor = os.open(
+            _safe_name(name),
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        identity = os.fstat(descriptor)
+    except OSError as error:
+        raise LOEOFoldError("LOEO publication file is missing or unsafe") from error
+    if not stat.S_ISREG(identity.st_mode):
         os.close(descriptor)
+        raise LOEOFoldError("LOEO publication file is missing or unsafe")
+    return descriptor
 
 
-def _atomic_bytes(path: Path, payload: bytes) -> None:
-    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    temporary = Path(name)
+def _relative_bytes(directory_fd: int, name: str) -> bytes:
+    descriptor = _relative_file_fd(directory_fd, name)
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            return stream.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
-def atomic_json(path: Path, value: Mapping[str, Any]) -> None:
-    _atomic_bytes(path, canonical_json(dict(value)) + b"\n")
+def _relative_sha256(directory_fd: int, name: str) -> str:
+    return hashlib.sha256(_relative_bytes(directory_fd, name)).hexdigest()
 
 
-def _read_json(path: Path, description: str) -> dict[str, Any]:
-    _require_real_file(path, description)
+def publication_entries(publication: LOEOPublicationHandle) -> frozenset[str]:
     try:
-        raw = path.read_bytes()
+        return frozenset(os.listdir(publication.directory_fd))
+    except OSError as error:
+        raise LOEOFoldError("LOEO publication directory is unreadable") from error
+
+
+def publication_has(publication: LOEOPublicationHandle, name: str) -> bool:
+    try:
+        identity = os.stat(_safe_name(name), dir_fd=publication.directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise LOEOFoldError("LOEO publication entry is unsafe") from error
+    return stat.S_ISREG(identity.st_mode)
+
+
+def relative_sha256(publication: LOEOPublicationHandle, name: str) -> str:
+    return _relative_sha256(publication.directory_fd, name)
+
+
+def _materialize_relative(directory_fd: int, name: str, destination: Path) -> None:
+    descriptor = _relative_file_fd(directory_fd, name)
+    try:
+        with os.fdopen(descriptor, "rb") as source, destination.open("xb") as output:
+            descriptor = -1
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                output.write(block)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _relative_json(directory_fd: int, name: str, description: str) -> dict[str, Any]:
+    raw = _relative_bytes(directory_fd, name)
+    try:
         value = json.loads(raw)
-    except (OSError, json.JSONDecodeError) as error:
+    except json.JSONDecodeError as error:
         raise LOEOFoldError(f"{description} is unreadable") from error
     if not isinstance(value, dict) or raw != canonical_json(value) + b"\n":
         raise LOEOFoldError(f"{description} is not canonical JSON")
     return value
 
 
-def _require_real_file(path: Path, description: str) -> None:
+def _publish_bytes(
+    publication: LOEOPublicationHandle,
+    name: str,
+    payload: bytes,
+    *,
+    boundary: str,
+    directory_fd: int | None = None,
+) -> None:
+    target_fd = publication.directory_fd if directory_fd is None else directory_fd
+    temporary = f".{_safe_name(name)}.{uuid.uuid4().hex}.tmp"
+    descriptor: int | None = None
+    published = False
     try:
-        identity = path.lstat()
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=target_fd,
+        )
+        identity = os.fstat(descriptor)
+        if not stat.S_ISREG(identity.st_mode):
+            raise LOEOFoldError("LOEO publication temporary file is unsafe")
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        publication_boundary(boundary)
+        os.rename(
+            temporary,
+            name,
+            src_dir_fd=target_fd,
+            dst_dir_fd=target_fd,
+        )
+        published = True
+        os.fsync(target_fd)
     except OSError as error:
-        raise LOEOFoldError(f"{description} is missing or unsafe") from error
-    if not stat.S_ISREG(identity.st_mode):
-        raise LOEOFoldError(f"{description} is missing or unsafe")
+        raise LOEOFoldError("LOEO publication failed safely") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if not published:
+            try:
+                os.unlink(temporary, dir_fd=target_fd)
+            except FileNotFoundError:
+                pass
+
+
+def publish_json(
+    publication: LOEOPublicationHandle,
+    name: str,
+    value: Mapping[str, Any],
+    *,
+    boundary: str,
+) -> None:
+    _publish_bytes(
+        publication,
+        name,
+        canonical_json(dict(value)) + b"\n",
+        boundary=boundary,
+    )
+
+
+@contextmanager
+def _external_temporary(suffix: str):
+    with tempfile.TemporaryDirectory(prefix="hqrc-v3-task15d-", dir="/private/tmp") as root:
+        yield Path(root) / f"serialization{suffix}"
+
+
+def _copy_external_file(
+    publication: LOEOPublicationHandle, source: Path, name: str, *, boundary: str
+) -> None:
+    with source.open("rb") as stream:
+        payload = stream.read()
+    _publish_bytes(publication, name, payload, boundary=boundary)
+
+
+def _open_or_create_child(publication: LOEOPublicationHandle, name: str) -> int:
+    name = _safe_name(name)
+    try:
+        os.mkdir(name, 0o700, dir_fd=publication.directory_fd)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise LOEOFoldError("LOEO child publication namespace is unsafe") from error
+    return _open_directory(
+        Path(name), "LOEO child publication namespace", dir_fd=publication.directory_fd
+    )
+
+
+def write_hqrc_checkpoint(
+    publication: LOEOPublicationHandle,
+    data: HQRCData,
+    *,
+    settings: dict[str, object],
+) -> None:
+    """Serialize HQRCData externally, then publish one held-dirfd generation."""
+
+    with tempfile.TemporaryDirectory(prefix="hqrc-v3-task15d-hqrc-", dir="/private/tmp") as root:
+        external = Path(root)
+        source_npz, source_metadata = write_hqrc_data(
+            external / "hqrc_data.npz", data, settings=settings
+        )
+        source_pointer = json.loads((external / "hqrc_data.current.json").read_bytes())
+        metadata = json.loads(source_metadata.read_bytes())
+        generation = uuid.uuid4().hex
+        npz_name = f"{generation}.npz"
+        metadata_name = f"{generation}.json"
+        npz_payload = source_npz.read_bytes()
+        metadata["generation"] = generation
+        unsigned_metadata = {
+            key: value for key, value in metadata.items() if key != "artifact_sha256"
+        }
+        metadata["artifact_sha256"] = sha_json(unsigned_metadata)
+        metadata_payload = canonical_json(metadata) + b"\n"
+        pointer = {
+            **source_pointer,
+            "generation": generation,
+            "npz": f".hqrc_data.generations/{npz_name}",
+            "metadata": f".hqrc_data.generations/{metadata_name}",
+            "npz_sha256": hashlib.sha256(npz_payload).hexdigest(),
+            "metadata_sha256": hashlib.sha256(metadata_payload).hexdigest(),
+        }
+        unsigned_pointer = {key: value for key, value in pointer.items() if key != "pointer_digest"}
+        pointer["pointer_digest"] = sha_json(unsigned_pointer)
+        child_fd = _open_or_create_child(publication, ".hqrc_data.generations")
+        try:
+            _publish_bytes(
+                publication,
+                npz_name,
+                npz_payload,
+                boundary="hqrc-generation-npz-prewrite",
+                directory_fd=child_fd,
+            )
+            _publish_bytes(
+                publication,
+                metadata_name,
+                metadata_payload,
+                boundary="hqrc-generation-metadata-prewrite",
+                directory_fd=child_fd,
+            )
+        finally:
+            os.close(child_fd)
+        publish_json(
+            publication,
+            "hqrc_data.current.json",
+            pointer,
+            boundary="hqrc-data-prewrite",
+        )
 
 
 def require_real_directory(path: Path, description: str) -> None:
@@ -541,48 +726,37 @@ def write_posterior_checkpoint(
     sampler: Mapping[str, object],
     identity_sha256: str,
 ) -> None:
-    directory = publication.path
     _posterior_metadata_matches(idata, inputs, sampler)
     diagnostics = validate_inference_data(idata, paper_profile=sampler["profile"] == "paper")
-    guard_namespace(publication)
-    descriptor, name = tempfile.mkstemp(prefix=".posterior.", suffix=".nc", dir=directory)
-    os.close(descriptor)
-    temporary = Path(name)
-    posterior_path = directory / "posterior.nc"
-    try:
+    with _external_temporary(".nc") as temporary:
         az.to_netcdf(idata, temporary)
         _fsync_file(temporary)
-        guard_namespace(publication)
-        os.replace(temporary, posterior_path)
-        _fsync_directory(directory)
-        guard_namespace(publication)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
-    guard_namespace(publication)
-    atomic_json(
-        directory / "posterior.checkpoint.json",
+        _copy_external_file(publication, temporary, "posterior.nc", boundary="posterior-prewrite")
+    publish_json(
+        publication,
+        "posterior.checkpoint.json",
         {
             "schema_version": 1,
             "state": "POSTERIOR_COMPLETE",
             "causal": False,
             "identity_sha256": identity_sha256,
-            "posterior_sha256": file_sha256(posterior_path),
+            "posterior_sha256": _relative_sha256(publication.directory_fd, "posterior.nc"),
             "diagnostics": _diagnostic_payload(diagnostics),
         },
+        boundary="posterior-checkpoint-prewrite",
     )
-    guard_namespace(publication)
 
 
 def _load_posterior_checkpoint(
-    directory: Path,
+    publication: LOEOPublicationHandle,
     *,
     inputs: LOEOFoldInputs,
     sampler: Mapping[str, object],
     identity_sha256: str,
 ):
-    checkpoint = _read_json(directory / "posterior.checkpoint.json", "LOEO posterior checkpoint")
-    posterior_path = directory / "posterior.nc"
+    checkpoint = _relative_json(
+        publication.directory_fd, "posterior.checkpoint.json", "LOEO posterior checkpoint"
+    )
     if (
         set(checkpoint)
         != {
@@ -599,13 +773,14 @@ def _load_posterior_checkpoint(
         or checkpoint["identity_sha256"] != identity_sha256
     ):
         raise LOEOFoldError("LOEO posterior checkpoint differs")
-    _require_real_file(posterior_path, "LOEO posterior checkpoint artifact")
-    if file_sha256(posterior_path) != checkpoint["posterior_sha256"]:
+    if _relative_sha256(publication.directory_fd, "posterior.nc") != checkpoint["posterior_sha256"]:
         raise LOEOFoldError("LOEO posterior checkpoint hash differs")
-    try:
-        idata = az.from_netcdf(posterior_path)
-    except (OSError, ValueError) as error:
-        raise LOEOFoldError("LOEO posterior checkpoint is unreadable") from error
+    with _external_temporary(".nc") as posterior_path:
+        _materialize_relative(publication.directory_fd, "posterior.nc", posterior_path)
+        try:
+            idata = az.from_netcdf(posterior_path).load()
+        except (OSError, ValueError) as error:
+            raise LOEOFoldError("LOEO posterior checkpoint is unreadable") from error
     _posterior_metadata_matches(idata, inputs, sampler)
     diagnostics = validate_inference_data(idata, paper_profile=sampler["profile"] == "paper")
     if checkpoint["diagnostics"] != _diagnostic_payload(diagnostics):
@@ -613,11 +788,18 @@ def _load_posterior_checkpoint(
     return idata
 
 
-def _hqrc_generation_paths(directory: Path) -> tuple[Path, Path, Path]:
-    pointer = _read_json(directory / "hqrc_data.current.json", "LOEO HQRCData pointer")
-    generation_dir = directory / ".hqrc_data.generations"
-    require_real_directory(generation_dir, "LOEO HQRCData generation namespace")
-    paths: list[Path] = []
+def _hqrc_generation_names(
+    publication: LOEOPublicationHandle,
+) -> tuple[dict[str, Any], str, str]:
+    pointer = _relative_json(
+        publication.directory_fd, "hqrc_data.current.json", "LOEO HQRCData pointer"
+    )
+    generation_fd = _open_directory(
+        Path(".hqrc_data.generations"),
+        "LOEO HQRCData generation namespace",
+        dir_fd=publication.directory_fd,
+    )
+    names: list[str] = []
     for key in ("npz", "metadata"):
         relative = pointer.get(key)
         if (
@@ -626,36 +808,80 @@ def _hqrc_generation_paths(directory: Path) -> tuple[Path, Path, Path]:
             or ".." in Path(relative).parts
         ):
             raise LOEOFoldError("LOEO HQRCData pointer path is unsafe")
-        path = directory / relative
-        if path.parent != generation_dir:
+        path = Path(relative)
+        if path.parent != Path(".hqrc_data.generations"):
             raise LOEOFoldError("LOEO HQRCData pointer path is unsafe")
-        _require_real_file(path, "LOEO HQRCData generation artifact")
-        paths.append(path)
-    if paths[0] == paths[1] or {path.name for path in generation_dir.iterdir()} != {
-        paths[0].name,
-        paths[1].name,
-    }:
-        raise LOEOFoldError("LOEO HQRCData generation namespace differs")
-    return directory / "hqrc_data.current.json", paths[0], paths[1]
+        names.append(path.name)
+    try:
+        if names[0] == names[1] or set(os.listdir(generation_fd)) != set(names):
+            raise LOEOFoldError("LOEO HQRCData generation namespace differs")
+        for name in names:
+            descriptor = _relative_file_fd(generation_fd, name)
+            os.close(descriptor)
+    finally:
+        os.close(generation_fd)
+    return pointer, names[0], names[1]
 
 
-def _artifact_records(directory: Path) -> dict[str, dict[str, str]]:
-    pointer, data_npz, data_metadata = _hqrc_generation_paths(directory)
-    paths = {
-        "hqrc_data_pointer": pointer,
-        "hqrc_data_npz": data_npz,
-        "hqrc_data_metadata": data_metadata,
-        "posterior": directory / "posterior.nc",
-        "posterior_checkpoint": directory / "posterior.checkpoint.json",
-        **{name: directory / filename for name, filename in PRODUCT_FILES.items()},
+def _load_hqrc_checkpoint(publication: LOEOPublicationHandle):
+    pointer, npz_name, metadata_name = _hqrc_generation_names(publication)
+    generation_fd = _open_directory(
+        Path(".hqrc_data.generations"),
+        "LOEO HQRCData generation namespace",
+        dir_fd=publication.directory_fd,
+    )
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="hqrc-v3-task15d-load-", dir="/private/tmp"
+        ) as root:
+            directory = Path(root)
+            child = directory / ".hqrc_data.generations"
+            child.mkdir()
+            _materialize_relative(generation_fd, npz_name, child / npz_name)
+            _materialize_relative(generation_fd, metadata_name, child / metadata_name)
+            (directory / "hqrc_data.current.json").write_bytes(canonical_json(pointer) + b"\n")
+            return load_hqrc_data(directory / "hqrc_data.npz")
+    finally:
+        os.close(generation_fd)
+
+
+def _artifact_records(publication: LOEOPublicationHandle) -> dict[str, dict[str, str]]:
+    _, data_npz, data_metadata = _hqrc_generation_names(publication)
+    names = {
+        "hqrc_data_pointer": (
+            publication.directory_fd,
+            "hqrc_data.current.json",
+            "hqrc_data.current.json",
+        ),
+        "posterior": (publication.directory_fd, "posterior.nc", "posterior.nc"),
+        "posterior_checkpoint": (
+            publication.directory_fd,
+            "posterior.checkpoint.json",
+            "posterior.checkpoint.json",
+        ),
+        **{
+            name: (publication.directory_fd, filename, filename)
+            for name, filename in PRODUCT_FILES.items()
+        },
     }
+    generation_fd = _open_directory(
+        Path(".hqrc_data.generations"), "LOEO HQRCData namespace", dir_fd=publication.directory_fd
+    )
+    names["hqrc_data_npz"] = (generation_fd, data_npz, f".hqrc_data.generations/{data_npz}")
+    names["hqrc_data_metadata"] = (
+        generation_fd,
+        data_metadata,
+        f".hqrc_data.generations/{data_metadata}",
+    )
     records: dict[str, dict[str, str]] = {}
-    for name, path in paths.items():
-        _require_real_file(path, f"LOEO fold output {name}")
-        records[name] = {
-            "path": path.relative_to(directory).as_posix(),
-            "sha256": file_sha256(path),
-        }
+    try:
+        for name, (descriptor, filename, relative) in names.items():
+            records[name] = {
+                "path": relative,
+                "sha256": _relative_sha256(descriptor, filename),
+            }
+    finally:
+        os.close(generation_fd)
     return records
 
 
@@ -673,21 +899,27 @@ def _expected_product_for_filename(
     raise LOEOFoldError("LOEO downstream publication order differs")
 
 
-def _existing_downstream_matches(path: Path, expected: object, *, filename: str) -> bool:
-    _require_real_file(path, "partial LOEO downstream artifact")
+def _existing_downstream_matches(
+    publication: LOEOPublicationHandle, expected: object, *, filename: str
+) -> bool:
     if filename.endswith(".parquet"):
-        try:
-            actual = pl.read_parquet(path)
-        except (OSError, pl.exceptions.PolarsError) as error:
-            raise LOEOFoldError("partial LOEO downstream product is unreadable") from error
+        with _external_temporary(".parquet") as temporary:
+            _materialize_relative(publication.directory_fd, filename, temporary)
+            try:
+                actual = pl.read_parquet(temporary)
+            except (OSError, pl.exceptions.PolarsError) as error:
+                raise LOEOFoldError("partial LOEO downstream product is unreadable") from error
         return isinstance(expected, pl.DataFrame) and _frames_equal(actual, expected)
-    return _read_json(path, "partial LOEO downstream JSON") == expected
+    return (
+        _relative_json(publication.directory_fd, filename, "partial LOEO downstream JSON")
+        == expected
+    )
 
 
 def validate_downstream_prefix(
-    directory: Path,
+    publication: LOEOPublicationHandle,
     *,
-    entries: Mapping[str, Path],
+    entries: frozenset[str],
     products: LOEOFoldProducts,
     identity: Mapping[str, Any],
 ) -> frozenset[str]:
@@ -705,13 +937,13 @@ def validate_downstream_prefix(
     if present != expected_present:
         raise LOEOFoldError("partial LOEO downstream artifacts are not a valid prefix")
     expected_manifest = (
-        manifest_payload(directory, identity=identity, products=products)
+        manifest_payload(publication, identity=identity, products=products)
         if prefix_length == len(order)
         else None
     )
     for filename in order[:prefix_length]:
         expected = _expected_product_for_filename(filename, products, expected_manifest)
-        if not _existing_downstream_matches(entries[filename], expected, filename=filename):
+        if not _existing_downstream_matches(publication, expected, filename=filename):
             raise LOEOFoldError("partial LOEO downstream artifact semantics differ")
     return frozenset(expected_present)
 
@@ -722,44 +954,47 @@ def write_products(
     *,
     preserve: frozenset[str] = frozenset(),
 ) -> None:
-    directory = publication.path
-    temporary_paths: list[Path] = []
-    try:
-        for name, frame in (
-            ("hourly_predictions", products.hourly_predictions),
-            ("metrics", products.metrics),
-        ):
-            if PRODUCT_FILES[name] in preserve:
-                continue
-            guard_namespace(publication)
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{name}.", suffix=".parquet", dir=directory
-            )
-            os.close(descriptor)
-            temporary = Path(temporary_name)
-            temporary_paths.append(temporary)
+    for name, frame in (
+        ("hourly_predictions", products.hourly_predictions),
+        ("metrics", products.metrics),
+    ):
+        if PRODUCT_FILES[name] in preserve:
+            continue
+        with _external_temporary(".parquet") as temporary:
             frame.write_parquet(temporary)
             _fsync_file(temporary)
-            guard_namespace(publication)
-            os.replace(temporary, directory / PRODUCT_FILES[name])
-            temporary_paths.remove(temporary)
-            checked_publication_boundary(publication, f"{name}-published")
-        if PRODUCT_FILES["posterior_summary"] not in preserve:
-            guard_namespace(publication)
-            atomic_json(directory / PRODUCT_FILES["posterior_summary"], products.posterior_summary)
-            checked_publication_boundary(publication, "posterior-summary-published")
-    finally:
-        for path in temporary_paths:
-            path.unlink(missing_ok=True)
+            _copy_external_file(
+                publication,
+                temporary,
+                PRODUCT_FILES[name],
+                boundary=f"{name}-prewrite",
+            )
+        checked_publication_boundary(publication, f"{name}-published")
+    if PRODUCT_FILES["posterior_summary"] not in preserve:
+        publish_json(
+            publication,
+            PRODUCT_FILES["posterior_summary"],
+            products.posterior_summary,
+            boundary="posterior-summary-prewrite",
+        )
+        checked_publication_boundary(publication, "posterior-summary-published")
 
 
-def _read_products(directory: Path) -> LOEOFoldProducts:
-    try:
-        hourly = pl.read_parquet(directory / PRODUCT_FILES["hourly_predictions"])
-        metrics = pl.read_parquet(directory / PRODUCT_FILES["metrics"])
-    except (OSError, pl.exceptions.PolarsError) as error:
-        raise LOEOFoldError("LOEO fold product is unreadable") from error
-    summary = _read_json(directory / PRODUCT_FILES["posterior_summary"], "LOEO posterior summary")
+def _read_products(publication: LOEOPublicationHandle) -> LOEOFoldProducts:
+    frames = []
+    for name in (PRODUCT_FILES["hourly_predictions"], PRODUCT_FILES["metrics"]):
+        with _external_temporary(".parquet") as temporary:
+            _materialize_relative(publication.directory_fd, name, temporary)
+            try:
+                frames.append(pl.read_parquet(temporary))
+            except (OSError, pl.exceptions.PolarsError) as error:
+                raise LOEOFoldError("LOEO fold product is unreadable") from error
+    hourly, metrics = frames
+    summary = _relative_json(
+        publication.directory_fd,
+        PRODUCT_FILES["posterior_summary"],
+        "LOEO posterior summary",
+    )
     return LOEOFoldProducts(hourly, metrics, summary)
 
 
@@ -785,14 +1020,17 @@ def result(directory: Path, *, reused: bool, sampler_fit_count: int) -> LOEOFold
 
 
 def manifest_payload(
-    directory: Path, *, identity: Mapping[str, Any], products: LOEOFoldProducts
+    publication: LOEOPublicationHandle,
+    *,
+    identity: Mapping[str, Any],
+    products: LOEOFoldProducts,
 ) -> dict[str, Any]:
     unsigned: dict[str, Any] = {
         "schema_version": 1,
         "state": "COMPLETE",
         "causal": False,
         "identity": dict(identity),
-        "outputs": _artifact_records(directory),
+        "outputs": _artifact_records(publication),
         "rows": {
             "hourly_predictions": products.hourly_predictions.height,
             "metrics": products.metrics.height,
@@ -802,16 +1040,17 @@ def manifest_payload(
 
 
 def validate_complete(
-    directory: Path,
+    publication: LOEOPublicationHandle,
     *,
     identity: Mapping[str, Any],
     inputs: LOEOFoldInputs,
     sampler: Mapping[str, object],
 ) -> LOEOFoldResult:
-    if {path.name for path in directory.iterdir()} != COMPLETE_TOP:
+    directory = publication.path
+    if publication_entries(publication) != COMPLETE_TOP:
         raise LOEOFoldError("completed LOEO fold directory contains unknown or partial entries")
-    manifest = _read_json(directory / "manifest.json", "LOEO fold manifest")
-    complete = _read_json(directory / "COMPLETE", "LOEO fold completion marker")
+    manifest = _relative_json(publication.directory_fd, "manifest.json", "LOEO fold manifest")
+    complete = _relative_json(publication.directory_fd, "COMPLETE", "LOEO fold completion marker")
     unsigned = {
         key: manifest[key]
         for key in ("schema_version", "state", "causal", "identity", "outputs", "rows")
@@ -835,15 +1074,15 @@ def validate_complete(
         or manifest.get("manifest_digest") != sha_json(unsigned)
         or complete
         != {
-            "manifest_sha256": file_sha256(directory / "manifest.json"),
+            "manifest_sha256": _relative_sha256(publication.directory_fd, "manifest.json"),
             "state": "COMPLETE",
             "causal": False,
         }
-        or manifest.get("outputs") != _artifact_records(directory)
+        or manifest.get("outputs") != _artifact_records(publication)
     ):
         raise LOEOFoldError("completed LOEO fold manifest differs")
     try:
-        data, settings = load_hqrc_data(directory / "hqrc_data.npz")
+        data, settings = _load_hqrc_checkpoint(publication)
     except (OSError, ValueError) as error:
         raise LOEOFoldError("published LOEO HQRCData differs") from error
     identity_sha256 = sha_json(identity)
@@ -854,7 +1093,7 @@ def validate_complete(
     }:
         raise LOEOFoldError("published LOEO HQRCData differs")
     idata = _load_posterior_checkpoint(
-        directory,
+        publication,
         inputs=inputs,
         sampler=sampler,
         identity_sha256=identity_sha256,
@@ -865,7 +1104,7 @@ def validate_complete(
         predictive_seed=int(identity["predictive_seed"]),
         predictive_draws=int(sampler["draws"]) * int(sampler["chains"]),
     )
-    published = _read_products(directory)
+    published = _read_products(publication)
     if (
         manifest.get("rows")
         != {
@@ -881,24 +1120,19 @@ def validate_complete(
 
 
 def load_resumable_checkpoint(
-    directory: Path,
+    publication: LOEOPublicationHandle,
     *,
     identity: Mapping[str, Any],
     inputs: LOEOFoldInputs,
     sampler: Mapping[str, object],
 ):
-    entries = {path.name: path for path in directory.iterdir() if path.name != ".loeo-fold.lock"}
+    entries = publication_entries(publication) - {".loeo-fold.lock"}
     if set(entries) - (CHECKPOINT_TOP | DOWNSTREAM_TOP) or not CHECKPOINT_TOP.issubset(entries):
         raise LOEOFoldError("unsafe partial LOEO fold publication")
-    for name, path in entries.items():
-        if name == ".hqrc_data.generations":
-            require_real_directory(path, "partial LOEO HQRCData namespace")
-        else:
-            _require_real_file(path, "partial LOEO fold artifact")
-    _hqrc_generation_paths(directory)
+    _hqrc_generation_names(publication)
     identity_sha256 = sha_json(identity)
     try:
-        data, settings = load_hqrc_data(directory / "hqrc_data.npz")
+        data, settings = _load_hqrc_checkpoint(publication)
     except (OSError, ValueError) as error:
         raise LOEOFoldError("checkpoint LOEO HQRCData differs") from error
     if not same_hqrc_data(data, inputs.hqrc_data) or settings != {
@@ -908,7 +1142,7 @@ def load_resumable_checkpoint(
     }:
         raise LOEOFoldError("checkpoint LOEO HQRCData differs")
     idata = _load_posterior_checkpoint(
-        directory,
+        publication,
         inputs=inputs,
         sampler=sampler,
         identity_sha256=identity_sha256,
@@ -920,7 +1154,7 @@ def load_resumable_checkpoint(
         predictive_draws=int(sampler["draws"]) * int(sampler["chains"]),
     )
     preserved = validate_downstream_prefix(
-        directory,
+        publication,
         entries=entries,
         products=products,
         identity=identity,
@@ -973,7 +1207,6 @@ def namespace(
 
 
 __all__ = [
-    "atomic_json",
     "checked_publication_boundary",
     "fold_lock",
     "guard_namespace",
@@ -981,7 +1214,11 @@ __all__ = [
     "load_resumable_checkpoint",
     "manifest_payload",
     "namespace",
+    "publication_entries",
     "publication_boundary",
+    "publication_has",
+    "publish_json",
+    "relative_sha256",
     "require_real_directory",
     "result",
     "sampler_contract",
@@ -989,4 +1226,5 @@ __all__ = [
     "validate_downstream_prefix",
     "write_posterior_checkpoint",
     "write_products",
+    "write_hqrc_checkpoint",
 ]

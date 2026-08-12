@@ -158,25 +158,48 @@ class HQRCModelOptions:
             raise ValueError("innovation must be normal_ar1, student_t_ar1, or normal_ar2")
 
 
+def event_reset_ar1_logp_numpy(
+    segments: Sequence[np.ndarray], phi: object, sigma: object
+) -> np.ndarray:
+    """Return exact stationary AR(1) log densities, independently per event.
+
+    ``phi`` and ``sigma`` may be aligned scalar or sample arrays.  The result has
+    their broadcast sample shape followed by the event dimension.
+    """
+
+    phi_values = np.asarray(phi, dtype=float)
+    sigma_values = np.asarray(sigma, dtype=float)
+    try:
+        phi_values, sigma_values = np.broadcast_arrays(phi_values, sigma_values)
+    except ValueError as error:
+        raise ValueError("phi and sigma must have aligned sample shapes") from error
+    if not np.isfinite(phi_values).all() or (np.abs(phi_values) >= 1).any():
+        raise ValueError("phi must be finite and strictly inside (-1, 1)")
+    if not np.isfinite(sigma_values).all() or (sigma_values <= 0).any():
+        raise ValueError("sigma must be finite and positive")
+    stationary_sd = sigma_values / np.sqrt(1.0 - phi_values**2)
+    terms: list[np.ndarray] = []
+    for segment in segments:
+        values = np.asarray(segment, dtype=float)
+        if values.ndim < 1 or values.shape[-1] == 0 or not np.isfinite(values).all():
+            raise ValueError("each AR segment must be finite with a non-empty final axis")
+        term = -0.5 * (
+            (values[..., 0] / stationary_sd) ** 2 + np.log(2 * math.pi * stationary_sd**2)
+        )
+        innovation = values[..., 1:] - phi_values[..., None] * values[..., :-1]
+        term = term - 0.5 * np.sum(
+            (innovation / sigma_values[..., None]) ** 2
+            + np.log(2 * math.pi * sigma_values[..., None] ** 2),
+            axis=-1,
+        )
+        terms.append(term)
+    return np.stack(terms, axis=-1)
+
+
 def stationary_ar1_logp_numpy(segments: Sequence[np.ndarray], phi: float, sigma: float) -> float:
     """Return the stationary AR(1) log density, restarting independently per event."""
 
-    if not math.isfinite(phi) or abs(phi) >= 1:
-        raise ValueError("phi must be finite and strictly inside (-1, 1)")
-    if not math.isfinite(sigma) or sigma <= 0:
-        raise ValueError("sigma must be finite and positive")
-    stationary_sd = sigma / math.sqrt(1.0 - phi**2)
-    total = 0.0
-    for segment in segments:
-        values = np.asarray(segment, dtype=float)
-        if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
-            raise ValueError("each AR segment must be a finite non-empty vector")
-        total += -0.5 * (
-            (values[0] / stationary_sd) ** 2 + math.log(2 * math.pi * stationary_sd**2)
-        )
-        innovation = values[1:] - phi * values[:-1]
-        total += float(-0.5 * np.sum((innovation / sigma) ** 2 + math.log(2 * math.pi * sigma**2)))
-    return total
+    return float(event_reset_ar1_logp_numpy(segments, phi, sigma).sum())
 
 
 def _validate_calibration(calibration: ApprovedARCalibration) -> ApprovedARCalibration:
@@ -207,9 +230,7 @@ def _intrinsic_random_walk(
         # The circular potential stays in scaled-innovation coordinates. With
         # the raw Normal density this is the exact change-of-variables form of
         # the normalized centered cyclic RW1 density.
-        raw = pm.Normal(
-            f"{name}_innovation_raw", mu=0.0, sigma=1.0, shape=(2, positions - 1)
-        )
+        raw = pm.Normal(f"{name}_innovation_raw", mu=0.0, sigma=1.0, shape=(2, positions - 1))
         innovation = pm.Deterministic(f"{name}_innovation", raw * sigma[:, None])
     else:
         innovation = pm.Normal(

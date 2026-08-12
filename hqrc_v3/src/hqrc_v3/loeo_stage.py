@@ -22,7 +22,6 @@ from hqrc_v3._loeo_types import (
     LOEOFoldProducts,
     LOEOFoldResult,
 )
-from hqrc_v3.bayes.artifacts import write_hqrc_data
 from hqrc_v3.bayes.model import HQRCData
 from hqrc_v3.bayes.samplers import sample_hqrc
 from hqrc_v3.correction_source import ValidatedCorrectionSource
@@ -268,30 +267,27 @@ def fit_loeo_fold(
     directory = namespace.path
     with publication_io.fold_lock(namespace) as publication_handle:
         publication_io.guard_namespace(publication_handle)
-        complete = directory / "COMPLETE"
-        manifest = directory / "manifest.json"
-        if complete.exists() or complete.is_symlink():
-            if not manifest.exists() or manifest.is_symlink():
+        if publication_io.publication_has(publication_handle, "COMPLETE"):
+            if not publication_io.publication_has(publication_handle, "manifest.json"):
                 raise LOEOFoldError("partial LOEO fold publication")
             completed = publication_io.validate_complete(
-                directory, identity=identity, inputs=inputs, sampler=sampler
+                publication_handle, identity=identity, inputs=inputs, sampler=sampler
             )
             publication_io.guard_namespace(publication_handle)
             return completed
-        existing = {path.name for path in directory.iterdir() if path.name != ".loeo-fold.lock"}
+        existing = publication_io.publication_entries(publication_handle) - {".loeo-fold.lock"}
         if existing:
             publication_io.guard_namespace(publication_handle)
             idata, products, preserved = publication_io.load_resumable_checkpoint(
-                directory,
+                publication_handle,
                 identity=identity,
                 inputs=inputs,
                 sampler=sampler,
             )
             fit_count = 0
         else:
-            publication_io.guard_namespace(publication_handle)
-            write_hqrc_data(
-                directory / "hqrc_data.npz",
+            publication_io.write_hqrc_checkpoint(
+                publication_handle,
                 inputs.hqrc_data,
                 settings={
                     "identity_sha256": identity_sha256,
@@ -333,20 +329,28 @@ def fit_loeo_fold(
                 predictive_draws=int(sampler["draws"]) * int(sampler["chains"]),
             )
         publication_io.write_products(publication_handle, products, preserve=preserved)
-        publication_io.guard_namespace(publication_handle)
-        payload = publication_io.manifest_payload(directory, identity=identity, products=products)
+        payload = publication_io.manifest_payload(
+            publication_handle, identity=identity, products=products
+        )
         if "manifest.json" not in preserved:
-            publication_io.guard_namespace(publication_handle)
-            publication_io.atomic_json(directory / "manifest.json", payload)
+            publication_io.publish_json(
+                publication_handle,
+                "manifest.json",
+                payload,
+                boundary="manifest-prewrite",
+            )
             publication_io.checked_publication_boundary(publication_handle, "manifest-published")
-        publication_io.guard_namespace(publication_handle)
-        publication_io.atomic_json(
-            directory / "COMPLETE",
+        publication_io.publish_json(
+            publication_handle,
+            "COMPLETE",
             {
-                "manifest_sha256": file_sha256(directory / "manifest.json"),
+                "manifest_sha256": publication_io.relative_sha256(
+                    publication_handle, "manifest.json"
+                ),
                 "state": "COMPLETE",
                 "causal": False,
             },
+            boundary="complete-prewrite",
         )
         publication_io.checked_publication_boundary(publication_handle, "complete-published")
     return publication_io.result(directory, reused=False, sampler_fit_count=fit_count)
@@ -388,7 +392,7 @@ def load_loeo_fold_result(
     with publication_io.fold_lock(namespace) as publication_handle:
         publication_io.guard_namespace(publication_handle)
         completed = publication_io.validate_complete(
-            directory, identity=identity, inputs=inputs, sampler=sampler
+            publication_handle, identity=identity, inputs=inputs, sampler=sampler
         )
         publication_io.guard_namespace(publication_handle)
         return completed

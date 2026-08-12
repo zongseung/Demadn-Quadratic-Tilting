@@ -11,6 +11,7 @@ from pathlib import Path
 
 import arviz as az
 import hqrc_v3._loeo_contract as loeo_contract_module
+import hqrc_v3._loeo_posterior as loeo_posterior_module
 import hqrc_v3._loeo_products as loeo_products_module
 import hqrc_v3._loeo_publication as loeo_publication_module
 import hqrc_v3.loeo_stage as loeo_stage_module
@@ -18,7 +19,13 @@ import numpy as np
 import pytest
 import xarray as xr
 from hqrc_v3.bayes.artifacts import load_hqrc_data
-from hqrc_v3.bayes.model import CYCLIC_HOUR_PARAMETERIZATION, HQRCModelOptions, build_hqrc_model
+from hqrc_v3.bayes.model import (
+    CYCLIC_HOUR_PARAMETERIZATION,
+    HQRCModelOptions,
+    build_hqrc_model,
+    event_reset_ar1_logp_numpy,
+    stationary_ar1_logp_numpy,
+)
 from hqrc_v3.bayes.samplers import SamplingDiagnostics, SamplingError
 from hqrc_v3.correction_source import ValidatedCorrectionSource
 from hqrc_v3.diagnostics.loeo import load_loeo_event, publish_loeo_universe
@@ -47,68 +54,109 @@ base_source = source_fixture
 source = ar_source_fixture
 
 
-def _posterior_dataset(*, chains: int = 2, draws: int = 4) -> xr.Dataset:
+def _posterior_dataset(inputs, *, chains: int = 2, draws: int = 4) -> xr.Dataset:
     sample = (chains, draws)
     phi = np.linspace(0.2, 0.5, chains * draws).reshape(sample)
     cholesky = np.broadcast_to(np.eye(3), (*sample, 2, 3, 3)).copy()
-    return xr.Dataset(
+    event_likelihood = event_reset_ar1_logp_numpy(
+        [inputs.hqrc_data.observations[segment] for segment in inputs.hqrc_data.segments],
+        phi,
+        np.full(sample, 0.1),
+    )
+    data_vars = {
+        "mu": (("chain", "draw", "mu_dim_0", "mu_dim_1"), np.zeros((*sample, 2, 3))),
+        "delta": (
+            ("chain", "draw", "delta_dim_0", "delta_dim_1"),
+            np.zeros((*sample, 2, 3)),
+        ),
+        "between_cholesky": (
+            (
+                "chain",
+                "draw",
+                "between_cholesky_dim_0",
+                "between_cholesky_dim_1",
+                "between_cholesky_dim_2",
+            ),
+            cholesky,
+        ),
+        "between_scale": (
+            ("chain", "draw", "between_scale_dim_0", "between_scale_dim_1"),
+            np.ones((*sample, 2, 3)),
+        ),
+    }
+    for holiday in range(2):
+        data_vars[f"between_cov_{holiday}"] = (
+            ("chain", "draw", f"between_cov_{holiday}_dim_0"),
+            np.broadcast_to(np.asarray([1.0, 0.0, 1.0, 0.0, 0.0, 1.0]), (*sample, 6)),
+        )
+        data_vars[f"between_cov_{holiday}_corr"] = (
+            (
+                "chain",
+                "draw",
+                f"between_cov_{holiday}_corr_dim_0",
+                f"between_cov_{holiday}_corr_dim_1",
+            ),
+            np.broadcast_to(np.eye(3), (*sample, 3, 3)),
+        )
+        data_vars[f"between_cov_{holiday}_stds"] = (
+            ("chain", "draw", f"between_cov_{holiday}_stds_dim_0"),
+            np.ones((*sample, 3)),
+        )
+    data_vars.update(
         {
-            "mu": (("chain", "draw", "holiday", "coefficient"), np.zeros((*sample, 2, 3))),
-            "delta": (
-                ("chain", "draw", "holiday", "coefficient"),
-                np.zeros((*sample, 2, 3)),
-            ),
-            "between_cholesky": (
-                ("chain", "draw", "holiday", "coefficient", "coefficient_aux"),
-                cholesky,
-            ),
-            "between_scale": (
-                ("chain", "draw", "holiday", "coefficient"),
-                np.ones((*sample, 2, 3)),
-            ),
-            "between_cov_0": (
-                ("chain", "draw", "packed_cholesky"),
-                np.broadcast_to(np.asarray([1.0, 0.0, 1.0, 0.0, 0.0, 1.0]), (*sample, 6)),
-            ),
-            "between_cov_1": (
-                ("chain", "draw", "packed_cholesky"),
-                np.broadcast_to(np.asarray([1.0, 0.0, 1.0, 0.0, 0.0, 1.0]), (*sample, 6)),
-            ),
             "beta_offset": (
-                ("chain", "draw", "event", "coefficient"),
+                ("chain", "draw", "beta_offset_dim_0", "beta_offset_dim_1"),
                 np.zeros((*sample, 9, 3)),
             ),
             "beta": (
-                ("chain", "draw", "event", "coefficient"),
+                ("chain", "draw", "beta_dim_0", "beta_dim_1"),
                 np.zeros((*sample, 9, 3)),
             ),
-            "sigma_gamma": (("chain", "draw", "holiday"), np.ones((*sample, 2))),
+            "sigma_gamma": (("chain", "draw", "sigma_gamma_dim_0"), np.ones((*sample, 2))),
             "gamma_innovation_raw": (
-                ("chain", "draw", "holiday", "innovation"),
+                (
+                    "chain",
+                    "draw",
+                    "gamma_innovation_raw_dim_0",
+                    "gamma_innovation_raw_dim_1",
+                ),
                 np.zeros((*sample, 2, 23)),
             ),
             "gamma_innovation": (
-                ("chain", "draw", "holiday", "innovation"),
+                (
+                    "chain",
+                    "draw",
+                    "gamma_innovation_dim_0",
+                    "gamma_innovation_dim_1",
+                ),
                 np.zeros((*sample, 2, 23)),
             ),
-            "gamma": (("chain", "draw", "holiday", "hour"), np.zeros((*sample, 2, 24))),
+            "gamma": (
+                ("chain", "draw", "gamma_dim_0", "gamma_dim_1"),
+                np.zeros((*sample, 2, 24)),
+            ),
             "u_phi": (("chain", "draw"), (phi + 1.0) / 2.0),
             "phi": (("chain", "draw"), phi),
             "sigma_r": (("chain", "draw"), np.full(sample, 0.1)),
             "event_log_likelihood": (
-                ("chain", "draw", "event"),
-                np.zeros((*sample, 9)),
+                ("chain", "draw", "event_log_likelihood_dim_0"),
+                event_likelihood,
             ),
         }
     )
+    dataset = xr.Dataset(data_vars)
+    return dataset.assign_coords({name: np.arange(size) for name, size in dataset.sizes.items()})
 
 
 def _fake_idata(inputs, *, chains: int = 2, draws: int = 4, sampler=None) -> az.InferenceData:
     idata = az.InferenceData(
-        posterior=_posterior_dataset(chains=chains, draws=draws),
+        posterior=_posterior_dataset(inputs, chains=chains, draws=draws),
         sample_stats=xr.Dataset(
             {"diverging": (("chain", "draw"), np.zeros((chains, draws), dtype=np.int8))}
         ),
+    )
+    idata.add_groups(
+        {"log_likelihood": xr.Dataset({"event": idata.posterior["event_log_likelihood"]})}
     )
     if sampler is not None:
         idata.attrs.update(
@@ -169,6 +217,12 @@ def _tree_snapshot(root: Path) -> dict[str, tuple[object, ...]]:
         else:
             snapshot[relative] = ("special", stat.S_IFMT(identity.st_mode), identity.st_ino)
     return snapshot
+
+
+def _attacker_rewrite_json(path: Path, value: dict[str, object]) -> None:
+    """Rewrite and rehash evidence through the attacker-controlled pathname."""
+
+    path.write_bytes(loeo_contract_module.canonical_json(value) + b"\n")
 
 
 def _single_checkpoint(root: Path) -> Path:
@@ -422,6 +476,71 @@ def test_h3_model_keeps_exact_geometry_options_and_posterior_phi_semantics(appro
     assert any(potential.name == "event_reset_ar1" for potential in model.potentials)
 
 
+def _mutate_exact_posterior(idata: az.InferenceData, mutation: str) -> None:
+    posterior = idata.posterior
+    if mutation == "extra-variable":
+        posterior["nu_minus_two"] = (("chain", "draw"), np.ones((2, 4)))
+    elif mutation == "wrong-event-dimension":
+        posterior["event_log_likelihood"] = posterior["event_log_likelihood"].rename(
+            {"event_log_likelihood_dim_0": "wrong_event"}
+        )
+    elif mutation == "packed-covariance":
+        posterior["between_cov_0"] = posterior["between_cov_0"] + 0.25
+    elif mutation == "negative-covariance":
+        changed = posterior["between_cholesky"].values.copy()
+        changed[..., 0, 0, 0] *= -1.0
+        posterior["between_cholesky"] = (posterior["between_cholesky"].dims, changed)
+    elif mutation == "gamma-innovation":
+        posterior["gamma_innovation"] = posterior["gamma_innovation"] + 0.25
+    elif mutation == "gamma-profile":
+        posterior["gamma"] = posterior["gamma"] + 0.25
+    elif mutation == "beta":
+        posterior["beta"] = posterior["beta"] + 0.25
+    elif mutation == "event-log-likelihood":
+        posterior["event_log_likelihood"] = posterior["event_log_likelihood"] + 0.25
+    elif mutation == "log-likelihood-mirror":
+        idata.log_likelihood["event"] = idata.log_likelihood["event"] + 0.25
+    else:
+        raise AssertionError(f"unknown posterior mutation: {mutation}")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "extra-variable",
+        "wrong-event-dimension",
+        "negative-covariance",
+        "packed-covariance",
+        "gamma-innovation",
+        "gamma-profile",
+        "beta",
+        "event-log-likelihood",
+        "log-likelihood-mirror",
+    ],
+)
+def test_h3_posterior_rejects_exact_schema_and_deterministic_mutations(
+    approved_fold, mutation: str
+) -> None:
+    source, publication, approved = approved_fold
+    inputs = prepare_loeo_fold_inputs(
+        source,
+        publication,
+        approved,
+        held_out_occurrence_id="seollal-2024",
+    )
+    idata = _fake_idata(inputs)
+    _mutate_exact_posterior(idata, mutation)
+    with pytest.raises(LOEOFoldError, match="posterior|likelihood|covariance|gamma|beta"):
+        loeo_posterior_module.validate_h3_posterior(idata, inputs)
+
+
+def test_event_reset_ar1_event_terms_sum_to_existing_scalar_contract() -> None:
+    segments = (np.asarray([0.2, -0.1, 0.3]), np.asarray([-0.5, 0.4]))
+    terms = event_reset_ar1_logp_numpy(segments, 0.35, 0.8)
+    assert terms.shape == (2,)
+    assert terms.sum() == pytest.approx(stationary_ar1_logp_numpy(segments, 0.35, 0.8))
+
+
 def test_products_use_known_restriction_one_ar_reset_and_exactly_one_noise_term(
     approved_fold, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -620,9 +739,7 @@ def test_checkpoint_recovery_complete_reuse_namespaces_and_fail_closed_products(
     os.replace(replacement_posterior, tampered.posterior_path)
     checkpoint = json.loads((tampered.output_dir / "posterior.checkpoint.json").read_bytes())
     checkpoint["posterior_sha256"] = file_sha256(tampered.posterior_path)
-    loeo_publication_module.atomic_json(
-        tampered.output_dir / "posterior.checkpoint.json", checkpoint
-    )
+    _attacker_rewrite_json(tampered.output_dir / "posterior.checkpoint.json", checkpoint)
     mutated_idata = az.from_netcdf(tampered.posterior_path)
     try:
         original_manifest = json.loads(tampered.manifest_path.read_bytes())
@@ -636,16 +753,15 @@ def test_checkpoint_recovery_complete_reuse_namespaces_and_fail_closed_products(
         mutated_idata.close()
     mutated_products.hourly_predictions.write_parquet(tampered.hourly_predictions_path)
     mutated_products.metrics.write_parquet(tampered.metrics_path)
-    loeo_publication_module.atomic_json(
-        tampered.posterior_summary_path, mutated_products.posterior_summary
-    )
-    rehashed_manifest = loeo_publication_module.manifest_payload(
-        tampered.output_dir,
-        identity=original_manifest["identity"],
-        products=mutated_products,
-    )
-    loeo_publication_module.atomic_json(tampered.manifest_path, rehashed_manifest)
-    loeo_publication_module.atomic_json(
+    _attacker_rewrite_json(tampered.posterior_summary_path, mutated_products.posterior_summary)
+    with loeo_publication_module.fold_lock(tampered.output_dir) as tampered_handle:
+        rehashed_manifest = loeo_publication_module.manifest_payload(
+            tampered_handle,
+            identity=original_manifest["identity"],
+            products=mutated_products,
+        )
+    _attacker_rewrite_json(tampered.manifest_path, rehashed_manifest)
+    _attacker_rewrite_json(
         tampered.output_dir / "COMPLETE",
         {
             "manifest_sha256": file_sha256(tampered.manifest_path),
@@ -682,6 +798,68 @@ def test_checkpoint_recovery_complete_reuse_namespaces_and_fail_closed_products(
     )
     with pytest.raises(LOEOFoldError, match="semantics"):
         load_loeo_fold_result(source, publication, approved, **fit_kwargs)
+
+
+def test_fully_rehashed_checkpoint_rejects_every_exact_posterior_semantic_mutation(
+    approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    calls = _install_fake_sampler(monkeypatch, source, publication, approved)
+    kwargs = _smoke_fit_kwargs(tmp_path / "fully-rehashed", seed=811)
+    fitted = fit_loeo_fold(source, publication, approved, **kwargs)
+    originals = {
+        name: (fitted.output_dir / name).read_bytes()
+        for name in ("posterior.nc", "posterior.checkpoint.json", "manifest.json", "COMPLETE")
+    }
+    mutations = (
+        "extra-variable",
+        "wrong-event-dimension",
+        "negative-covariance",
+        "packed-covariance",
+        "gamma-innovation",
+        "gamma-profile",
+        "beta",
+        "event-log-likelihood",
+        "log-likelihood-mirror",
+    )
+    for mutation in mutations:
+        for name, payload in originals.items():
+            (fitted.output_dir / name).write_bytes(payload)
+        idata = az.from_netcdf(fitted.posterior_path).load()
+        try:
+            _mutate_exact_posterior(idata, mutation)
+            replacement = tmp_path / f"{mutation}.nc"
+            az.to_netcdf(idata, replacement)
+        finally:
+            idata.close()
+        os.replace(replacement, fitted.posterior_path)
+        checkpoint = json.loads(originals["posterior.checkpoint.json"])
+        checkpoint["posterior_sha256"] = file_sha256(fitted.posterior_path)
+        _attacker_rewrite_json(fitted.output_dir / "posterior.checkpoint.json", checkpoint)
+        manifest = json.loads(originals["manifest.json"])
+        manifest["outputs"]["posterior"]["sha256"] = file_sha256(fitted.posterior_path)
+        manifest["outputs"]["posterior_checkpoint"]["sha256"] = file_sha256(
+            fitted.output_dir / "posterior.checkpoint.json"
+        )
+        unsigned = {
+            key: manifest[key]
+            for key in ("schema_version", "state", "causal", "identity", "outputs", "rows")
+        }
+        manifest["manifest_digest"] = loeo_contract_module.sha_json(unsigned)
+        _attacker_rewrite_json(fitted.manifest_path, manifest)
+        _attacker_rewrite_json(
+            fitted.output_dir / "COMPLETE",
+            {
+                "manifest_sha256": file_sha256(fitted.manifest_path),
+                "state": "COMPLETE",
+                "causal": False,
+            },
+        )
+        before = _tree_snapshot(fitted.output_dir)
+        with pytest.raises(LOEOFoldError, match="posterior|likelihood|covariance|gamma|beta"):
+            load_loeo_fold_result(source, publication, approved, **kwargs)
+        assert _tree_snapshot(fitted.output_dir) == before
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -875,6 +1053,49 @@ def test_fit_rejects_intermediate_swap_at_boundary_before_sampler_or_outside_wri
     assert swapped is True
     assert _tree_snapshot(outside) == outside_before
     assert len(calls) == 0
+
+
+@pytest.mark.parametrize(
+    ("boundary", "expected_sampler_calls"),
+    [
+        ("hqrc-data-prewrite", 0),
+        ("posterior-prewrite", 1),
+        ("hourly_predictions-prewrite", 1),
+        ("manifest-prewrite", 1),
+        ("complete-prewrite", 1),
+    ],
+)
+def test_every_publication_class_uses_held_directory_after_prewrite_namespace_swap(
+    approved_fold,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    expected_sampler_calls: int,
+) -> None:
+    source, publication, approved = approved_fold
+    calls = _install_fake_sampler(monkeypatch, source, publication, approved)
+    output_root = tmp_path / boundary
+    outside = tmp_path / f"outside-{boundary}"
+    outside.mkdir()
+    (outside / "marker").write_bytes(b"untouched")
+    outside_before = _tree_snapshot(outside)
+    swapped = False
+
+    def swap_before_write(name: str) -> None:
+        nonlocal swapped
+        if name != boundary or swapped:
+            return
+        swapped = True
+        component = output_root / "loeo-h3"
+        component.rename(output_root / "quarantined-loeo-h3")
+        component.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(loeo_publication_module, "publication_boundary", swap_before_write)
+    with pytest.raises(LOEOFoldError, match="namespace|changed|unsafe"):
+        fit_loeo_fold(source, publication, approved, **_smoke_fit_kwargs(output_root))
+    assert swapped is True
+    assert _tree_snapshot(outside) == outside_before
+    assert len(calls) == expected_sampler_calls
 
 
 @pytest.mark.parametrize("kind", ["dangling", "fifo", "special"])

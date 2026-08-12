@@ -11,11 +11,12 @@ import arviz as az
 import numpy as np
 import polars as pl
 import pytest
+from hqrc_v3._loeo_posterior import validate_h3_posterior
 from hqrc_v3.bayes.artifacts import load_hqrc_data
 from hqrc_v3.correction_source import validate_correction_source
 from hqrc_v3.diagnostics.loeo import load_loeo_universe
 from hqrc_v3.diagnostics.loeo_ar import load_approved_loeo_ar_set
-from hqrc_v3.loeo_stage import fit_loeo_fold, prepare_loeo_fold_inputs
+from hqrc_v3.loeo_stage import fit_loeo_fold, load_loeo_fold_result, prepare_loeo_fold_inputs
 from hqrc_v3.provenance import file_sha256
 
 _PROPOSAL_SHA = "db54721c0899f29312abe3d47d08977b33e02f53315d629c17fd319f6bfa83cd"
@@ -116,6 +117,8 @@ def test_real_xgboost_b1_one_fold_runs_reduced_pymc_without_mutating_inputs(tmp_
     assert summary["phi"]["sample_count"] == 6
     assert summary["phi"]["parameterization"].startswith("phi=2*u_phi-1")
     posterior = az.from_netcdf(result.posterior_path)
+    validated = validate_h3_posterior(posterior, inputs)
+    assert len(validated.data_vars) == 20
     assert {"u_phi", "phi"}.issubset(posterior.posterior)
     np.testing.assert_allclose(posterior.posterior["phi"], 2.0 * posterior.posterior["u_phi"] - 1.0)
     assert posterior.attrs["hqrc_causal"] == "false"
@@ -155,6 +158,20 @@ def test_real_xgboost_b1_one_fold_runs_reduced_pymc_without_mutating_inputs(tmp_
     )
     assert reused.reused is True and reused.sampler_fit_count == 0
     assert reused.output_dir == result.output_dir
+    loaded = load_loeo_fold_result(
+        source,
+        publication,
+        approved,
+        held_out_occurrence_id=held_out,
+        sampler_seed=20260812,
+        profile="smoke",
+        draws=3,
+        tune=3,
+        chains=2,
+        output_root=tmp_path,
+    )
+    assert loaded.reused is True and loaded.sampler_fit_count == 0
+    assert loaded.output_dir == result.output_dir
     assert {
         "source": _tree_hashes(run),
         "loeo": _tree_hashes(loeo_dir),
