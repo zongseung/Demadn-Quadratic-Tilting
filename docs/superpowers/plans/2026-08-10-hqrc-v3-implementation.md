@@ -1541,7 +1541,7 @@ and freezes, without recalculation, all ten proposals. Every loaded approval mus
 context and `registry_ids - {held_out}`. Reject causal eight-event approvals, fold swaps, event
 order/population changes, and any proposal/plot/training digest change.
 
-- [ ] **Step 4: Implement one immutable H3 LOEO fold**
+- [x] **Step 4: Implement one immutable H3 LOEO fold**
 
 Create `hqrc_v3/src/hqrc_v3/loeo_stage.py`, unit/integration tests, and a reduced real-data slow
 test. For one held-out id, build `HQRCData` from the approved nine events and call the reviewed
