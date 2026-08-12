@@ -1553,7 +1553,7 @@ prediction. Evaluation scale is the held-out OOF fold scale for 2020--2023 and `
 NUTS geometry, namespace identity, strict diagnostics gate, atomic posterior checkpoint, immutable
 products, semantic reuse, and fail-closed recovery.
 
-- [ ] **Step 5: Publish the complete ten-fold primary H3 matrix**
+- [x] **Step 5: Publish the complete ten-fold primary H3 matrix**
 
 Implement `fit_loeo_primary`. Paper profile requires all ten folds and creates aggregate
 `COMPLETE` only after every fold independently passes R-hat/ESS/divergence and semantic checks.
