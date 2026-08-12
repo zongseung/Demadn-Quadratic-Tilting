@@ -31,9 +31,7 @@ _GENERATION_NAMESPACE = frozenset({"universe.parquet", "folds", "manifest.json",
 _COLUMNS = (*STANDARDIZED_RESIDUAL_COLUMNS, "causal")
 _YEARS = tuple(range(2020, 2025))
 _FOLD_FILENAMES = frozenset(
-    f"{holiday}-{year}.parquet"
-    for year in _YEARS
-    for holiday in ("seollal", "chuseok")
+    f"{holiday}-{year}.parquet" for year in _YEARS for holiday in ("seollal", "chuseok")
 )
 
 
@@ -77,6 +75,18 @@ class LOEOFold:
     occurrence_ids: tuple[str, ...]
     path: Path
     residual_sha256: str
+    frame: pl.DataFrame
+    context: EventResidualContext
+    causal: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LOEOHeldOut:
+    """One re-read held-out event from the fully revalidated physical universe."""
+
+    occurrence_id: str
+    path: Path
+    universe_sha256: str
     frame: pl.DataFrame
     context: EventResidualContext
     causal: bool
@@ -840,10 +850,41 @@ def load_loeo_fold(
     )
 
 
+def load_loeo_event(
+    source: ValidatedCorrectionSource,
+    context: EventResidualContext,
+    *,
+    output_dir: Path,
+    occurrence_id: str,
+) -> LOEOHeldOut:
+    """Re-read one held-out event only after validating the complete universe and folds."""
+
+    publication, universe, _, _ = _load_publication(source, context, Path(output_dir))
+    if occurrence_id not in publication.occurrence_ids:
+        raise LOEOError("LOEO held-out occurrence is not registered")
+    frame = universe.filter(pl.col("occurrence_id") == occurrence_id)
+    if (
+        frame.is_empty()
+        or frame["occurrence_id"].unique().to_list() != [occurrence_id]
+        or frame["causal"].unique().to_list() != [False]
+    ):
+        raise LOEOError("LOEO held-out event differs from the physical universe")
+    return LOEOHeldOut(
+        occurrence_id=occurrence_id,
+        path=publication.universe_path,
+        universe_sha256=publication.universe_sha256,
+        frame=frame,
+        context=context,
+        causal=False,
+    )
+
+
 __all__ = [
     "LOEOError",
     "LOEOFold",
+    "LOEOHeldOut",
     "LOEOPublication",
+    "load_loeo_event",
     "load_loeo_fold",
     "load_loeo_universe",
     "publish_loeo_universe",
