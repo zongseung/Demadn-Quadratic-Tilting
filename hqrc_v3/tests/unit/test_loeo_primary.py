@@ -228,6 +228,68 @@ def test_paper_preflight_rejects_nonpaper_source_and_smoke_sampler_before_fold_c
     assert calls == []
 
 
+def test_paper_preflight_revalidates_all_physical_folds_before_any_fold_call(
+    approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    source = replace(source, source_profile="paper")
+    missing = publication.fold_paths[publication.occurrence_ids[-1]]
+    missing.rename(missing.with_suffix(".missing"))
+    calls: list[str] = []
+
+    def unexpected_fold_call(*_args, **kwargs):
+        calls.append(kwargs["held_out_occurrence_id"])
+        raise AssertionError("fold kernel must not be called")
+
+    monkeypatch.setattr(primary_module, "fit_loeo_fold", unexpected_fold_call)
+    with pytest.raises(LOEOPrimaryError, match="complete revalidation"):
+        fit_loeo_primary(
+            source,
+            publication,
+            approved,
+            held_out_occurrence_ids=publication.occurrence_ids,
+            root_seed=71,
+            profile="paper",
+            draws=1_000,
+            tune=1_000,
+            chains=4,
+            output_root=tmp_path / "matrix-paper",
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("error", [TypeError("bad source"), ValueError("bad approval")])
+def test_paper_preflight_wraps_lower_level_reload_errors_before_fold_calls(
+    approved_fold,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    source, publication, approved = approved_fold
+    source = replace(source, source_profile="paper")
+    calls: list[object] = []
+    monkeypatch.setattr(
+        primary_module,
+        "validate_loeo_fold_sources",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(primary_module, "fit_loeo_fold", lambda *args, **kwargs: calls.append(args))
+    with pytest.raises(LOEOPrimaryError, match="complete revalidation"):
+        fit_loeo_primary(
+            source,
+            publication,
+            approved,
+            held_out_occurrence_ids=publication.occurrence_ids,
+            root_seed=71,
+            profile="paper",
+            draws=1_000,
+            tune=1_000,
+            chains=4,
+            output_root=tmp_path / "matrix-paper",
+        )
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     "selected",
     [
@@ -299,6 +361,33 @@ def test_fake_ten_fold_matrix_calls_only_reviewed_kernel_and_aggregates_exactly(
     assert manifest["identity"]["root_seed"] == 71
     assert manifest["identity"]["publication_scope"] == "smoke-subset"
     assert manifest["identity"]["aggregation"]["full_posterior_draws_duplicated"] is False
+
+
+def test_manifest_persists_initial_fold_fit_status_across_complete_reuse(
+    approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    selected = ("seollal-2024", "chuseok-2024")
+    materials = {held: _fake_material(approved_fold, held, tmp_path) for held in selected}
+    _install_fake_matrix_kernel(monkeypatch, materials)
+    kwargs = _fit_kwargs(tmp_path / "matrix", selected)
+
+    first = fit_loeo_primary(source, publication, approved, **kwargs)
+    before = first.manifest_path.read_bytes()
+    manifest = json.loads(before)
+    assert manifest["fold_execution"] == [
+        {
+            "held_out_occurrence_id": held,
+            "fit_status": "fit",
+            "sampler_fit_count": 1,
+        }
+        for held in selected
+    ]
+
+    reused = fit_loeo_primary(source, publication, approved, **kwargs)
+    assert reused.fold_sampler_fit_counts == {held: 0 for held in selected}
+    assert reused.manifest_path.read_bytes() == before
+    assert json.loads(before)["fold_execution"] == manifest["fold_execution"]
 
 
 def test_fold_failure_leaves_no_aggregate_complete_and_retry_fits_only_missing_fold(
@@ -397,6 +486,7 @@ def test_fully_rehashed_aggregate_semantic_mutation_rejects_without_cleanup(
             "identity",
             "outputs",
             "rows",
+            "fold_execution",
         )
     }
     manifest["manifest_digest"] = sha_json(unsigned)
@@ -415,6 +505,71 @@ def test_fully_rehashed_aggregate_semantic_mutation_rejects_without_cleanup(
     with pytest.raises(LOEOPrimaryError, match="semantics differ"):
         fit_loeo_primary(source, publication, approved, **kwargs)
     assert _snapshot(completed.output_dir) == before
+
+
+@pytest.mark.parametrize(
+    "boundary_name",
+    [
+        "matrix-manifest-prewrite",
+        "matrix-complete-prewrite",
+        "matrix-complete-published",
+    ],
+)
+def test_publication_time_semantic_mutation_never_leaves_complete(
+    approved_fold,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary_name: str,
+) -> None:
+    source, publication, approved = approved_fold
+    selected = ("seollal-2024", "chuseok-2024")
+    materials = {held: _fake_material(approved_fold, held, tmp_path) for held in selected}
+    _install_fake_matrix_kernel(monkeypatch, materials)
+    output_root = tmp_path / "matrix"
+    mutated = False
+
+    def mutate_at_boundary(name: str) -> None:
+        nonlocal mutated
+        if name != boundary_name or mutated:
+            return
+        hourly_path = next(output_root.rglob("hourly_predictions.parquet"))
+        hourly = pl.read_parquet(hourly_path).with_columns(
+            (pl.col("corrected_point_mw") + 123.0).alias("corrected_point_mw")
+        )
+        hourly.write_parquet(hourly_path)
+        mutated = True
+
+    monkeypatch.setattr(fold_publication_module, "publication_boundary", mutate_at_boundary)
+    with pytest.raises(LOEOPrimaryError):
+        fit_loeo_primary(source, publication, approved, **_fit_kwargs(output_root, selected))
+    assert mutated
+    assert list(output_root.rglob("COMPLETE")) == []
+
+
+def test_postpublish_complete_substitution_is_preserved_and_rejected(
+    approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    selected = ("seollal-2024", "chuseok-2024")
+    materials = {held: _fake_material(approved_fold, held, tmp_path) for held in selected}
+    _install_fake_matrix_kernel(monkeypatch, materials)
+    output_root = tmp_path / "matrix"
+    planted: list[tuple[Path, int]] = []
+
+    def replace_complete(name: str) -> None:
+        if name != "matrix-complete-published" or planted:
+            return
+        complete = next(output_root.rglob("COMPLETE"))
+        complete.unlink()
+        complete.write_bytes(b"foreign-complete")
+        planted.append((complete, complete.lstat().st_ino))
+
+    monkeypatch.setattr(fold_publication_module, "publication_boundary", replace_complete)
+    with pytest.raises(LOEOPrimaryError):
+        fit_loeo_primary(source, publication, approved, **_fit_kwargs(output_root, selected))
+    complete, inode = planted[0]
+    assert complete.lstat().st_ino == inode
+    assert complete.read_bytes() == b"foreign-complete"
 
 
 def test_interrupted_ordered_prefix_recovers_without_rewriting_verified_inode(

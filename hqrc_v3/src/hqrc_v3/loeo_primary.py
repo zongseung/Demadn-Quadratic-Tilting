@@ -12,11 +12,15 @@ from hqrc_v3._loeo_primary_products import generate_loeo_primary_products
 from hqrc_v3._loeo_primary_types import LOEOPrimaryError, LOEOPrimaryProducts, LOEOPrimaryResult
 from hqrc_v3._loeo_types import LOEOFoldError, LOEOFoldMaterial
 from hqrc_v3.correction_source import ValidatedCorrectionSource
-from hqrc_v3.diagnostics.loeo import LOEOPublication
+from hqrc_v3.diagnostics.loeo import LOEOError, LOEOPublication
 from hqrc_v3.diagnostics.loeo_ar import ApprovedLOEOARSet
-from hqrc_v3.loeo_stage import fit_loeo_fold, load_loeo_fold_material
+from hqrc_v3.loeo_stage import (
+    fit_loeo_fold,
+    load_loeo_fold_material,
+    validate_loeo_fold_sources,
+)
 
-_AGGREGATION_SCHEMA_VERSION = 1
+_AGGREGATION_SCHEMA_VERSION = 2
 
 
 def _selected_folds(
@@ -77,6 +81,13 @@ def _selected_folds(
         )
     except (TypeError, ValueError) as error:
         raise LOEOPrimaryError("LOEO primary sampler contract is invalid") from error
+    if profile == "paper":
+        try:
+            validate_loeo_fold_sources(source, publication, approved_set)
+        except (TypeError, ValueError, LOEOFoldError, LOEOError) as error:
+            raise LOEOPrimaryError(
+                "paper LOEO primary inputs failed complete revalidation"
+            ) from error
     return held_out_occurrence_ids
 
 

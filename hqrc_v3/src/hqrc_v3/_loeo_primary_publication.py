@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -96,17 +98,63 @@ def manifest_payload(
     *,
     identity: Mapping[str, Any],
     products: LOEOPrimaryProducts,
+    fold_execution: list[dict[str, object]],
 ) -> dict[str, Any]:
     unsigned: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "state": "COMPLETE",
         "evaluation": "retrospective-loeo-primary-h3",
         "causal": False,
         "identity": dict(identity),
         "outputs": _artifact_records(publication),
         "rows": {key: getattr(products, key).height for key in PRODUCT_FILES},
+        "fold_execution": fold_execution,
     }
     return {**unsigned, "manifest_digest": sha_json(unsigned)}
+
+
+def _fold_execution(
+    selected_occurrence_ids: tuple[str, ...], fold_fit_counts: Mapping[str, int]
+) -> list[dict[str, object]]:
+    if set(fold_fit_counts) != set(selected_occurrence_ids):
+        raise LOEOPrimaryError("LOEO primary fold execution population differs")
+    rows: list[dict[str, object]] = []
+    for held_out in selected_occurrence_ids:
+        count = fold_fit_counts[held_out]
+        if type(count) is not int or count not in {0, 1}:
+            raise LOEOPrimaryError("LOEO primary fold sampler fit count differs")
+        rows.append(
+            {
+                "held_out_occurrence_id": held_out,
+                "fit_status": "fit" if count == 1 else "reuse",
+                "sampler_fit_count": count,
+            }
+        )
+    return rows
+
+
+def _recorded_execution(
+    value: object, selected_occurrence_ids: tuple[str, ...]
+) -> list[dict[str, object]]:
+    if not isinstance(value, list) or len(value) != len(selected_occurrence_ids):
+        raise LOEOPrimaryError("LOEO primary fold execution provenance differs")
+    counts: dict[str, int] = {}
+    for row in value:
+        if not isinstance(row, dict) or set(row) != {
+            "held_out_occurrence_id",
+            "fit_status",
+            "sampler_fit_count",
+        }:
+            raise LOEOPrimaryError("LOEO primary fold execution provenance differs")
+        held_out = row["held_out_occurrence_id"]
+        count = row["sampler_fit_count"]
+        if not isinstance(held_out, str) or type(count) is not int or count not in {0, 1}:
+            raise LOEOPrimaryError("LOEO primary fold execution provenance differs")
+        counts[held_out] = count
+    expected = _fold_execution(selected_occurrence_ids, counts)
+    if value != expected:
+        raise LOEOPrimaryError("LOEO primary fold execution provenance differs")
+    return expected
 
 
 def _frames_equal(left: pl.DataFrame, right: pl.DataFrame) -> bool:
@@ -164,7 +212,15 @@ def validate_complete(
     manifest = publication_io._relative_json(
         publication.directory_fd, "manifest.json", "LOEO primary manifest"
     )
-    expected_manifest = manifest_payload(publication, identity=identity, products=products)
+    recorded_execution = _recorded_execution(
+        manifest.get("fold_execution"), selected_occurrence_ids
+    )
+    expected_manifest = manifest_payload(
+        publication,
+        identity=identity,
+        products=products,
+        fold_execution=recorded_execution,
+    )
     complete = publication_io._relative_json(
         publication.directory_fd, "COMPLETE", "LOEO primary completion marker"
     )
@@ -180,6 +236,62 @@ def validate_complete(
         fold_fit_counts=fold_fit_counts,
         reused=True,
     )
+
+
+def _validate_ready(
+    publication: publication_io.LOEOPublicationHandle,
+    *,
+    identity: Mapping[str, Any],
+    products: LOEOPrimaryProducts,
+    selected_occurrence_ids: tuple[str, ...],
+    fold_execution: list[dict[str, object]],
+) -> None:
+    if publication_io.publication_entries(publication) != {_LOCK, *_ORDER}:
+        raise LOEOPrimaryError("LOEO primary publication is not ready for completion")
+    for filename, frame in _product_items(products):
+        _validate_product(publication, filename, frame)
+    manifest = publication_io._relative_json(
+        publication.directory_fd, "manifest.json", "LOEO primary manifest"
+    )
+    recorded = _recorded_execution(manifest.get("fold_execution"), selected_occurrence_ids)
+    if recorded != fold_execution or manifest != manifest_payload(
+        publication,
+        identity=identity,
+        products=products,
+        fold_execution=recorded,
+    ):
+        raise LOEOPrimaryError("LOEO primary publication is not ready for completion")
+
+
+def _remove_owned_complete(
+    publication: publication_io.LOEOPublicationHandle, owned: tuple[int, int]
+) -> bool:
+    try:
+        descriptor = os.open(
+            "COMPLETE",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=publication.directory_fd,
+        )
+    except OSError:
+        return False
+    removed = False
+    try:
+        descriptor_identity = os.fstat(descriptor)
+        entry_identity = os.stat("COMPLETE", dir_fd=publication.directory_fd, follow_symlinks=False)
+        current = (descriptor_identity.st_dev, descriptor_identity.st_ino)
+        if (
+            current == owned
+            and (entry_identity.st_dev, entry_identity.st_ino) == owned
+            and stat.S_ISREG(descriptor_identity.st_mode)
+        ):
+            os.unlink("COMPLETE", dir_fd=publication.directory_fd)
+            os.fsync(publication.directory_fd)
+            removed = True
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+    return removed
 
 
 def publish_or_resume(
@@ -200,6 +312,7 @@ def publish_or_resume(
                 selected_occurrence_ids=selected_occurrence_ids,
                 fold_fit_counts=fold_fit_counts,
             )
+        requested_execution = _fold_execution(selected_occurrence_ids, fold_fit_counts)
         entries = publication_io.publication_entries(publication) - {_LOCK}
         present = tuple(name for name in _ORDER if name in entries)
         if set(entries) != set(_ORDER[: len(present)]) or present != _ORDER[: len(present)]:
@@ -207,15 +320,19 @@ def publish_or_resume(
         product_by_name = dict(_product_items(products))
         for filename in present:
             if filename == "manifest.json":
-                expected_manifest = manifest_payload(
-                    publication, identity=identity, products=products
+                partial_manifest = publication_io._relative_json(
+                    publication.directory_fd, filename, "partial LOEO primary manifest"
                 )
-                if (
-                    publication_io._relative_json(
-                        publication.directory_fd, filename, "partial LOEO primary manifest"
-                    )
-                    != expected_manifest
-                ):
+                recorded_execution = _recorded_execution(
+                    partial_manifest.get("fold_execution"), selected_occurrence_ids
+                )
+                expected_manifest = manifest_payload(
+                    publication,
+                    identity=identity,
+                    products=products,
+                    fold_execution=recorded_execution,
+                )
+                if partial_manifest != expected_manifest:
                     raise LOEOPrimaryError("partial LOEO primary manifest semantics differ")
             else:
                 _validate_product(publication, filename, product_by_name[filename])
@@ -224,12 +341,30 @@ def publish_or_resume(
                 publication_io.publish_json(
                     publication,
                     filename,
-                    manifest_payload(publication, identity=identity, products=products),
+                    manifest_payload(
+                        publication,
+                        identity=identity,
+                        products=products,
+                        fold_execution=requested_execution,
+                    ),
                     boundary="matrix-manifest-prewrite",
                 )
             else:
                 _publish_frame(publication, filename, product_by_name[filename])
-        publication_io.publish_json(
+        manifest = publication_io._relative_json(
+            publication.directory_fd, "manifest.json", "LOEO primary manifest"
+        )
+        recorded_execution = _recorded_execution(
+            manifest.get("fold_execution"), selected_occurrence_ids
+        )
+        _validate_ready(
+            publication,
+            identity=identity,
+            products=products,
+            selected_occurrence_ids=selected_occurrence_ids,
+            fold_execution=recorded_execution,
+        )
+        owned_complete = publication_io.publish_json(
             publication,
             "COMPLETE",
             {
@@ -239,7 +374,21 @@ def publish_or_resume(
             },
             boundary="matrix-complete-prewrite",
         )
-        publication_io.checked_publication_boundary(publication, "matrix-complete-published")
+        try:
+            publication_io.checked_publication_boundary(publication, "matrix-complete-published")
+            validate_complete(
+                publication,
+                identity=identity,
+                products=products,
+                selected_occurrence_ids=selected_occurrence_ids,
+                fold_fit_counts=fold_fit_counts,
+            )
+        except Exception as error:
+            if not _remove_owned_complete(publication, owned_complete):
+                raise LOEOPrimaryError(
+                    "invalid LOEO primary completion could not be safely withdrawn"
+                ) from error
+            raise
         return _result(
             matrix_namespace.path,
             selected_occurrence_ids=selected_occurrence_ids,

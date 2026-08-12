@@ -150,23 +150,13 @@ def _approved_set_payload(approved: ApprovedLOEOARSet) -> tuple[object, ...]:
     )
 
 
-def prepare_loeo_fold_inputs(
+def validate_loeo_fold_sources(
     source: ValidatedCorrectionSource,
     publication: LOEOPublication,
     approved_set: ApprovedLOEOARSet,
-    *,
-    held_out_occurrence_id: str,
-) -> LOEOFoldInputs:
-    """Prepare one fully source-revalidated fold without invoking a sampler."""
+) -> tuple[LOEOPublication, ApprovedLOEOARSet]:
+    """Reload the complete physical LOEO/approval publications before fold work."""
 
-    if not isinstance(source, ValidatedCorrectionSource):
-        raise TypeError("LOEO fold preparation requires a ValidatedCorrectionSource")
-    if not isinstance(publication, LOEOPublication):
-        raise TypeError("LOEO fold preparation requires a LOEOPublication")
-    if not isinstance(approved_set, ApprovedLOEOARSet):
-        raise TypeError("LOEO fold preparation requires an ApprovedLOEOARSet")
-    if not isinstance(held_out_occurrence_id, str) or not held_out_occurrence_id.strip():
-        raise LOEOFoldError("LOEO held-out occurrence id must be nonblank")
     current = load_loeo_universe(source, publication.context, output_dir=publication.output_dir)
     if current != publication:
         raise LOEOFoldError("supplied LOEO publication differs from current validated inputs")
@@ -191,6 +181,27 @@ def prepare_loeo_fold_inputs(
         or trusted_set.source_context.universe_sha256 != publication.universe_sha256
     ):
         raise LOEOFoldError("approved LOEO AR set differs from the physical publication")
+    return current, trusted_set
+
+
+def prepare_loeo_fold_inputs(
+    source: ValidatedCorrectionSource,
+    publication: LOEOPublication,
+    approved_set: ApprovedLOEOARSet,
+    *,
+    held_out_occurrence_id: str,
+) -> LOEOFoldInputs:
+    """Prepare one fully source-revalidated fold without invoking a sampler."""
+
+    if not isinstance(source, ValidatedCorrectionSource):
+        raise TypeError("LOEO fold preparation requires a ValidatedCorrectionSource")
+    if not isinstance(publication, LOEOPublication):
+        raise TypeError("LOEO fold preparation requires a LOEOPublication")
+    if not isinstance(approved_set, ApprovedLOEOARSet):
+        raise TypeError("LOEO fold preparation requires an ApprovedLOEOARSet")
+    if not isinstance(held_out_occurrence_id, str) or not held_out_occurrence_id.strip():
+        raise LOEOFoldError("LOEO held-out occurrence id must be nonblank")
+    _, trusted_set = validate_loeo_fold_sources(source, publication, approved_set)
     try:
         approved = trusted_set.calibration_for(held_out_occurrence_id)
         training = load_loeo_fold(
@@ -457,4 +468,5 @@ __all__ = [
     "load_loeo_fold_result",
     "load_loeo_fold_material",
     "prepare_loeo_fold_inputs",
+    "validate_loeo_fold_sources",
 ]

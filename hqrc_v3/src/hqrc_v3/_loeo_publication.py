@@ -374,7 +374,7 @@ def _publish_bytes(
     *,
     boundary: str,
     directory_fd: int | None = None,
-) -> None:
+) -> tuple[int, int]:
     target_fd = publication.directory_fd if directory_fd is None else directory_fd
     temporary = f".{_safe_name(name)}.{uuid.uuid4().hex}.tmp"
     descriptor: int | None = None
@@ -425,6 +425,7 @@ def _publish_bytes(
         os.unlink(temporary, dir_fd=target_fd)
         temporary_unlinked = True
         os.fsync(target_fd)
+        return expected
     except OSError as error:
         raise LOEOFoldError("LOEO publication failed safely") from error
     finally:
@@ -453,8 +454,8 @@ def publish_json(
     value: Mapping[str, Any],
     *,
     boundary: str,
-) -> None:
-    _publish_bytes(
+) -> tuple[int, int]:
+    return _publish_bytes(
         publication,
         name,
         canonical_json(dict(value)) + b"\n",
