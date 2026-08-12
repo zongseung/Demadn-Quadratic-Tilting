@@ -377,7 +377,8 @@ def _publish_bytes(
     target_fd = publication.directory_fd if directory_fd is None else directory_fd
     temporary = f".{_safe_name(name)}.{uuid.uuid4().hex}.tmp"
     descriptor: int | None = None
-    published = False
+    identity: os.stat_result | None = None
+    temporary_unlinked = False
     try:
         descriptor = os.open(
             temporary,
@@ -388,30 +389,61 @@ def _publish_bytes(
         identity = os.fstat(descriptor)
         if not stat.S_ISREG(identity.st_mode):
             raise LOEOFoldError("LOEO publication temporary file is unsafe")
-        with os.fdopen(descriptor, "wb") as stream:
-            descriptor = None
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("LOEO publication temporary write made no progress")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
         publication_boundary(boundary)
-        os.rename(
+        os.link(
             temporary,
             name,
             src_dir_fd=target_fd,
             dst_dir_fd=target_fd,
+            follow_symlinks=False,
         )
-        published = True
+        temporary_identity = os.stat(temporary, dir_fd=target_fd, follow_symlinks=False)
+        target_descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=target_fd,
+        )
+        try:
+            target_identity = os.fstat(target_descriptor)
+        finally:
+            os.close(target_descriptor)
+        expected = (identity.st_dev, identity.st_ino)
+        if (
+            (temporary_identity.st_dev, temporary_identity.st_ino) != expected
+            or (target_identity.st_dev, target_identity.st_ino) != expected
+            or not stat.S_ISREG(target_identity.st_mode)
+        ):
+            raise LOEOFoldError("LOEO publication link identity changed")
+        os.unlink(temporary, dir_fd=target_fd)
+        temporary_unlinked = True
         os.fsync(target_fd)
     except OSError as error:
         raise LOEOFoldError("LOEO publication failed safely") from error
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        if not published:
+        if descriptor is not None and identity is not None and not temporary_unlinked:
             try:
-                os.unlink(temporary, dir_fd=target_fd)
+                descriptor_identity = os.fstat(descriptor)
+                entry_identity = os.stat(temporary, dir_fd=target_fd, follow_symlinks=False)
             except FileNotFoundError:
                 pass
+            else:
+                expected = (identity.st_dev, identity.st_ino)
+                if (
+                    stat.S_ISREG(descriptor_identity.st_mode)
+                    and (descriptor_identity.st_dev, descriptor_identity.st_ino) == expected
+                    and (entry_identity.st_dev, entry_identity.st_ino) == expected
+                ):
+                    os.unlink(temporary, dir_fd=target_fd)
+                    os.fsync(target_fd)
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def publish_json(

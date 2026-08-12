@@ -219,6 +219,67 @@ def _tree_snapshot(root: Path) -> dict[str, tuple[object, ...]]:
     return snapshot
 
 
+def _entry_snapshot(path: Path) -> tuple[object, ...]:
+    identity = path.lstat()
+    prefix = (stat.S_IFMT(identity.st_mode), identity.st_dev, identity.st_ino)
+    if stat.S_ISREG(identity.st_mode):
+        return (*prefix, path.read_bytes())
+    if stat.S_ISLNK(identity.st_mode):
+        return (*prefix, os.readlink(path))
+    return prefix
+
+
+def _plant_foreign_entry(target: Path, kind: str, outside: Path) -> tuple[object, ...]:
+    if kind == "regular":
+        target.write_bytes(b"foreign-publication-evidence")
+    elif kind == "symlink":
+        target.symlink_to(outside / "marker")
+    elif kind == "fifo":
+        os.mkfifo(target)
+    else:  # pragma: no cover - closed test parameter set
+        raise AssertionError(kind)
+    return _entry_snapshot(target)
+
+
+def _pending_publication_target(directory: Path, boundary: str) -> Path:
+    generation_suffix = {
+        "hqrc-generation-npz-prewrite": ".npz",
+        "hqrc-generation-metadata-prewrite": ".json",
+    }.get(boundary)
+    if generation_suffix is not None:
+        generation_dir = directory / ".hqrc_data.generations"
+        candidates = [
+            path
+            for path in generation_dir.iterdir()
+            if path.name.startswith(".")
+            and path.name.endswith(".tmp")
+            and f"{generation_suffix}." in path.name
+        ]
+        assert len(candidates) == 1
+        encoded_target, _nonce, suffix = candidates[0].name.rsplit(".", 2)
+        assert suffix == "tmp"
+        return generation_dir / encoded_target.removeprefix(".")
+    names = {
+        "hqrc-data-prewrite": "hqrc_data.current.json",
+        "posterior-prewrite": "posterior.nc",
+        "posterior-checkpoint-prewrite": "posterior.checkpoint.json",
+        "hourly_predictions-prewrite": "hourly_predictions.parquet",
+        "metrics-prewrite": "metrics.parquet",
+        "posterior-summary-prewrite": "posterior_summary.json",
+        "manifest-prewrite": "manifest.json",
+        "complete-prewrite": "COMPLETE",
+    }
+    return directory / names[boundary]
+
+
+def _publication_temporaries(directory: Path) -> list[Path]:
+    return [
+        path
+        for path in directory.rglob("*")
+        if path.name.startswith(".") and path.name.endswith(".tmp")
+    ]
+
+
 def _attacker_rewrite_json(path: Path, value: dict[str, object]) -> None:
     """Rewrite and rehash evidence through the attacker-controlled pathname."""
 
@@ -1095,6 +1156,89 @@ def test_every_publication_class_uses_held_directory_after_prewrite_namespace_sw
         fit_loeo_fold(source, publication, approved, **_smoke_fit_kwargs(output_root))
     assert swapped is True
     assert _tree_snapshot(outside) == outside_before
+    assert len(calls) == expected_sampler_calls
+
+
+@pytest.mark.parametrize("kind", ["regular", "symlink", "fifo"])
+def test_publication_primitive_never_replaces_foreign_target_inserted_at_prewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    directory = tmp_path / kind
+    directory.mkdir()
+    outside = tmp_path / f"outside-{kind}"
+    outside.mkdir()
+    (outside / "marker").write_bytes(b"outside-unchanged")
+    outside_before = _tree_snapshot(outside)
+    target = directory / "artifact.bin"
+    planted: list[tuple[object, ...]] = []
+
+    def insert_target(name: str) -> None:
+        assert name == "primitive-prewrite"
+        planted.append(_plant_foreign_entry(target, kind, outside))
+
+    monkeypatch.setattr(loeo_publication_module, "publication_boundary", insert_target)
+    with loeo_publication_module.fold_lock(directory) as publication_handle:
+        with pytest.raises(LOEOFoldError, match="publication failed safely"):
+            loeo_publication_module._publish_bytes(
+                publication_handle,
+                target.name,
+                b"implementation-payload",
+                boundary="primitive-prewrite",
+            )
+    assert len(planted) == 1
+    assert _entry_snapshot(target) == planted[0]
+    assert _tree_snapshot(outside) == outside_before
+    assert _publication_temporaries(directory) == []
+
+
+@pytest.mark.parametrize(
+    ("boundary", "kind", "expected_sampler_calls"),
+    [
+        ("hqrc-generation-npz-prewrite", "regular", 0),
+        ("hqrc-generation-metadata-prewrite", "symlink", 0),
+        ("hqrc-data-prewrite", "fifo", 0),
+        ("posterior-prewrite", "regular", 1),
+        ("posterior-checkpoint-prewrite", "symlink", 1),
+        ("hourly_predictions-prewrite", "fifo", 1),
+        ("metrics-prewrite", "regular", 1),
+        ("posterior-summary-prewrite", "symlink", 1),
+        ("manifest-prewrite", "fifo", 1),
+        ("complete-prewrite", "regular", 1),
+    ],
+)
+def test_every_publication_boundary_preserves_foreign_target_inserted_at_prewrite(
+    approved_fold,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    kind: str,
+    expected_sampler_calls: int,
+) -> None:
+    source, publication, approved = approved_fold
+    calls = _install_fake_sampler(monkeypatch, source, publication, approved)
+    output_root = tmp_path / boundary
+    outside = tmp_path / f"outside-{boundary}"
+    outside.mkdir()
+    (outside / "marker").write_bytes(b"outside-unchanged")
+    outside_before = _tree_snapshot(outside)
+    target: list[Path] = []
+    planted: list[tuple[object, ...]] = []
+
+    def insert_target(name: str) -> None:
+        if name != boundary or planted:
+            return
+        locks = list(output_root.rglob(".loeo-fold.lock"))
+        assert len(locks) == 1
+        target.append(_pending_publication_target(locks[0].parent, boundary))
+        planted.append(_plant_foreign_entry(target[0], kind, outside))
+
+    monkeypatch.setattr(loeo_publication_module, "publication_boundary", insert_target)
+    with pytest.raises(LOEOFoldError, match="publication failed safely"):
+        fit_loeo_fold(source, publication, approved, **_smoke_fit_kwargs(output_root))
+    assert len(target) == len(planted) == 1
+    assert _entry_snapshot(target[0]) == planted[0]
+    assert _tree_snapshot(outside) == outside_before
+    assert _publication_temporaries(target[0].parents[1]) == []
     assert len(calls) == expected_sampler_calls
 
 
