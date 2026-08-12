@@ -26,6 +26,7 @@ from hqrc_v3._loeo_products import generate_loeo_fold_products
 from hqrc_v3._loeo_types import (
     LOEOFoldError,
     LOEOFoldInputs,
+    LOEOFoldMaterial,
     LOEOFoldProducts,
     LOEOFoldResult,
 )
@@ -692,7 +693,7 @@ def guard_namespace(publication: LOEOPublicationHandle) -> None:
 
 
 @contextmanager
-def fold_lock(directory: LOEONamespace | Path):
+def fold_lock(directory: LOEONamespace | Path, *, lock_name: str = ".loeo-fold.lock"):
     namespace_value = (
         directory
         if isinstance(directory, LOEONamespace)
@@ -704,7 +705,7 @@ def fold_lock(directory: LOEONamespace | Path):
     try:
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
-            lock_fd = os.open(".loeo-fold.lock", flags, 0o600, dir_fd=directory_fd)
+            lock_fd = os.open(_safe_name(lock_name), flags, 0o600, dir_fd=directory_fd)
             identity = os.fstat(lock_fd)
         except OSError as error:
             raise LOEOFoldError("LOEO fold result lock is unsafe") from error
@@ -1071,13 +1072,13 @@ def manifest_payload(
     return {**unsigned, "manifest_digest": sha_json(unsigned)}
 
 
-def validate_complete(
+def load_complete_material(
     publication: LOEOPublicationHandle,
     *,
     identity: Mapping[str, Any],
     inputs: LOEOFoldInputs,
     sampler: Mapping[str, object],
-) -> LOEOFoldResult:
+) -> LOEOFoldMaterial:
     directory = publication.path
     if publication_entries(publication) != COMPLETE_TOP:
         raise LOEOFoldError("completed LOEO fold directory contains unknown or partial entries")
@@ -1148,7 +1149,32 @@ def validate_complete(
         or dict(published.posterior_summary) != dict(expected.posterior_summary)
     ):
         raise LOEOFoldError("published LOEO fold semantics differ")
-    return result(directory, reused=True, sampler_fit_count=0)
+    return LOEOFoldMaterial(
+        result=result(directory, reused=True, sampler_fit_count=0),
+        inputs=inputs,
+        identity=dict(identity),
+        sampler=dict(sampler),
+        products=published,
+        manifest=manifest,
+        inference_data=idata,
+    )
+
+
+def validate_complete(
+    publication: LOEOPublicationHandle,
+    *,
+    identity: Mapping[str, Any],
+    inputs: LOEOFoldInputs,
+    sampler: Mapping[str, object],
+) -> LOEOFoldResult:
+    """Validate a completed fold while retaining the historical result-only API."""
+
+    return load_complete_material(
+        publication,
+        identity=identity,
+        inputs=inputs,
+        sampler=sampler,
+    ).result
 
 
 def load_resumable_checkpoint(
@@ -1197,15 +1223,6 @@ def load_resumable_checkpoint(
 def namespace(
     output_root: Path, inputs: LOEOFoldInputs, sampler: Mapping[str, object], identity: object
 ) -> LOEONamespace:
-    root = Path(output_root)
-    if not root.is_absolute():
-        raise LOEOFoldError("LOEO fold output root must be an absolute trusted boundary")
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        raise LOEOFoldError("LOEO fold output root is unsafe") from error
-    require_real_directory(root, "LOEO fold output root")
-    root_fd = _open_directory(root, "LOEO fold output root")
     context = inputs.publication.context
     components = (
         "loeo-h3",
@@ -1216,24 +1233,39 @@ def namespace(
         str(sampler["profile"]),
         f"identity-{sha_json(identity)}",
     )
-    root_identity = _identity(root_fd, "LOEO fold trusted output root")
+    return secure_namespace(Path(output_root), components)
+
+
+def secure_namespace(output_root: Path, components: tuple[str, ...]) -> LOEONamespace:
+    """Create a canonical no-follow namespace below one absolute trusted root."""
+
+    root = Path(output_root)
+    if not root.is_absolute():
+        raise LOEOFoldError("LOEO output root must be an absolute trusted boundary")
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise LOEOFoldError("LOEO output root is unsafe") from error
+    if not components:
+        raise LOEOFoldError("LOEO output namespace components are empty")
+    require_real_directory(root, "LOEO output root")
+    root_fd = _open_directory(root, "LOEO output root")
+    root_identity = _identity(root_fd, "LOEO trusted output root")
     current_fd = root_fd
     final_identity: tuple[int, int] | None = None
     try:
         for component in components:
-            next_fd = _ensure_directory_component(
-                current_fd, component, "LOEO fold namespace component"
-            )
+            next_fd = _ensure_directory_component(current_fd, component, "LOEO namespace component")
             if current_fd != root_fd:
                 os.close(current_fd)
             current_fd = next_fd
-        final_identity = _identity(current_fd, "LOEO fold result directory")
+        final_identity = _identity(current_fd, "LOEO result directory")
     finally:
         if current_fd != root_fd:
             os.close(current_fd)
         os.close(root_fd)
     if final_identity is None:
-        raise LOEOFoldError("LOEO fold namespace could not be established")
+        raise LOEOFoldError("LOEO namespace could not be established")
     path = root.joinpath(*components)
     return LOEONamespace(root, components, path, root_identity, final_identity)
 
@@ -1243,6 +1275,7 @@ __all__ = [
     "fold_lock",
     "guard_namespace",
     "input_identity",
+    "load_complete_material",
     "load_resumable_checkpoint",
     "manifest_payload",
     "namespace",
@@ -1254,6 +1287,7 @@ __all__ = [
     "require_real_directory",
     "result",
     "sampler_contract",
+    "secure_namespace",
     "validate_complete",
     "validate_downstream_prefix",
     "write_posterior_checkpoint",

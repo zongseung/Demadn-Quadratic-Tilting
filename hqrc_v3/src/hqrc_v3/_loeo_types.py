@@ -62,4 +62,23 @@ class LOEOFoldResult:
     reused: bool
 
 
-__all__ = ["LOEOFoldError", "LOEOFoldInputs", "LOEOFoldProducts", "LOEOFoldResult"]
+@dataclass(frozen=True, slots=True)
+class LOEOFoldMaterial:
+    """Fully revalidated fold material loaded through the held publication descriptor."""
+
+    result: LOEOFoldResult
+    inputs: LOEOFoldInputs
+    identity: Mapping[str, Any]
+    sampler: Mapping[str, object]
+    products: LOEOFoldProducts
+    manifest: Mapping[str, Any]
+    inference_data: Any
+
+
+__all__ = [
+    "LOEOFoldError",
+    "LOEOFoldInputs",
+    "LOEOFoldMaterial",
+    "LOEOFoldProducts",
+    "LOEOFoldResult",
+]

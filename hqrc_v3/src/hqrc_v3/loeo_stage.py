@@ -19,6 +19,7 @@ from hqrc_v3._loeo_products import generate_loeo_fold_products
 from hqrc_v3._loeo_types import (
     LOEOFoldError,
     LOEOFoldInputs,
+    LOEOFoldMaterial,
     LOEOFoldProducts,
     LOEOFoldResult,
 )
@@ -398,14 +399,62 @@ def load_loeo_fold_result(
         return completed
 
 
+def load_loeo_fold_material(
+    source: ValidatedCorrectionSource,
+    publication: LOEOPublication,
+    approved_set: ApprovedLOEOARSet,
+    *,
+    held_out_occurrence_id: str,
+    sampler_seed: int,
+    profile: str,
+    draws: int | None = None,
+    tune: int | None = None,
+    chains: int | None = None,
+    output_root: Path,
+) -> LOEOFoldMaterial:
+    """Securely load one completed fold's products and in-memory posterior."""
+
+    inputs = prepare_loeo_fold_inputs(
+        source,
+        publication,
+        approved_set,
+        held_out_occurrence_id=held_out_occurrence_id,
+    )
+    sampler = publication_io.sampler_contract(
+        profile,
+        root_seed=sampler_seed,
+        held_out_occurrence_id=held_out_occurrence_id,
+        draws=draws,
+        tune=tune,
+        chains=chains,
+    )
+    if profile == "paper" and inputs.source.source_profile != "paper":
+        raise LOEOFoldError("paper sampler requires a paper-profile correction source")
+    identity = publication_io.input_identity(inputs, sampler)
+    namespace = publication_io.namespace(Path(output_root), inputs, sampler, identity)
+    publication_io.require_real_directory(namespace.path, "completed LOEO fold result")
+    with publication_io.fold_lock(namespace) as publication_handle:
+        publication_io.guard_namespace(publication_handle)
+        material = publication_io.load_complete_material(
+            publication_handle,
+            identity=identity,
+            inputs=inputs,
+            sampler=sampler,
+        )
+        publication_io.guard_namespace(publication_handle)
+        return material
+
+
 __all__ = [
     "LOEOFoldError",
     "LOEOFoldInputs",
+    "LOEOFoldMaterial",
     "LOEOFoldProducts",
     "LOEOFoldResult",
     "derive_loeo_seed",
     "fit_loeo_fold",
     "generate_loeo_fold_products",
     "load_loeo_fold_result",
+    "load_loeo_fold_material",
     "prepare_loeo_fold_inputs",
 ]
