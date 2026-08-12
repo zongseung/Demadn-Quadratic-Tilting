@@ -1,12 +1,87 @@
 # Task 15D Step 4 implementation report
 
-Status: FIX ROUND 2 IMPLEMENTATION AWAITING FRESH INDEPENDENT RE-REVIEW
+Status: FIX ROUND 3 IMPLEMENTATION AWAITING FRESH INDEPENDENT RE-REVIEW
 
 Implementation commit: `28e7731`
 
 Fix round 1 code/tests commit: `5650a41`
 
 Fix round 2 code/tests commit: `ef7ec54`
+
+Fix round 3 code/tests commit: `92bd553`
+
+## Fix round 3 review response
+
+The remaining Important no-replace finding is addressed without any posterior, model, prior,
+sampler, product, provenance, or recovery-contract change and without starting Task 15E.
+
+Publication no longer checks absence and then calls replacing `rename`. `_publish_bytes` creates
+its same-directory temporary with `O_NOFOLLOW|O_CREAT|O_EXCL`, verifies it is regular with
+`fstat`, keeps that descriptor open while writing/fsyncing and across the injected prewrite hook,
+then calls `os.link(temp, target, src_dir_fd=held_fd, dst_dir_fd=held_fd,
+follow_symlinks=False)`. The link is an atomic exclusive publication: an inserted regular file,
+symlink, FIFO, or any other existing directory entry produces `EEXIST` without opening, following,
+or changing the final target.
+
+After a successful link, production verifies both linked names against the still-open temp
+descriptor's `(device,inode)` and regular-file type, unlinks the temp name, and fsyncs the held
+directory. On every failure, it leaves the target untouched and removes only the implementation
+temp whose directory-entry identity still equals the owned open descriptor; mismatched or missing
+temp names are preserved/not unlinked. Because the target hard link exposes the already-fsynced
+inode before temp unlink, the final name remains valid and durable. Normal publication into an
+empty namespace and checkpoint recovery remain green, including verified-prefix inode
+preservation.
+
+## Fix round 3 TDD and no-replace evidence
+
+Production was untouched for the genuine RED. Three direct primitive cases inserted a regular
+file, symlink, or FIFO at the exact prewrite hook. Ten full-fold integration cases covered every
+publication boundary: HQRC generation NPZ and metadata, HQRC pointer, posterior NetCDF and
+checkpoint, both Parquets, posterior summary, manifest, and `COMPLETE`, rotating all three node
+types across the boundary matrix. All 13 replacing-publication cases failed because production
+did not raise:
+
+```text
+13 failed, 43 deselected in 107.81s
+```
+
+After the exclusive-link change, the same cases assert typed `LOEOFoldError`, identical inserted
+inode/type/bytes or link target, an unchanged outside tree, no implementation temp residue, and
+the expected zero/one sampler call boundary:
+
+```text
+13 passed, 43 deselected in 99.33s
+```
+
+## Fix round 3 final verification
+
+All acceptance layers were rerun on the final code:
+
+```text
+focused Task 15D: 56 passed in 516.74s
+impacted adjacent: 137 passed, 30 warnings in 119.47s
+actual XGBoost-B1 reduced PyMC: 1 passed, 4 warnings in 135.95s
+full non-slow: 601 passed, 9 deselected, 77 warnings in 713.89s
+```
+
+The focused run includes all earlier posterior/recovery/tamper/namespace/lock cases and verified
+downstream-prefix inode preservation. The actual smoke used a fresh `/private/tmp` output,
+traversed fit, exact posterior validation, immutable reuse and load, and reasserted exact
+before/after file-hash maps for the source, LOEO, approved-AR, and paper artifact trees. JUnit
+outputs are `/private/tmp/hqrc-v3-task15d-r3-focused.xml`,
+`/private/tmp/hqrc-v3-task15d-r3-adjacent.xml`,
+`/private/tmp/hqrc-v3-task15d-r3-real.xml`, and
+`/private/tmp/hqrc-v3-task15d-r3-full.xml`.
+
+Final static audit found zero `rename`/`replace` calls in the publication/orchestration modules,
+the one exclusive `os.link` publication path, and identity-checked temp-only unlinks. Full Ruff
+passed, both changed source/test files were already formatted, and `git diff --check` passed. The
+protected untracked nested `hqrc_v3/uv.lock` remains 127 bytes, inode `97849780`, mtime
+`2026-08-10T21:28:30+0900`, SHA-256
+`f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`.
+
+No Task 15E/full matrix/paper LOEO fit was started. Task 15 Step 4 remains unchecked pending a
+fresh independent re-review.
 
 ## Fix round 2 review response
 
