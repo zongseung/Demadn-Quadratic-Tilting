@@ -1,8 +1,138 @@
 # Task 15D Step 4 implementation report
 
-Status: IMPLEMENTATION AWAITING INDEPENDENT REVIEW
+Status: FIX ROUND 1 IMPLEMENTATION AWAITING FRESH INDEPENDENT RE-REVIEW
 
 Implementation commit: `28e7731`
+
+Fix round 1 code/tests commit: `5650a41`
+
+## Fix round 1 review response
+
+The four Important review findings and the scale-provenance Minor are addressed without starting
+Task 15 Step 5 or any full paper LOEO fit:
+
+1. **Trusted approved-set wrapper.** Preparation now reloads the complete approved LOEO AR set
+   from the physical source/publication, compares the supplied wrapper's complete public payload
+   and loader token with that trusted reload, and stores/uses only the trusted reloaded set and
+   calibration. Retained-token `dataclasses.replace` substitutions of approved paths/hashes,
+   training/proposal/plot hashes, proposal digests, or calibrations all fail closed.
+2. **Central H3 posterior semantics.** `_loeo_posterior.py` now owns checkpoint validation for the
+   exact nine-event H3 posterior. It requires the model variables and exact trailing shapes,
+   finite samples, sampler-declared chain/draw sizes, positive scales and Cholesky diagonals,
+   lower-triangular full-covariance factors, `u_phi`/`phi` support, exact
+   `phi = 2*u_phi - 1`, and a nine-event log-likelihood vector. Checkpoint write, recovery, and
+   complete reuse all pass through the same validator. A fully rehashed NetCDF/product/manifest
+   mutation of `phi` is rejected semantically.
+3. **Immutable ordered recovery.** Recovery recognizes only the ordered verified prefix
+   `hourly -> metrics -> posterior summary -> manifest`. Existing Parquets must match regenerated
+   schema and values and JSON must be canonical and exactly equal. The entire prefix is validated
+   before mutation; verified files are skipped rather than rewritten, preserving their inodes.
+   Foreign bytes, gaps, and manifest-only evidence fail closed and remain byte/inode-identical.
+4. **Race-resistant namespace and lock.** Namespace creation walks canonical components below an
+   absolute trusted output root with directory FDs plus `O_DIRECTORY|O_NOFOLLOW`. A namespace
+   records trusted-root and final `(device,inode)` identities. `fold_lock` re-walks the complete
+   no-follow chain, holds the final-directory FD for the full lock/publication lifetime, opens the
+   lock relative to that FD with `O_NOFOLLOW|O_NONBLOCK`, and accepts only an `fstat`-verified
+   regular file. Publication guards compare the held final FD with a fresh trusted-root-relative
+   no-follow walk before writes and before/after injectable boundaries. Dangling lock symlinks,
+   FIFOs, and a non-regular special-node substitute reject without escape or blocking.
+5. **Evaluation versus scale-source identity (Minor).** Inputs and manifest identity now record
+   `evaluation_split_id` and `scale_source_split_id` separately. For 2020--2023 they are the same
+   OOF split; for either 2024 event they are respectively `final-2024` and `oof-2023`.
+
+The operating assumption is an absolute, user-controlled local `output_root` whose ownership is
+trusted. Under that model, the held final FD, repeated no-follow re-walks, and before/after boundary
+guards close the reviewed intermediate-component swap threat. Existing multi-step HQRCData helper
+I/O is guarded before entry and immediately after its publication boundary; this report does not
+claim safety against a privileged hostile actor continuously replacing a trusted root inside an
+individual helper syscall sequence.
+
+### Fix-round RED evidence
+
+Tests were added before the production fixes. The approval-wrapper/scale group was genuinely RED:
+
+```text
+8 failed, 6 deselected in 57.22s
+```
+
+The posterior/recovery/namespace group was genuinely RED:
+
+```text
+9 failed, 13 deselected in 148.51s
+```
+
+Those failures included accepted retained-token provenance substitutions; absent 2024
+evaluation/scale-source identity; accepted fully rehashed `phi` mutation; blind overwrite of all
+four valid recovery-prefix boundaries; acceptance of foreign/gapped/manifest-only evidence; and
+following an intermediate namespace symlink. Direct lock probes additionally showed a dangling
+symlink could create its external target and a FIFO could block. AF_UNIX socket creation is denied
+by this macOS sandbox, so the non-regular-node branch is exercised with a directory while the FIFO
+test separately proves nonblocking behavior. The child process records only lock-call monotonic
+time (`<1s`), with a 10-second parent startup/import safety timeout.
+
+The later self-review discovered a second TOCTOU window after the first full verification: a
+namespace could be safely created, then an intermediate component could be replaced before
+`fold_lock` re-opened the Path. The exact post-namespace swap test was RED because the fit did not
+raise and wrote through the replacement. A second injected swap at `hqrc-data-published` reached
+the sampler and then surfaced a raw `FileNotFoundError` rather than a guarded namespace error:
+
+```text
+test_fit_rejects_intermediate_swap_after_namespace_without_touching_outside
+FAILED: DID NOT RAISE (1 failed in 27.84s)
+
+test_fit_rejects_intermediate_swap_at_boundary_before_sampler_or_outside_write
+FAILED: raw FileNotFoundError after the boundary (1 failed in 27.46s)
+```
+
+After the held-FD/re-walk guards, both exact race regressions passed. The first proves sampler zero
+and an unchanged outside snapshot; the second proves an immediate typed rejection after the hook
+and no post-swap write into the outside tree:
+
+```text
+2 passed in 33.92s
+```
+
+### Final post-guard verification
+
+All earlier suite results preceded the final TOCTOU guard and are retained below only as
+chronology. Every acceptance layer was rerun after that code change; these are the final results:
+
+```text
+# focused one-fold module, including the two TOCTOU regressions
+27 passed in 401.97s
+
+# impacted LOEO/AR/HQRC adjacent files
+136 passed, 1 deselected, 2 warnings in 183.79s
+
+# actual XGBoost-B1, two-chain 3-tune/3-draw PyMC fit and semantic reuse
+1 passed, 3 warnings in 185.12s
+
+# complete non-slow suite
+572 passed, 9 deselected, 77 warnings in 669.78s
+```
+
+The actual smoke again compared complete relative-path/file-hash maps for the source, LOEO,
+approved-AR, and original paper trees before and after the fit/reuse; all four maps were identical.
+Its only writes were pytest output under `/private/tmp`. The warnings are the expected tiny-draw
+ArviZ/all-NaN diagnostic warnings, not failures.
+
+Final post-import-cleanup and static evidence:
+
+```text
+6 passed, 21 deselected in 41.60s
+.venv/bin/ruff check --config hqrc_v3/pyproject.toml hqrc_v3/src hqrc_v3/tests
+All checks passed!
+.venv/bin/ruff format --check --config hqrc_v3/pyproject.toml <6 changed source/test files>
+6 files already formatted
+git diff --check
+(no output, exit 0)
+openssl dgst -sha256 hqrc_v3/uv.lock
+f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657
+```
+
+The protected nested lock remains an intentionally untracked 127-byte file with its original
+`2026-08-10T21:28:30+0900` mtime. The code commit staged exactly six source/test files; its
+post-commit status contained only `?? hqrc_v3/uv.lock`.
 
 ## Scope delivered
 
@@ -20,8 +150,8 @@ Implementation commit: `28e7731`
   Beta prior remains live: `u_phi` is a free sampled RV and posterior `phi=2*u_phi-1` is retained;
   phi is neither fixed nor replaced with an ACF plug-in.
 - Evaluation uses the unique source-frozen `sigma_n_mw` attached to the held-out physical frame.
-  Callers cannot supply a scale or an outcome-derived substitute. Both 2024 events use the
-  pre-existing final-2024 source scale, whose baseline scale was frozen before correction fitting.
+  Callers cannot supply a scale or an outcome-derived substitute. Both 2024 events are evaluated
+  on `final-2024` rows but use the pre-existing `oof-2023` scale frozen before correction fitting.
 - Held-out point predictions are exactly `baseline + sigma_eval * posterior_mean(q)`. Predictive
   draws are exactly `baseline + sigma_eval * (q + e)`, with one stationary AR(1) simulation whose
   state starts at the first held-out hour. No baseline bootstrap, residual resampling, or second
