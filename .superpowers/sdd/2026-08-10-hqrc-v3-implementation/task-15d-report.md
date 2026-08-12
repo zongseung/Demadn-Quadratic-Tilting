@@ -1,10 +1,143 @@
 # Task 15D Step 4 implementation report
 
-Status: FIX ROUND 1 IMPLEMENTATION AWAITING FRESH INDEPENDENT RE-REVIEW
+Status: FIX ROUND 2 IMPLEMENTATION AWAITING FRESH INDEPENDENT RE-REVIEW
 
 Implementation commit: `28e7731`
 
 Fix round 1 code/tests commit: `5650a41`
+
+Fix round 2 code/tests commit: `ef7ec54`
+
+## Fix round 2 review response
+
+The two remaining Important findings are addressed without changing the statistical contract or
+starting Task 15E:
+
+1. **Held-dirfd publication eliminates guard-to-pathname-write races.** Every publication target
+   mutation now uses the locked final directory descriptor. A regular `O_NOFOLLOW|O_EXCL` temp is
+   created relative to that descriptor, fsynced, and renamed atomically with
+   `src_dir_fd=dst_dir_fd`; JSON, pointer, manifest, and `COMPLETE` use the same primitive. ArviZ,
+   Polars, and the HQRC serializer write only beneath task-private `/private/tmp` directories;
+   their bytes are copied into held-dirfd temporaries. `.hqrc_data.generations` is opened as a
+   held no-follow child descriptor, and its NPZ/metadata plus the final-dirfd pointer share one
+   newly generated identity with recomputed hashes/digests. Recovery and reuse read via
+   `O_NOFOLLOW` regular-file descriptors and materialize only trusted fd bytes to `/private/tmp`
+   when a third-party library requires a pathname.
+2. **Exact Task 14 H3 posterior semantics.** A fresh nine-event `sample_hqrc` and an existing real
+   Task 14 artifact established the exact PyMC namespace. The LOEO posterior permits exactly 20
+   variables: nine free variables, four stable LKJ auxiliaries, and seven deterministics. Exact
+   generated dimension names/order and zero-based coordinate values are required, including the
+   event dimension and its `log_likelihood.event` mirror. Packed LKJ values are verified as the
+   lower-triangle Cholesky representation, with reconstructed covariance, standard deviations,
+   correlations, `between_scale`, and `between_cholesky`. The validator also recomputes
+   `gamma_innovation`, centered cyclic cumulative `gamma`, event-metadata/restriction-aware
+   `beta`, `phi`, and all nine event-reset Gaussian AR(1) likelihood terms using the shared
+   stationary-first density implementation.
+
+The statistical contract is unchanged: nine physical training events, causal=false retrospective
+evaluation, H3 partial pooling, full covariance, restriction effect, non-centered cyclic RW1,
+`adapt_diag`, the live fold-approved Beta prior for posterior-estimated phi, and normal event-reset
+AR(1). No threshold, prior, or sampler contract changed.
+
+## Fix round 2 TDD and attack evidence
+
+The preserved pre-fix regression run was a genuine RED:
+
+```text
+13 failed, 27 deselected in 114.32s
+```
+
+All eight initial posterior mutations were accepted (extra Student-t variable, wrong event dim,
+packed covariance, gamma innovation/profile, beta, event likelihood, and likelihood-group mirror),
+and all five requested prewrite hook names were absent. The final suite extends this to negative
+covariance as well.
+
+Five prewrite namespace swaps cover HQRC pointer publication, NetCDF, Parquet, manifest, and
+`COMPLETE`. Each hook renames the pathname namespace and substitutes an outside symlink after the
+held-fd temp is fsynced but immediately before rename. Production continues only against the held
+inode, the outside tree remains exactly unchanged, and the next namespace guard fails closed. The
+sampler count is zero for the HQRC swap and one for later publication classes:
+
+```text
+6 passed, 35 deselected in 98.41s
+```
+
+A separate attack loop fully rewrites and rehashes posterior NetCDF, checkpoint posterior hash,
+manifest posterior/checkpoint hashes and manifest digest, and the `COMPLETE` manifest hash for
+nine mutations: extra variable, wrong dimension, negative and inconsistent covariance, gamma
+innovation, gamma profile, beta, event likelihood, and likelihood mirror. Every load rejects and
+preserves the attacker tree byte/inode state. Together with direct exact-validator and shared
+AR(1) aggregate tests:
+
+```text
+11 passed, 32 deselected in 101.54s
+```
+
+## Fix round 2 exact schema and numerical audit
+
+The fresh nine-event PyMC sample had exact dimensions `(chain, draw, <variable>_dim_i)`, with
+coordinates `0..size-1`; beta/offset/event likelihood had nine-event trailing sizes. Its
+`log_likelihood` group contained only `event`, with dimensions, coordinates, and values exactly
+mirroring posterior `event_log_likelihood`. The actual reduced-PyMC artifact reconstruction errors
+were:
+
+- exact zero for phi, scaled innovation, packed Cholesky, and LKJ standard deviations;
+- maximum absolute error `2.22e-16` for gamma, `5.55e-17` for correlation, and `1.11e-16` for beta;
+- maximum absolute error `2.84e-14` for event likelihood;
+- maximum relative error `4.89e-14` across the audited relations.
+
+The final validator therefore uses `rtol=atol=1e-12`: comfortably above legitimate NetCDF/PyMC
+floating-point reconstruction error while far below all preserved attacks.
+
+## Fix round 2 publication-path audit
+
+The final production scan reports **zero publication-target pathname reads or writes**. Remaining
+Path-oriented callsites are classified as follows:
+
+- two pre-publication hashes of the trusted upstream LOEO source manifest;
+- ArviZ/Polars/HQRC serialization and materialization paths rooted only under `/private/tmp`;
+- returned `LOEOFoldResult` paths, which are API references after validation and are never used as
+  an internal read/write trust boundary.
+
+All actual publication mutations, hashes, directory enumeration, recovery reads, checkpoint
+loads, and semantic product reads use held final/child descriptors with no-follow regular-file
+checks. The final descriptor-callsite self-review found no unresolved publication pathname write.
+
+## Fix round 2 final verification
+
+Post-tolerance final evidence:
+
+```text
+focused Task 15D: 43 passed in 424.16s
+impacted adjacent: 136 passed, 1 deselected, 2 warnings in 125.60s
+actual XGBoost-B1 reduced PyMC: 1 passed, 4 warnings in 133.98s
+full non-slow: 588 passed, 9 deselected, 77 warnings in 613.42s
+```
+
+The actual smoke explicitly performs fit, exact 20-variable validation, immutable reuse, and
+`load_loeo_fold_result`; it traverses held-fd HQRC/NetCDF/Parquet/JSON paths and reasserts exact
+source/LOEO/approved-AR/paper tree hash-map equality. Its JUnit output is
+`/private/tmp/hqrc-v3-task15d-r2-real-final.xml`; the full-suite JUnit is
+`/private/tmp/hqrc-v3-task15d-r2-full-final.xml`.
+
+Final static evidence:
+
+```text
+.venv/bin/ruff check --config hqrc_v3/pyproject.toml hqrc_v3/src hqrc_v3/tests
+All checks passed!
+
+.venv/bin/ruff format --check --config hqrc_v3/pyproject.toml <6 changed files>
+6 files already formatted
+
+git diff --check
+(no output, exit 0)
+```
+
+The protected untracked nested lock remains 127 bytes, inode `97849780`, mtime
+`2026-08-10T21:28:30+0900`, SHA-256
+`f07f2944707750a9b0753690e6fca2d9c83dbf1d29340e3628483573a2766657`.
+No Task 15E/full matrix/paper LOEO fit was started. Task 15 Step 4 remains unchecked pending a
+fresh independent re-review.
 
 ## Fix round 1 review response
 
