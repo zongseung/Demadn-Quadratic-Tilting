@@ -11,7 +11,7 @@ import stat
 import tempfile
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,8 @@ import numpy as np
 import polars as pl
 
 from hqrc_v3._loeo_contract import MODEL_OPTIONS, canonical_json, derive_loeo_seed, sha_json
-from hqrc_v3._loeo_products import generate_loeo_fold_products, posterior_mapping
+from hqrc_v3._loeo_posterior import validate_h3_posterior
+from hqrc_v3._loeo_products import generate_loeo_fold_products
 from hqrc_v3._loeo_types import (
     LOEOFoldError,
     LOEOFoldInputs,
@@ -205,7 +206,8 @@ def input_identity(inputs: LOEOFoldInputs, sampler: Mapping[str, object]) -> dic
             "fold_proposal_digest": inputs.approved_set.proposal_digests[held],
         },
         "evaluation_scale": {
-            "split_id": str(inputs.held_out.frame["split_id"].item(0)),
+            "evaluation_split_id": inputs.evaluation_split_id,
+            "scale_source_split_id": inputs.scale_source_split_id,
             "sigma_n_mw": inputs.sigma_eval,
         },
         "model": {
@@ -228,9 +230,12 @@ def input_identity(inputs: LOEOFoldInputs, sampler: Mapping[str, object]) -> dic
 def _posterior_metadata_matches(
     idata: object, inputs: LOEOFoldInputs, sampler: Mapping[str, object]
 ) -> None:
-    posterior = posterior_mapping(idata)
-    if "u_phi" not in posterior or "phi" not in posterior:
-        raise LOEOFoldError("LOEO posterior does not retain sampled AR prior semantics")
+    posterior = validate_h3_posterior(idata, inputs)
+    if (
+        int(posterior.sizes["chain"]) != sampler["chains"]
+        or int(posterior.sizes["draw"]) != sampler["draws"]
+    ):
+        raise LOEOFoldError("LOEO posterior sample dimensions differ from sampler contract")
     try:
         calibration = json.loads(idata.attrs["hqrc_calibration_json"])
         model = json.loads(idata.attrs["hqrc_model_json"])
@@ -336,23 +341,183 @@ def require_real_directory(path: Path, description: str) -> None:
         raise LOEOFoldError(f"{description} is missing or unsafe")
 
 
+def _directory_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_directory(path: Path, description: str, *, dir_fd: int | None = None) -> int:
+    try:
+        descriptor = os.open(
+            path if dir_fd is None else path.name, _directory_flags(), dir_fd=dir_fd
+        )
+        identity = os.fstat(descriptor)
+    except OSError as error:
+        raise LOEOFoldError(f"{description} is missing or unsafe") from error
+    if not stat.S_ISDIR(identity.st_mode):
+        os.close(descriptor)
+        raise LOEOFoldError(f"{description} is missing or unsafe")
+    return descriptor
+
+
+def _ensure_directory_component(parent_fd: int, name: str, description: str) -> int:
+    if not name or name in {".", ".."} or "/" in name:
+        raise LOEOFoldError(f"{description} is unsafe")
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise LOEOFoldError(f"{description} is unsafe") from error
+    return _open_directory(Path(name), description, dir_fd=parent_fd)
+
+
+@dataclass(frozen=True, slots=True)
+class LOEONamespace:
+    """Canonical trusted-root-relative identity for one fold directory."""
+
+    root: Path
+    components: tuple[str, ...]
+    path: Path
+    root_identity: tuple[int, int]
+    final_identity: tuple[int, int]
+
+    def __fspath__(self) -> str:
+        return str(self.path)
+
+
+@dataclass(frozen=True, slots=True)
+class LOEOPublicationHandle:
+    """A locked final-directory descriptor plus its canonical path identity."""
+
+    namespace: LOEONamespace
+    directory_fd: int
+
+    @property
+    def path(self) -> Path:
+        return self.namespace.path
+
+
+def _identity(descriptor: int, description: str) -> tuple[int, int]:
+    try:
+        current = os.fstat(descriptor)
+    except OSError as error:
+        raise LOEOFoldError(f"{description} descriptor is unavailable") from error
+    if not stat.S_ISDIR(current.st_mode):
+        raise LOEOFoldError(f"{description} is unsafe")
+    return current.st_dev, current.st_ino
+
+
+def _open_namespace_final(namespace: LOEONamespace) -> int:
+    descriptors: list[int] = []
+    try:
+        descriptors.append(_open_directory(namespace.root, "LOEO fold trusted output root"))
+        if _identity(descriptors[0], "LOEO fold trusted output root") != namespace.root_identity:
+            raise LOEOFoldError("LOEO fold trusted output root changed")
+        for component in namespace.components:
+            descriptors.append(
+                _open_directory(
+                    Path(component),
+                    "LOEO fold namespace component",
+                    dir_fd=descriptors[-1],
+                )
+            )
+        final = descriptors[-1]
+        if _identity(final, "LOEO fold result directory") != namespace.final_identity:
+            raise LOEOFoldError("LOEO fold namespace identity changed")
+        for descriptor in descriptors[:-1]:
+            os.close(descriptor)
+        return final
+    except Exception:
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def _namespace_for_existing_directory(directory: Path) -> LOEONamespace:
+    path = Path(directory)
+    if not path.is_absolute() or path.parent == path:
+        raise LOEOFoldError("LOEO fold result directory requires an absolute trusted parent")
+    require_real_directory(path.parent, "LOEO fold trusted output root")
+    root_fd = _open_directory(path.parent, "LOEO fold trusted output root")
+    final_fd: int | None = None
+    try:
+        final_fd = _open_directory(Path(path.name), "LOEO fold result directory", dir_fd=root_fd)
+        return LOEONamespace(
+            root=path.parent,
+            components=(path.name,),
+            path=path,
+            root_identity=_identity(root_fd, "LOEO fold trusted output root"),
+            final_identity=_identity(final_fd, "LOEO fold result directory"),
+        )
+    finally:
+        if final_fd is not None:
+            os.close(final_fd)
+        os.close(root_fd)
+
+
+def guard_namespace(publication: LOEOPublicationHandle) -> None:
+    """Re-walk the canonical no-follow chain and match the held final inode."""
+
+    if not isinstance(publication, LOEOPublicationHandle):
+        raise TypeError("publication must be an LOEOPublicationHandle")
+    held_identity = _identity(publication.directory_fd, "LOEO fold result directory")
+    if held_identity != publication.namespace.final_identity:
+        raise LOEOFoldError("LOEO fold held namespace identity changed")
+    current_fd = _open_namespace_final(publication.namespace)
+    try:
+        if _identity(current_fd, "LOEO fold result directory") != held_identity:
+            raise LOEOFoldError("LOEO fold namespace identity changed")
+    finally:
+        os.close(current_fd)
+
+
 @contextmanager
-def fold_lock(directory: Path):
-    directory.mkdir(parents=True, exist_ok=True)
-    require_real_directory(directory, "LOEO fold result directory")
-    lock_path = directory / ".loeo-fold.lock"
-    if lock_path.exists() and lock_path.is_symlink():
-        raise LOEOFoldError("LOEO fold result lock is unsafe")
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+def fold_lock(directory: LOEONamespace | Path):
+    namespace_value = (
+        directory
+        if isinstance(directory, LOEONamespace)
+        else _namespace_for_existing_directory(Path(directory))
+    )
+    directory_fd = _open_namespace_final(namespace_value)
+    lock_fd: int | None = None
+    locked = False
+    try:
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
-            yield
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock_fd = os.open(".loeo-fold.lock", flags, 0o600, dir_fd=directory_fd)
+            identity = os.fstat(lock_fd)
+        except OSError as error:
+            raise LOEOFoldError("LOEO fold result lock is unsafe") from error
+        if not stat.S_ISREG(identity.st_mode):
+            raise LOEOFoldError("LOEO fold result lock is unsafe")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        locked = True
+        publication = LOEOPublicationHandle(namespace_value, directory_fd)
+        guard_namespace(publication)
+        yield publication
+    finally:
+        if lock_fd is not None:
+            try:
+                if locked:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+        os.close(directory_fd)
 
 
 def publication_boundary(_: str) -> None:
     """Failure-injection hook proving checkpoint and downstream recovery boundaries."""
+
+
+def checked_publication_boundary(publication: LOEOPublicationHandle, name: str) -> None:
+    """Run an injectable boundary and detect a namespace swap immediately."""
+
+    guard_namespace(publication)
+    publication_boundary(name)
+    guard_namespace(publication)
 
 
 def _diagnostic_payload(diagnostics: SamplingDiagnostics) -> dict[str, Any]:
@@ -369,15 +534,17 @@ def _diagnostic_payload(diagnostics: SamplingDiagnostics) -> dict[str, Any]:
 
 
 def write_posterior_checkpoint(
-    directory: Path,
+    publication: LOEOPublicationHandle,
     idata: object,
     *,
     inputs: LOEOFoldInputs,
     sampler: Mapping[str, object],
     identity_sha256: str,
 ) -> None:
+    directory = publication.path
     _posterior_metadata_matches(idata, inputs, sampler)
     diagnostics = validate_inference_data(idata, paper_profile=sampler["profile"] == "paper")
+    guard_namespace(publication)
     descriptor, name = tempfile.mkstemp(prefix=".posterior.", suffix=".nc", dir=directory)
     os.close(descriptor)
     temporary = Path(name)
@@ -385,11 +552,14 @@ def write_posterior_checkpoint(
     try:
         az.to_netcdf(idata, temporary)
         _fsync_file(temporary)
+        guard_namespace(publication)
         os.replace(temporary, posterior_path)
         _fsync_directory(directory)
+        guard_namespace(publication)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
+    guard_namespace(publication)
     atomic_json(
         directory / "posterior.checkpoint.json",
         {
@@ -401,6 +571,7 @@ def write_posterior_checkpoint(
             "diagnostics": _diagnostic_payload(diagnostics),
         },
     )
+    guard_namespace(publication)
 
 
 def _load_posterior_checkpoint(
@@ -488,13 +659,79 @@ def _artifact_records(directory: Path) -> dict[str, dict[str, str]]:
     return records
 
 
-def write_products(directory: Path, products: LOEOFoldProducts) -> None:
+def _expected_product_for_filename(
+    filename: str, products: LOEOFoldProducts, manifest: Mapping[str, Any] | None
+) -> object:
+    if filename == PRODUCT_FILES["hourly_predictions"]:
+        return products.hourly_predictions
+    if filename == PRODUCT_FILES["metrics"]:
+        return products.metrics
+    if filename == PRODUCT_FILES["posterior_summary"]:
+        return dict(products.posterior_summary)
+    if filename == "manifest.json" and manifest is not None:
+        return dict(manifest)
+    raise LOEOFoldError("LOEO downstream publication order differs")
+
+
+def _existing_downstream_matches(path: Path, expected: object, *, filename: str) -> bool:
+    _require_real_file(path, "partial LOEO downstream artifact")
+    if filename.endswith(".parquet"):
+        try:
+            actual = pl.read_parquet(path)
+        except (OSError, pl.exceptions.PolarsError) as error:
+            raise LOEOFoldError("partial LOEO downstream product is unreadable") from error
+        return isinstance(expected, pl.DataFrame) and _frames_equal(actual, expected)
+    return _read_json(path, "partial LOEO downstream JSON") == expected
+
+
+def validate_downstream_prefix(
+    directory: Path,
+    *,
+    entries: Mapping[str, Path],
+    products: LOEOFoldProducts,
+    identity: Mapping[str, Any],
+) -> frozenset[str]:
+    """Validate an immutable ordered downstream prefix before any recovery write."""
+
+    order = (
+        PRODUCT_FILES["hourly_predictions"],
+        PRODUCT_FILES["metrics"],
+        PRODUCT_FILES["posterior_summary"],
+        "manifest.json",
+    )
+    present = {name for name in order if name in entries}
+    prefix_length = len(present)
+    expected_present = set(order[:prefix_length])
+    if present != expected_present:
+        raise LOEOFoldError("partial LOEO downstream artifacts are not a valid prefix")
+    expected_manifest = (
+        manifest_payload(directory, identity=identity, products=products)
+        if prefix_length == len(order)
+        else None
+    )
+    for filename in order[:prefix_length]:
+        expected = _expected_product_for_filename(filename, products, expected_manifest)
+        if not _existing_downstream_matches(entries[filename], expected, filename=filename):
+            raise LOEOFoldError("partial LOEO downstream artifact semantics differ")
+    return frozenset(expected_present)
+
+
+def write_products(
+    publication: LOEOPublicationHandle,
+    products: LOEOFoldProducts,
+    *,
+    preserve: frozenset[str] = frozenset(),
+) -> None:
+    directory = publication.path
     temporary_paths: list[Path] = []
     try:
         for name, frame in (
             ("hourly_predictions", products.hourly_predictions),
             ("metrics", products.metrics),
         ):
+            if PRODUCT_FILES[name] in preserve:
+                continue
+            guard_namespace(publication)
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=f".{name}.", suffix=".parquet", dir=directory
             )
@@ -503,11 +740,14 @@ def write_products(directory: Path, products: LOEOFoldProducts) -> None:
             temporary_paths.append(temporary)
             frame.write_parquet(temporary)
             _fsync_file(temporary)
+            guard_namespace(publication)
             os.replace(temporary, directory / PRODUCT_FILES[name])
             temporary_paths.remove(temporary)
-            publication_boundary(f"{name}-published")
-        atomic_json(directory / PRODUCT_FILES["posterior_summary"], products.posterior_summary)
-        publication_boundary("posterior-summary-published")
+            checked_publication_boundary(publication, f"{name}-published")
+        if PRODUCT_FILES["posterior_summary"] not in preserve:
+            guard_namespace(publication)
+            atomic_json(directory / PRODUCT_FILES["posterior_summary"], products.posterior_summary)
+            checked_publication_boundary(publication, "posterior-summary-published")
     finally:
         for path in temporary_paths:
             path.unlink(missing_ok=True)
@@ -673,36 +913,70 @@ def load_resumable_checkpoint(
         sampler=sampler,
         identity_sha256=identity_sha256,
     )
-    for filename in DOWNSTREAM_TOP:
-        path = entries.get(filename)
-        if path is not None:
-            path.unlink()
-    _fsync_directory(directory)
-    return idata
+    products = generate_loeo_fold_products(
+        inputs,
+        idata,
+        predictive_seed=int(identity["predictive_seed"]),
+        predictive_draws=int(sampler["draws"]) * int(sampler["chains"]),
+    )
+    preserved = validate_downstream_prefix(
+        directory,
+        entries=entries,
+        products=products,
+        identity=identity,
+    )
+    return idata, products, preserved
 
 
 def namespace(
     output_root: Path, inputs: LOEOFoldInputs, sampler: Mapping[str, object], identity: object
-) -> Path:
+) -> LOEONamespace:
     root = Path(output_root)
-    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_absolute():
+        raise LOEOFoldError("LOEO fold output root must be an absolute trusted boundary")
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise LOEOFoldError("LOEO fold output root is unsafe") from error
     require_real_directory(root, "LOEO fold output root")
+    root_fd = _open_directory(root, "LOEO fold output root")
     context = inputs.publication.context
-    return (
-        root
-        / "loeo-h3"
-        / context.model
-        / context.feature_set
-        / f"seed-{context.seed}"
-        / inputs.held_out_occurrence_id
-        / str(sampler["profile"])
-        / f"identity-{sha_json(identity)}"
+    components = (
+        "loeo-h3",
+        context.model,
+        context.feature_set,
+        f"seed-{context.seed}",
+        inputs.held_out_occurrence_id,
+        str(sampler["profile"]),
+        f"identity-{sha_json(identity)}",
     )
+    root_identity = _identity(root_fd, "LOEO fold trusted output root")
+    current_fd = root_fd
+    final_identity: tuple[int, int] | None = None
+    try:
+        for component in components:
+            next_fd = _ensure_directory_component(
+                current_fd, component, "LOEO fold namespace component"
+            )
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        final_identity = _identity(current_fd, "LOEO fold result directory")
+    finally:
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
+    if final_identity is None:
+        raise LOEOFoldError("LOEO fold namespace could not be established")
+    path = root.joinpath(*components)
+    return LOEONamespace(root, components, path, root_identity, final_identity)
 
 
 __all__ = [
     "atomic_json",
+    "checked_publication_boundary",
     "fold_lock",
+    "guard_namespace",
     "input_identity",
     "load_resumable_checkpoint",
     "manifest_payload",
@@ -712,6 +986,7 @@ __all__ = [
     "result",
     "sampler_contract",
     "validate_complete",
+    "validate_downstream_prefix",
     "write_posterior_checkpoint",
     "write_products",
 ]

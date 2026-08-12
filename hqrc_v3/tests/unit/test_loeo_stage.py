@@ -1,6 +1,11 @@
 """Task 15D one-fold immutable H3 LOEO contracts."""
 
 import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -45,6 +50,7 @@ source = ar_source_fixture
 def _posterior_dataset(*, chains: int = 2, draws: int = 4) -> xr.Dataset:
     sample = (chains, draws)
     phi = np.linspace(0.2, 0.5, chains * draws).reshape(sample)
+    cholesky = np.broadcast_to(np.eye(3), (*sample, 2, 3, 3)).copy()
     return xr.Dataset(
         {
             "mu": (("chain", "draw", "holiday", "coefficient"), np.zeros((*sample, 2, 3))),
@@ -54,7 +60,36 @@ def _posterior_dataset(*, chains: int = 2, draws: int = 4) -> xr.Dataset:
             ),
             "between_cholesky": (
                 ("chain", "draw", "holiday", "coefficient", "coefficient_aux"),
-                np.broadcast_to(np.eye(3), (*sample, 2, 3, 3)).copy(),
+                cholesky,
+            ),
+            "between_scale": (
+                ("chain", "draw", "holiday", "coefficient"),
+                np.ones((*sample, 2, 3)),
+            ),
+            "between_cov_0": (
+                ("chain", "draw", "packed_cholesky"),
+                np.broadcast_to(np.asarray([1.0, 0.0, 1.0, 0.0, 0.0, 1.0]), (*sample, 6)),
+            ),
+            "between_cov_1": (
+                ("chain", "draw", "packed_cholesky"),
+                np.broadcast_to(np.asarray([1.0, 0.0, 1.0, 0.0, 0.0, 1.0]), (*sample, 6)),
+            ),
+            "beta_offset": (
+                ("chain", "draw", "event", "coefficient"),
+                np.zeros((*sample, 9, 3)),
+            ),
+            "beta": (
+                ("chain", "draw", "event", "coefficient"),
+                np.zeros((*sample, 9, 3)),
+            ),
+            "sigma_gamma": (("chain", "draw", "holiday"), np.ones((*sample, 2))),
+            "gamma_innovation_raw": (
+                ("chain", "draw", "holiday", "innovation"),
+                np.zeros((*sample, 2, 23)),
+            ),
+            "gamma_innovation": (
+                ("chain", "draw", "holiday", "innovation"),
+                np.zeros((*sample, 2, 23)),
             ),
             "gamma": (("chain", "draw", "holiday", "hour"), np.zeros((*sample, 2, 24))),
             "u_phi": (("chain", "draw"), (phi + 1.0) / 2.0),
@@ -118,6 +153,81 @@ def _fake_idata(inputs, *, chains: int = 2, draws: int = 4, sampler=None) -> az.
     return idata
 
 
+def _tree_snapshot(root: Path) -> dict[str, tuple[object, ...]]:
+    snapshot: dict[str, tuple[object, ...]] = {}
+    if not root.exists() and not root.is_symlink():
+        return snapshot
+    for path in (root, *sorted(root.rglob("*"))):
+        relative = path.relative_to(root).as_posix() if path != root else "."
+        identity = path.lstat()
+        if stat.S_ISDIR(identity.st_mode):
+            snapshot[relative] = ("directory", identity.st_ino)
+        elif stat.S_ISREG(identity.st_mode):
+            snapshot[relative] = ("regular", identity.st_ino, path.read_bytes())
+        elif stat.S_ISLNK(identity.st_mode):
+            snapshot[relative] = ("symlink", os.readlink(path))
+        else:
+            snapshot[relative] = ("special", stat.S_IFMT(identity.st_mode), identity.st_ino)
+    return snapshot
+
+
+def _single_checkpoint(root: Path) -> Path:
+    checkpoints = list(root.rglob("posterior.checkpoint.json"))
+    assert len(checkpoints) == 1
+    return checkpoints[0].parent
+
+
+def _install_fake_sampler(monkeypatch: pytest.MonkeyPatch, source, publication, approved):
+    calls: list[dict[str, object]] = []
+
+    def fake_sample(data, calibration, **kwargs):
+        held_out = (set(publication.occurrence_ids) - set(data.occurrence_ids)).pop()
+        current_inputs = prepare_loeo_fold_inputs(
+            source,
+            publication,
+            approved,
+            held_out_occurrence_id=held_out,
+        )
+        assert data.occurrence_ids == current_inputs.hqrc_data.occurrence_ids
+        assert calibration.artifact_digest == current_inputs.approved.artifact_digest
+        calls.append(kwargs)
+        return _fake_idata(
+            current_inputs,
+            chains=kwargs["chains"],
+            draws=kwargs["draws"],
+            sampler={
+                "draws": kwargs["draws"],
+                "tune": kwargs["tune"],
+                "chains": kwargs["chains"],
+                "seed": kwargs["seed"],
+                "target_accept": 0.9,
+                "paper_profile": False,
+                "init": "adapt_diag",
+                "geometry": "noncentered-cyclic-hour-rw1-v1",
+            },
+        )
+
+    monkeypatch.setattr(loeo_stage_module, "sample_hqrc", fake_sample)
+    monkeypatch.setattr(
+        loeo_publication_module,
+        "validate_inference_data",
+        lambda *_args, **_kwargs: SamplingDiagnostics(1.0, 800.0, 700.0, 0),
+    )
+    return calls
+
+
+def _smoke_fit_kwargs(output_root: Path, *, seed: int = 71) -> dict[str, object]:
+    return {
+        "held_out_occurrence_id": "seollal-2024",
+        "sampler_seed": seed,
+        "profile": "smoke",
+        "draws": 4,
+        "tune": 3,
+        "chains": 2,
+        "output_root": output_root,
+    }
+
+
 @pytest.fixture
 def approved_fold(source: ValidatedCorrectionSource, tmp_path: Path):
     publication = publish_loeo_universe(source, CONTEXT, output_dir=tmp_path / "loeo")
@@ -164,9 +274,9 @@ def test_safe_event_loader_and_preparation_bind_one_physical_fold(
     original = approved.calibration_for
 
     def calibration_for(self, occurrence_id: str):
-        assert self is approved
         calls.append(occurrence_id)
-        return original(occurrence_id)
+        assert self is not approved
+        return original.__func__(self, occurrence_id)
 
     monkeypatch.setattr(type(approved), "calibration_for", calibration_for)
     inputs = prepare_loeo_fold_inputs(
@@ -186,6 +296,7 @@ def test_safe_event_loader_and_preparation_bind_one_physical_fold(
     assert inputs.held_out.frame.equals(event.frame, null_equal=True)
     assert inputs.sigma_eval == pytest.approx(23.0)
     assert inputs.causal is False
+    assert inputs.approved_set is not approved
     assert inputs.approved.calibration.event_ids == tuple(sorted(inputs.hqrc_data.occurrence_ids))
     for index in range(9):
         positions = np.flatnonzero(inputs.hqrc_data.occurrence_index == index)
@@ -194,11 +305,22 @@ def test_safe_event_loader_and_preparation_bind_one_physical_fold(
 
 
 @pytest.mark.parametrize(
-    ("held_out", "expected_scale"),
-    [("seollal-2020", 20.0), ("seollal-2024", 23.0), ("chuseok-2024", 23.0)],
+    ("held_out", "expected_scale", "evaluation_split", "scale_source_split"),
+    [
+        ("seollal-2020", 20.0, "oof-2020", "oof-2020"),
+        ("seollal-2021", 21.0, "oof-2021", "oof-2021"),
+        ("seollal-2022", 22.0, "oof-2022", "oof-2022"),
+        ("seollal-2023", 23.0, "oof-2023", "oof-2023"),
+        ("seollal-2024", 23.0, "final-2024", "oof-2023"),
+        ("chuseok-2024", 23.0, "final-2024", "oof-2023"),
+    ],
 )
 def test_evaluation_scale_is_the_unique_source_frozen_fold_scale(
-    approved_fold, held_out: str, expected_scale: float
+    approved_fold,
+    held_out: str,
+    expected_scale: float,
+    evaluation_split: str,
+    scale_source_split: str,
 ) -> None:
     source, publication, approved = approved_fold
     inputs = prepare_loeo_fold_inputs(
@@ -209,6 +331,14 @@ def test_evaluation_scale_is_the_unique_source_frozen_fold_scale(
     )
     assert inputs.sigma_eval == pytest.approx(expected_scale)
     assert inputs.held_out.frame["sigma_n_mw"].unique().to_list() == [expected_scale]
+    assert inputs.evaluation_split_id == evaluation_split
+    assert inputs.scale_source_split_id == scale_source_split
+    identity = loeo_publication_module.input_identity(inputs, {"root_seed": 17})
+    assert identity["evaluation_scale"] == {
+        "evaluation_split_id": evaluation_split,
+        "scale_source_split_id": scale_source_split,
+        "sigma_n_mw": expected_scale,
+    }
 
 
 def test_preparation_rejects_raw_untrusted_and_incomplete_approval_wrappers(
@@ -222,8 +352,40 @@ def test_preparation_rejects_raw_untrusted_and_incomplete_approval_wrappers(
             object(),
             held_out_occurrence_id="seollal-2024",
         )
+
+
+def test_preparation_rejects_retained_token_approval_wrapper_provenance_substitution(
+    approved_fold, tmp_path: Path
+) -> None:
+    source, publication, approved = approved_fold
+    held_out = "seollal-2024"
+    other = "seollal-2020"
+    replacement_calibrations = dict(approved.calibrations)
+    replacement_calibrations[other] = approved.calibrations["chuseok-2020"]
+    substitutions = {
+        "approved_paths": {
+            **approved.approved_paths,
+            held_out: tmp_path / "forged-approved.json",
+        },
+        "approved_sha256": {**approved.approved_sha256, held_out: "0" * 64},
+        "training_sha256": {**approved.training_sha256, other: "1" * 64},
+        "proposal_sha256": {**approved.proposal_sha256, other: "2" * 64},
+        "proposal_digests": {**approved.proposal_digests, other: "3" * 64},
+        "plot_sha256": {**approved.plot_sha256, other: "4" * 64},
+        "calibrations": replacement_calibrations,
+    }
+    for field, value in substitutions.items():
+        forged = replace(approved, **{field: value})
+        assert forged._token is approved._token
+        with pytest.raises(LOEOFoldError, match="approved LOEO AR set|revalidation"):
+            prepare_loeo_fold_inputs(
+                source,
+                publication,
+                forged,
+                held_out_occurrence_id=held_out,
+            )
     untrusted = replace(approved, _token=object())
-    with pytest.raises(LOEOFoldError, match="revalidation"):
+    with pytest.raises(LOEOFoldError, match="approved LOEO AR set|revalidation"):
         prepare_loeo_fold_inputs(
             source,
             publication,
@@ -442,6 +604,58 @@ def test_checkpoint_recovery_complete_reuse_namespaces_and_fail_closed_products(
     recovered.metrics_path.unlink()
     recovered.metrics_path.write_bytes(metrics_bytes)
 
+    tamper_kwargs = {**fit_kwargs, "sampler_seed": 73}
+    tampered = fit_loeo_fold(source, publication, approved, **tamper_kwargs)
+    tamper_inputs = prepare_loeo_fold_inputs(
+        source,
+        publication,
+        approved,
+        held_out_occurrence_id="seollal-2024",
+    )
+    tampered_idata = az.from_netcdf(tampered.posterior_path)
+    tampered_idata.posterior["phi"] = tampered_idata.posterior["phi"] + 0.05
+    replacement_posterior = tmp_path / "rehashed-mutated-posterior.nc"
+    az.to_netcdf(tampered_idata, replacement_posterior)
+    tampered_idata.close()
+    os.replace(replacement_posterior, tampered.posterior_path)
+    checkpoint = json.loads((tampered.output_dir / "posterior.checkpoint.json").read_bytes())
+    checkpoint["posterior_sha256"] = file_sha256(tampered.posterior_path)
+    loeo_publication_module.atomic_json(
+        tampered.output_dir / "posterior.checkpoint.json", checkpoint
+    )
+    mutated_idata = az.from_netcdf(tampered.posterior_path)
+    try:
+        original_manifest = json.loads(tampered.manifest_path.read_bytes())
+        mutated_products = generate_loeo_fold_products(
+            tamper_inputs,
+            mutated_idata,
+            predictive_seed=original_manifest["identity"]["predictive_seed"],
+            predictive_draws=8,
+        )
+    finally:
+        mutated_idata.close()
+    mutated_products.hourly_predictions.write_parquet(tampered.hourly_predictions_path)
+    mutated_products.metrics.write_parquet(tampered.metrics_path)
+    loeo_publication_module.atomic_json(
+        tampered.posterior_summary_path, mutated_products.posterior_summary
+    )
+    rehashed_manifest = loeo_publication_module.manifest_payload(
+        tampered.output_dir,
+        identity=original_manifest["identity"],
+        products=mutated_products,
+    )
+    loeo_publication_module.atomic_json(tampered.manifest_path, rehashed_manifest)
+    loeo_publication_module.atomic_json(
+        tampered.output_dir / "COMPLETE",
+        {
+            "manifest_sha256": file_sha256(tampered.manifest_path),
+            "state": "COMPLETE",
+            "causal": False,
+        },
+    )
+    with pytest.raises(LOEOFoldError, match="posterior|phi|semantics"):
+        load_loeo_fold_result(source, publication, approved, **tamper_kwargs)
+
     mutated = loeo_products_module.pl.read_parquet(recovered.hourly_predictions_path).with_columns(
         (loeo_products_module.pl.col("corrected_point_mw") + 1.0).alias("corrected_point_mw")
     )
@@ -468,6 +682,266 @@ def test_checkpoint_recovery_complete_reuse_namespaces_and_fail_closed_products(
     )
     with pytest.raises(LOEOFoldError, match="semantics"):
         load_loeo_fold_result(source, publication, approved, **fit_kwargs)
+
+
+@pytest.mark.parametrize(
+    ("boundary", "expected_existing"),
+    [
+        ("hourly_predictions-published", ("hourly_predictions.parquet",)),
+        (
+            "metrics-published",
+            ("hourly_predictions.parquet", "metrics.parquet"),
+        ),
+        (
+            "posterior-summary-published",
+            ("hourly_predictions.parquet", "metrics.parquet", "posterior_summary.json"),
+        ),
+        (
+            "manifest-published",
+            (
+                "hourly_predictions.parquet",
+                "metrics.parquet",
+                "posterior_summary.json",
+                "manifest.json",
+            ),
+        ),
+    ],
+)
+def test_recovery_preserves_verified_downstream_prefix_without_overwrite(
+    approved_fold,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    expected_existing: tuple[str, ...],
+) -> None:
+    source, publication, approved = approved_fold
+    calls = _install_fake_sampler(monkeypatch, source, publication, approved)
+    interrupted = True
+
+    def interrupt(name: str) -> None:
+        nonlocal interrupted
+        if name == boundary and interrupted:
+            interrupted = False
+            raise OSError("leave verified prefix")
+
+    monkeypatch.setattr(loeo_publication_module, "publication_boundary", interrupt)
+    kwargs = _smoke_fit_kwargs(tmp_path / boundary)
+    with pytest.raises(OSError, match="verified prefix"):
+        fit_loeo_fold(source, publication, approved, **kwargs)
+    directory = _single_checkpoint(tmp_path / boundary)
+    before = {
+        name: (directory / name).lstat().st_ino
+        for name in expected_existing
+        if (directory / name).exists()
+    }
+    assert tuple(before) == expected_existing
+    monkeypatch.setattr(loeo_publication_module, "publication_boundary", lambda _name: None)
+    recovered = fit_loeo_fold(source, publication, approved, **kwargs)
+    assert recovered.sampler_fit_count == 0 and len(calls) == 1
+    assert {name: (directory / name).lstat().st_ino for name in expected_existing} == before
+
+
+@pytest.mark.parametrize(
+    ("kind", "filename"),
+    [
+        ("foreign", "hourly_predictions.parquet"),
+        ("gap", "metrics.parquet"),
+        ("manifest_only", "manifest.json"),
+    ],
+)
+def test_recovery_rejects_and_preserves_unverified_downstream_evidence(
+    approved_fold,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    filename: str,
+) -> None:
+    source, publication, approved = approved_fold
+    calls = _install_fake_sampler(monkeypatch, source, publication, approved)
+    interrupted = True
+
+    def interrupt(name: str) -> None:
+        nonlocal interrupted
+        if name == "posterior-checkpointed" and interrupted:
+            interrupted = False
+            raise OSError("leave checkpoint")
+
+    monkeypatch.setattr(loeo_publication_module, "publication_boundary", interrupt)
+    kwargs = _smoke_fit_kwargs(tmp_path / kind)
+    with pytest.raises(OSError, match="leave checkpoint"):
+        fit_loeo_fold(source, publication, approved, **kwargs)
+    directory = _single_checkpoint(tmp_path / kind)
+    (directory / filename).write_bytes(f"foreign-{kind}".encode())
+    before = _tree_snapshot(directory)
+    monkeypatch.setattr(loeo_publication_module, "publication_boundary", lambda _name: None)
+    with pytest.raises(LOEOFoldError, match="partial|prefix|downstream|product|manifest"):
+        fit_loeo_fold(source, publication, approved, **kwargs)
+    assert _tree_snapshot(directory) == before
+    assert len(calls) == 1
+
+
+def _namespace_material(approved_fold, root: Path):
+    source, publication, approved = approved_fold
+    inputs = prepare_loeo_fold_inputs(
+        source,
+        publication,
+        approved,
+        held_out_occurrence_id="seollal-2024",
+    )
+    sampler = loeo_publication_module.sampler_contract(
+        "smoke",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        draws=4,
+        tune=3,
+        chains=2,
+    )
+    identity = loeo_publication_module.input_identity(inputs, sampler)
+    return publication, inputs, sampler, identity
+
+
+def test_namespace_rejects_intermediate_symlink_without_touching_external_target(
+    approved_fold, tmp_path: Path
+) -> None:
+    publication, inputs, sampler, identity = _namespace_material(approved_fold, tmp_path / "unused")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "marker"
+    marker.write_bytes(b"untouched")
+    root = tmp_path / "symlink-root"
+    root.mkdir()
+    (root / "loeo-h3").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(LOEOFoldError, match="unsafe|symlink|namespace"):
+        loeo_publication_module.namespace(root, inputs, sampler, identity)
+    assert marker.read_bytes() == b"untouched"
+    assert not (outside / publication.context.model).exists()
+
+
+def test_fit_rejects_intermediate_swap_after_namespace_without_touching_outside(
+    approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    calls = _install_fake_sampler(monkeypatch, source, publication, approved)
+    output_root = tmp_path / "results"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_before: list[dict[str, tuple[object, ...]]] = []
+    original_namespace = loeo_publication_module.namespace
+
+    def swap_after_namespace(*args, **kwargs):
+        namespace = original_namespace(*args, **kwargs)
+        directory = getattr(namespace, "path", namespace)
+        original_component = output_root / "loeo-h3"
+        moved_component = outside / "loeo-h3"
+        original_component.rename(moved_component)
+        original_component.symlink_to(moved_component, target_is_directory=True)
+        assert Path(directory).is_relative_to(original_component)
+        outside_before.append(_tree_snapshot(outside))
+        return namespace
+
+    monkeypatch.setattr(loeo_publication_module, "namespace", swap_after_namespace)
+    with pytest.raises(LOEOFoldError, match="namespace|changed|unsafe"):
+        fit_loeo_fold(source, publication, approved, **_smoke_fit_kwargs(output_root))
+    assert len(outside_before) == 1
+    assert _tree_snapshot(outside) == outside_before[0]
+    assert calls == []
+
+
+def test_fit_rejects_intermediate_swap_at_boundary_before_sampler_or_outside_write(
+    approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    calls = _install_fake_sampler(monkeypatch, source, publication, approved)
+    output_root = tmp_path / "results"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "marker"
+    marker.write_bytes(b"untouched")
+    outside_before = _tree_snapshot(outside)
+    swapped = False
+
+    def swap_at_boundary(name: str) -> None:
+        nonlocal swapped
+        if name != "hqrc-data-published" or swapped:
+            return
+        swapped = True
+        component = output_root / "loeo-h3"
+        component.rename(output_root / "quarantined-loeo-h3")
+        component.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(loeo_publication_module, "publication_boundary", swap_at_boundary)
+    with pytest.raises(LOEOFoldError, match="namespace|changed|unsafe"):
+        fit_loeo_fold(source, publication, approved, **_smoke_fit_kwargs(output_root))
+    assert swapped is True
+    assert _tree_snapshot(outside) == outside_before
+    assert len(calls) == 0
+
+
+@pytest.mark.parametrize("kind", ["dangling", "fifo", "special"])
+def test_fold_lock_rejects_dangling_fifo_and_special_without_escape_or_block(
+    approved_fold, tmp_path: Path, kind: str
+) -> None:
+    del approved_fold
+    directory = Path(tempfile.mkdtemp(prefix="hqrc-lock-", dir="/private/tmp"))
+    try:
+        lock_path = directory / ".loeo-fold.lock"
+        if kind == "dangling":
+            external_lock = tmp_path / "external-lock"
+            lock_path.symlink_to(external_lock)
+            with pytest.raises(LOEOFoldError, match="lock|unsafe"):
+                with loeo_publication_module.fold_lock(directory):
+                    pass
+            assert not external_lock.exists()
+            assert lock_path.is_symlink()
+            return
+        if kind == "fifo":
+            os.mkfifo(lock_path)
+            before = lock_path.lstat()
+            command = (
+                "from pathlib import Path\n"
+                "from time import monotonic\n"
+                "from hqrc_v3._loeo_publication import fold_lock\n"
+                "from hqrc_v3._loeo_types import LOEOFoldError\n"
+                f"p = Path({str(directory)!r})\n"
+                "started = monotonic()\n"
+                "try:\n"
+                "    with fold_lock(p):\n"
+                "        pass\n"
+                "except LOEOFoldError:\n"
+                "    print(f'LOEO_FOLD_ERROR {monotonic() - started:.9f}')\n"
+                "    raise SystemExit(23)\n"
+                "raise SystemExit(0)\n"
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", command],
+                cwd=Path(__file__).parents[2],
+                env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[2] / "src")},
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            assert completed.returncode == 23
+            marker, elapsed_text = completed.stdout.strip().split()
+            assert marker == "LOEO_FOLD_ERROR"
+            assert float(elapsed_text) < 1.0
+            after = lock_path.lstat()
+            assert stat.S_ISFIFO(after.st_mode) and after.st_ino == before.st_ino
+            return
+        lock_path.mkdir()
+        before = lock_path.lstat()
+        with pytest.raises(LOEOFoldError, match="lock|unsafe"):
+            with loeo_publication_module.fold_lock(directory):
+                pass
+        after = lock_path.lstat()
+        assert stat.S_ISDIR(after.st_mode) and after.st_ino == before.st_ino
+    finally:
+        for child in directory.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                child.rmdir()
+            else:
+                child.unlink()
+        directory.rmdir()
 
 
 def test_strict_diagnostic_failure_publishes_no_complete_result(

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
 import polars as pl
 
 from hqrc_v3._loeo_contract import derive_loeo_seed
+from hqrc_v3._loeo_posterior import posterior_mapping
 from hqrc_v3._loeo_types import LOEOFoldError, LOEOFoldInputs, LOEOFoldProducts
 from hqrc_v3.bayes.predictive import (
     corrected_predictive_draws,
@@ -20,16 +20,6 @@ from hqrc_v3.bayes.predictive import (
 from hqrc_v3.evaluation.metrics import point_metric_frame, probabilistic_metric_frame
 
 _HOLIDAY_INDEX = {"seollal": 0, "chuseok": 1}
-
-
-def posterior_mapping(idata: object) -> Mapping[str, object]:
-    posterior = getattr(idata, "posterior", None)
-    if posterior is None or not hasattr(posterior, "data_vars"):
-        raise LOEOFoldError("LOEO posterior InferenceData is missing")
-    required = {"mu", "between_cholesky", "gamma", "u_phi", "phi", "sigma_r"}
-    if not required.issubset(posterior):
-        raise LOEOFoldError("LOEO H3 posterior variables are incomplete")
-    return posterior
 
 
 def generate_loeo_fold_products(

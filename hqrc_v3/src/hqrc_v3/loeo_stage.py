@@ -35,7 +35,7 @@ from hqrc_v3.diagnostics.loeo import (
     load_loeo_fold,
     load_loeo_universe,
 )
-from hqrc_v3.diagnostics.loeo_ar import ApprovedLOEOARSet
+from hqrc_v3.diagnostics.loeo_ar import ApprovedLOEOARSet, load_approved_loeo_ar_set
 from hqrc_v3.provenance import file_sha256
 
 _HOLIDAY_INDEX = {"seollal": 0, "chuseok": 1}
@@ -91,7 +91,7 @@ def _build_hqrc_data(fold: LOEOFold, approved: ApprovedARCalibration) -> HQRCDat
         raise LOEOFoldError("LOEO physical training fold cannot form HQRCData") from error
 
 
-def _evaluation_scale(held_out: LOEOHeldOut) -> tuple[float, int]:
+def _evaluation_scale(held_out: LOEOHeldOut) -> tuple[float, str, str, int]:
     frame = held_out.frame
     required = {
         "occurrence_id",
@@ -127,7 +127,27 @@ def _evaluation_scale(held_out: LOEOHeldOut) -> tuple[float, int]:
     restrictions = frame["restriction"].unique()
     if restrictions.len() != 1 or restrictions.item() not in (0, 1):
         raise LOEOFoldError("LOEO held-out restriction metadata differs")
-    return float(scale), int(restrictions.item())
+    scale_source_split = expected_split if year < 2024 else "oof-2023"
+    return float(scale), expected_split, scale_source_split, int(restrictions.item())
+
+
+def _approved_set_payload(approved: ApprovedLOEOARSet) -> tuple[object, ...]:
+    return (
+        approved.output_dir,
+        approved.approved_set_path,
+        approved.proposal_set_sha256,
+        approved.approved_set_sha256,
+        approved.context,
+        approved.source_context,
+        approved.occurrence_ids,
+        dict(approved.training_sha256),
+        dict(approved.proposal_sha256),
+        dict(approved.proposal_digests),
+        dict(approved.plot_sha256),
+        dict(approved.approved_paths),
+        dict(approved.approved_sha256),
+        dict(approved.calibrations),
+    )
 
 
 def prepare_loeo_fold_inputs(
@@ -150,18 +170,29 @@ def prepare_loeo_fold_inputs(
     current = load_loeo_universe(source, publication.context, output_dir=publication.output_dir)
     if current != publication:
         raise LOEOFoldError("supplied LOEO publication differs from current validated inputs")
+    try:
+        trusted_set = load_approved_loeo_ar_set(
+            source,
+            publication,
+            output_dir=approved_set.output_dir,
+        )
+    except (TypeError, ValueError) as error:
+        raise LOEOFoldError("approved LOEO AR set failed complete revalidation") from error
+    if getattr(approved_set, "_token", None) is not getattr(
+        trusted_set, "_token", None
+    ) or _approved_set_payload(approved_set) != _approved_set_payload(trusted_set):
+        raise LOEOFoldError("approved LOEO AR set wrapper differs from its trusted publication")
     if (
         publication.causal is not False
         or len(publication.occurrence_ids) != 10
-        or approved_set.occurrence_ids != publication.occurrence_ids
-        or approved_set.context != publication.context
-        or approved_set.source_context.loeo_manifest_sha256
-        != file_sha256(publication.manifest_path)
-        or approved_set.source_context.universe_sha256 != publication.universe_sha256
+        or trusted_set.occurrence_ids != publication.occurrence_ids
+        or trusted_set.context != publication.context
+        or trusted_set.source_context.loeo_manifest_sha256 != file_sha256(publication.manifest_path)
+        or trusted_set.source_context.universe_sha256 != publication.universe_sha256
     ):
         raise LOEOFoldError("approved LOEO AR set differs from the physical publication")
     try:
-        approved = approved_set.calibration_for(held_out_occurrence_id)
+        approved = trusted_set.calibration_for(held_out_occurrence_id)
         training = load_loeo_fold(
             source,
             publication.context,
@@ -177,22 +208,24 @@ def prepare_loeo_fold_inputs(
     except (TypeError, ValueError) as error:
         raise LOEOFoldError("LOEO fold inputs failed complete source revalidation") from error
     if (
-        approved_set.training_sha256.get(held_out_occurrence_id) != training.residual_sha256
+        trusted_set.training_sha256.get(held_out_occurrence_id) != training.residual_sha256
         or approved.residual_sha256 != training.residual_sha256
     ):
         raise LOEOFoldError("LOEO fold approval is not bound to the physical training artifact")
     hqrc_data = _build_hqrc_data(training, approved)
-    scale, restriction = _evaluation_scale(held_out)
+    scale, evaluation_split, scale_source_split, restriction = _evaluation_scale(held_out)
     return LOEOFoldInputs(
         source=source,
         publication=publication,
-        approved_set=approved_set,
+        approved_set=trusted_set,
         approved=approved,
         held_out_occurrence_id=held_out_occurrence_id,
         training_fold=training,
         held_out=held_out,
         hqrc_data=hqrc_data,
         sigma_eval=scale,
+        evaluation_split_id=evaluation_split,
+        scale_source_split_id=scale_source_split,
         restriction=restriction,
         causal=False,
     )
@@ -231,19 +264,24 @@ def fit_loeo_fold(
         raise LOEOFoldError("paper sampler requires a paper-profile correction source")
     identity = publication_io.input_identity(inputs, sampler)
     identity_sha256 = _sha_json(identity)
-    directory = publication_io.namespace(Path(output_root), inputs, sampler, identity)
-    with publication_io.fold_lock(directory):
+    namespace = publication_io.namespace(Path(output_root), inputs, sampler, identity)
+    directory = namespace.path
+    with publication_io.fold_lock(namespace) as publication_handle:
+        publication_io.guard_namespace(publication_handle)
         complete = directory / "COMPLETE"
         manifest = directory / "manifest.json"
         if complete.exists() or complete.is_symlink():
             if not manifest.exists() or manifest.is_symlink():
                 raise LOEOFoldError("partial LOEO fold publication")
-            return publication_io.validate_complete(
+            completed = publication_io.validate_complete(
                 directory, identity=identity, inputs=inputs, sampler=sampler
             )
+            publication_io.guard_namespace(publication_handle)
+            return completed
         existing = {path.name for path in directory.iterdir() if path.name != ".loeo-fold.lock"}
         if existing:
-            idata = publication_io.load_resumable_checkpoint(
+            publication_io.guard_namespace(publication_handle)
+            idata, products, preserved = publication_io.load_resumable_checkpoint(
                 directory,
                 identity=identity,
                 inputs=inputs,
@@ -251,6 +289,7 @@ def fit_loeo_fold(
             )
             fit_count = 0
         else:
+            publication_io.guard_namespace(publication_handle)
             write_hqrc_data(
                 directory / "hqrc_data.npz",
                 inputs.hqrc_data,
@@ -260,7 +299,7 @@ def fit_loeo_fold(
                     "causal": False,
                 },
             )
-            publication_io.publication_boundary("hqrc-data-published")
+            publication_io.checked_publication_boundary(publication_handle, "hqrc-data-published")
             idata = sample_hqrc(
                 inputs.hqrc_data,
                 inputs.approved,
@@ -276,24 +315,31 @@ def fit_loeo_fold(
             )
             idata.attrs["hqrc_causal"] = "false"
             publication_io.write_posterior_checkpoint(
-                directory,
+                publication_handle,
                 idata,
                 inputs=inputs,
                 sampler=sampler,
                 identity_sha256=identity_sha256,
             )
             fit_count = 1
-        publication_io.publication_boundary("posterior-checkpointed")
-        products = generate_loeo_fold_products(
-            inputs,
-            idata,
-            predictive_seed=int(identity["predictive_seed"]),
-            predictive_draws=int(sampler["draws"]) * int(sampler["chains"]),
-        )
-        publication_io.write_products(directory, products)
+            products = None
+            preserved = frozenset()
+        publication_io.checked_publication_boundary(publication_handle, "posterior-checkpointed")
+        if products is None:
+            products = generate_loeo_fold_products(
+                inputs,
+                idata,
+                predictive_seed=int(identity["predictive_seed"]),
+                predictive_draws=int(sampler["draws"]) * int(sampler["chains"]),
+            )
+        publication_io.write_products(publication_handle, products, preserve=preserved)
+        publication_io.guard_namespace(publication_handle)
         payload = publication_io.manifest_payload(directory, identity=identity, products=products)
-        publication_io.atomic_json(directory / "manifest.json", payload)
-        publication_io.publication_boundary("manifest-published")
+        if "manifest.json" not in preserved:
+            publication_io.guard_namespace(publication_handle)
+            publication_io.atomic_json(directory / "manifest.json", payload)
+            publication_io.checked_publication_boundary(publication_handle, "manifest-published")
+        publication_io.guard_namespace(publication_handle)
         publication_io.atomic_json(
             directory / "COMPLETE",
             {
@@ -302,7 +348,7 @@ def fit_loeo_fold(
                 "causal": False,
             },
         )
-        publication_io.publication_boundary("complete-published")
+        publication_io.checked_publication_boundary(publication_handle, "complete-published")
     return publication_io.result(directory, reused=False, sampler_fit_count=fit_count)
 
 
@@ -336,12 +382,16 @@ def load_loeo_fold_result(
         chains=chains,
     )
     identity = publication_io.input_identity(inputs, sampler)
-    directory = publication_io.namespace(Path(output_root), inputs, sampler, identity)
+    namespace = publication_io.namespace(Path(output_root), inputs, sampler, identity)
+    directory = namespace.path
     publication_io.require_real_directory(directory, "completed LOEO fold result")
-    with publication_io.fold_lock(directory):
-        return publication_io.validate_complete(
+    with publication_io.fold_lock(namespace) as publication_handle:
+        publication_io.guard_namespace(publication_handle)
+        completed = publication_io.validate_complete(
             directory, identity=identity, inputs=inputs, sampler=sampler
         )
+        publication_io.guard_namespace(publication_handle)
+        return completed
 
 
 __all__ = [

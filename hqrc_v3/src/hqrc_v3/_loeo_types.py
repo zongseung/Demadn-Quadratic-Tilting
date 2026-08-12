@@ -33,6 +33,8 @@ class LOEOFoldInputs:
     held_out: LOEOHeldOut
     hqrc_data: HQRCData
     sigma_eval: float
+    evaluation_split_id: str
+    scale_source_split_id: str
     restriction: int
     causal: bool = False
 
