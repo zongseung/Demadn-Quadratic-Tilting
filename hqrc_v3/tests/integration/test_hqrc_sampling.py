@@ -183,6 +183,54 @@ def test_sampler_records_requested_cores_and_rejects_invalid_values(tmp_path, mo
             sample_hqrc(data, approved, draws=2, tune=2, chains=2, cores=invalid)
 
 
+def test_sample_hqrc_records_explicit_jitter_initialization(tmp_path, monkeypatch):
+    data = HQRCData(
+        observations=np.array([0.1, 0.2]),
+        occurrence_index=np.array([0, 0]), holiday_type_index=np.array([0, 0]),
+        tau_days=np.array([0.0, 1.0 / 24.0]), hour=np.array([0, 1]), restriction=np.array([0, 0]),
+        occurrence_ids=("a",),
+    )
+    approved = SimpleNamespace(
+        artifact_path=tmp_path / "approved.json",
+        artifact_digest="digest",
+        residual_sha256="residual",
+        config_sha256="config",
+        event_sha256="event",
+        context=EventResidualContext("model", "B0", 5, ("oof-2020",)),
+        a=0.1,
+        b=0.2,
+    )
+    monkeypatch.setattr("hqrc_v3.bayes.samplers.require_approved_calibration", lambda value: value)
+    monkeypatch.setattr(
+        "hqrc_v3.bayes.samplers.build_hqrc_model",
+        lambda *_args: __import__("contextlib").nullcontext(),
+    )
+    captured = {}
+    monkeypatch.setattr(pm, "sample", lambda **kwargs: captured.update(kwargs) or az.from_dict(
+        posterior={"event_log_likelihood": np.zeros((4, 2, 1))},
+        sample_stats={"diverging": np.zeros((4, 2), dtype=np.int8)},
+    ))
+    monkeypatch.setattr(
+        "hqrc_v3.bayes.samplers.validate_inference_data",
+        lambda *_args, **_kwargs: SamplingDiagnostics(1.0, 800.0, 700.0, 0),
+    )
+    monkeypatch.setattr("hqrc_v3.bayes.samplers.importlib.metadata.version", lambda _: "test")
+    idata = sample_hqrc(
+        data,
+        approved,
+        draws=1000,
+        tune=1000,
+        chains=4,
+        cores=2,
+        init="jitter+adapt_diag",
+        target_accept=0.99,
+        paper_profile=True,
+    )
+    assert captured["init"] == "jitter+adapt_diag"
+    assert captured["target_accept"] == 0.99
+    assert json.loads(idata.attrs["hqrc_sampler_json"])["init"] == "jitter+adapt_diag"
+
+
 def test_paper_diagnostics_fail_closed_without_divergence_statistics():
     idata = az.from_dict(posterior={"phi": np.zeros((4, 8))})
     with pytest.raises(SamplingError, match="diverging"):

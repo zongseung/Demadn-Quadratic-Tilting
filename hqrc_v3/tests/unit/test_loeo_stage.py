@@ -1109,6 +1109,60 @@ def test_sampler_cores_are_resolved_and_bound_to_loeo_identity(approved_fold, tm
         )
 
 
+def test_paper_v2_jitter_sampler_contract_is_identity_bound(approved_fold) -> None:
+    source, publication, approved = approved_fold
+    inputs = prepare_loeo_fold_inputs(
+        source, publication, approved, held_out_occurrence_id="seollal-2024"
+    )
+    baseline = loeo_publication_module.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        draws=5000,
+        tune=5000,
+        chains=4,
+        cores=4,
+    )
+    v2 = loeo_publication_module.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        draws=5000,
+        tune=5000,
+        chains=4,
+        cores=4,
+        init="jitter+adapt_diag",
+        target_accept=0.99,
+    )
+    assert v2["init"] == "jitter+adapt_diag"
+    assert v2["target_accept"] == 0.99
+    assert loeo_publication_module.input_identity(inputs, v2) != (
+        loeo_publication_module.input_identity(inputs, baseline)
+    )
+    with pytest.raises(LOEOFoldError, match="init"):
+        loeo_publication_module.sampler_contract(
+            "paper",
+            root_seed=71,
+            held_out_occurrence_id="seollal-2024",
+            draws=5000,
+            tune=5000,
+            chains=4,
+            cores=4,
+            init="advi",
+        )
+    with pytest.raises(LOEOFoldError, match="target_accept"):
+        loeo_publication_module.sampler_contract(
+            "paper",
+            root_seed=71,
+            held_out_occurrence_id="seollal-2024",
+            draws=5000,
+            tune=5000,
+            chains=4,
+            cores=4,
+            target_accept=0.95,
+        )
+
+
 def test_namespace_rejects_intermediate_symlink_without_touching_external_target(
     approved_fold, tmp_path: Path
 ) -> None:

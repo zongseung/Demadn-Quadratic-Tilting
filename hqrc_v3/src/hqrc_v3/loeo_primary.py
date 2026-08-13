@@ -35,6 +35,8 @@ def _selected_folds(
     tune: int | None,
     chains: int | None,
     cores: int | None,
+    init: str | None,
+    target_accept: float | None,
     output_root: Path,
 ) -> tuple[str, ...]:
     if not isinstance(source, ValidatedCorrectionSource):
@@ -80,6 +82,8 @@ def _selected_folds(
             tune=tune,
             chains=chains,
             cores=cores,
+            init=init,
+            target_accept=target_accept,
         )
     except (TypeError, ValueError, LOEOFoldError) as error:
         raise LOEOPrimaryError("LOEO primary sampler contract is invalid") from error
@@ -117,17 +121,25 @@ def _matrix_identity(
     profile: str,
 ) -> dict[str, object]:
     first = dict(materials[0].identity)
+    first_sampler = dict(materials[0].sampler)
     common_keys = ("source", "context", "model")
     for material in materials:
         identity = dict(material.identity)
         held = material.inputs.held_out_occurrence_id
         sampler = dict(material.sampler)
+        sampler_without_fold_seed = {
+            key: value for key, value in sampler.items() if key != "seed"
+        }
+        first_without_fold_seed = {
+            key: value for key, value in first_sampler.items() if key != "seed"
+        }
         if (
             any(identity.get(key) != first.get(key) for key in common_keys)
             or identity.get("causal") is not False
             or sampler.get("root_seed") != root_seed
             or sampler.get("profile") != profile
             or sampler.get("seed") != derive_loeo_seed(root_seed, f"H3-fold-sampler:{held}")
+            or sampler_without_fold_seed != first_without_fold_seed
             or identity.get("predictive_seed")
             != derive_loeo_seed(root_seed, f"H3-fold-predictive:{held}")
         ):
@@ -194,6 +206,8 @@ def fit_loeo_primary(
     tune: int | None = None,
     chains: int | None = None,
     cores: int | None = None,
+    init: str | None = None,
+    target_accept: float | None = None,
     output_root: Path,
 ) -> LOEOPrimaryResult:
     """Fit/reuse selected reviewed folds and publish one immutable H3 aggregate."""
@@ -209,6 +223,8 @@ def fit_loeo_primary(
         tune=tune,
         chains=chains,
         cores=cores,
+        init=init,
+        target_accept=target_accept,
         output_root=output_root,
     )
     fold_fit_counts: dict[str, int] = {}
@@ -226,6 +242,8 @@ def fit_loeo_primary(
                 tune=tune,
                 chains=chains,
                 cores=cores,
+                init=init,
+                target_accept=target_accept,
                 output_root=output_root,
             )
             fold_fit_counts[held_out] = fitted.sampler_fit_count
@@ -241,6 +259,8 @@ def fit_loeo_primary(
                     tune=tune,
                     chains=chains,
                     cores=cores,
+                    init=init,
+                    target_accept=target_accept,
                     output_root=output_root,
                 )
             )

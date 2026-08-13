@@ -88,6 +88,8 @@ def sampler_contract(
     tune: int | None,
     chains: int | None,
     cores: int | None = None,
+    init: str | None = None,
+    target_accept: float | None = None,
 ) -> dict[str, object]:
     derived_seed = derive_loeo_seed(root_seed, f"H3-fold-sampler:{held_out_occurrence_id}")
     if profile == "paper":
@@ -117,6 +119,17 @@ def sampler_contract(
         raise LOEOFoldError("cores must be a positive integer")
     if resolved_cores > resolved[2]:
         raise LOEOFoldError("cores must not exceed chains")
+    resolved_init = PYMC_INITIALIZATION if init is None else init
+    if resolved_init not in {"adapt_diag", "jitter+adapt_diag"}:
+        raise LOEOFoldError("LOEO sampler init is not approved")
+    resolved_target_accept = 0.99 if profile == "paper" else 0.9
+    if target_accept is not None and (
+        isinstance(target_accept, bool)
+        or not isinstance(target_accept, (int, float))
+        or not math.isfinite(float(target_accept))
+        or float(target_accept) != resolved_target_accept
+    ):
+        raise LOEOFoldError("LOEO target_accept differs from the approved profile setting")
     return {
         "backend": "pymc",
         "root_seed": root_seed,
@@ -125,9 +138,9 @@ def sampler_contract(
         "tune": resolved[1],
         "chains": resolved[2],
         "cores": resolved_cores,
-        "target_accept": 0.99 if profile == "paper" else 0.9,
+        "target_accept": resolved_target_accept,
         "profile": profile,
-        "init": PYMC_INITIALIZATION,
+        "init": resolved_init,
         "geometry": SAMPLER_GEOMETRY,
     }
 

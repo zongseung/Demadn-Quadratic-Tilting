@@ -254,6 +254,8 @@ def fit_loeo_fold(
     tune: int | None = None,
     chains: int | None = None,
     cores: int | None = None,
+    init: str | None = None,
+    target_accept: float | None = None,
     output_root: Path,
 ) -> LOEOFoldResult:
     """Fit or strictly reuse exactly one immutable H3 partial-pooling LOEO fold."""
@@ -272,6 +274,8 @@ def fit_loeo_fold(
         tune=tune,
         chains=chains,
         cores=cores,
+        init=init,
+        target_accept=target_accept,
     )
     if profile == "paper" and inputs.source.source_profile != "paper":
         raise LOEOFoldError("paper sampler requires a paper-profile correction source")
@@ -309,6 +313,8 @@ def fit_loeo_fold(
                     chains=int(sampler["chains"]),
                     cores=int(sampler["cores"]),
                     seed=int(sampler["seed"]),
+                    init=str(sampler["init"]),
+                    target_accept=float(sampler["target_accept"]),
                     backend="pymc",
                     paper_profile=profile == "paper",
                 )
@@ -353,6 +359,8 @@ def fit_loeo_fold(
                 chains=int(sampler["chains"]),
                 cores=int(sampler["cores"]),
                 seed=int(sampler["seed"]),
+                init=str(sampler["init"]),
+                target_accept=float(sampler["target_accept"]),
                 backend="pymc",
                 paper_profile=profile == "paper",
             )
@@ -415,6 +423,8 @@ def load_loeo_fold_result(
     tune: int | None = None,
     chains: int | None = None,
     cores: int | None = None,
+    init: str | None = None,
+    target_accept: float | None = None,
     output_root: Path,
 ) -> LOEOFoldResult:
     """Load and semantically revalidate one completed result without fitting."""
@@ -433,6 +443,8 @@ def load_loeo_fold_result(
         tune=tune,
         chains=chains,
         cores=cores,
+        init=init,
+        target_accept=target_accept,
     )
     identity = publication_io.input_identity(inputs, sampler)
     namespace = publication_io.namespace(Path(output_root), inputs, sampler, identity)
@@ -459,6 +471,8 @@ def load_loeo_fold_material(
     tune: int | None = None,
     chains: int | None = None,
     cores: int | None = None,
+    init: str | None = None,
+    target_accept: float | None = None,
     output_root: Path,
 ) -> LOEOFoldMaterial:
     """Securely load one completed fold's products and in-memory posterior."""
@@ -477,6 +491,8 @@ def load_loeo_fold_material(
         tune=tune,
         chains=chains,
         cores=cores,
+        init=init,
+        target_accept=target_accept,
     )
     if profile == "paper" and inputs.source.source_profile != "paper":
         raise LOEOFoldError("paper sampler requires a paper-profile correction source")

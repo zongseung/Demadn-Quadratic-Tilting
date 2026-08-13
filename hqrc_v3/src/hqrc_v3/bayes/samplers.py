@@ -29,6 +29,7 @@ class SamplingError(RuntimeError):
 
 
 PYMC_INITIALIZATION = "adapt_diag"
+PYMC_INITIALIZATION_CHOICES = frozenset({"adapt_diag", "jitter+adapt_diag"})
 SAMPLER_GEOMETRY = "noncentered-cyclic-hour-rw1-v1"
 
 
@@ -93,6 +94,8 @@ def sample_hqrc(
     chains: int = 4,
     cores: int = 1,
     seed: int = 11,
+    init: str = PYMC_INITIALIZATION,
+    target_accept: float | None = None,
     backend: Literal["pymc", "nutpie"] = "pymc",
     paper_profile: bool = False,
 ):
@@ -107,12 +110,22 @@ def sample_hqrc(
         raise ValueError("cores must not exceed chains")
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise TypeError("seed must be an integer")
+    if init not in PYMC_INITIALIZATION_CHOICES:
+        raise ValueError("init must be an approved PyMC initialization")
     if paper_profile and (chains != 4 or draws < 1_000 or tune < 1_000):
         raise ValueError("paper_profile requires exactly 4 chains and at least 1000 tune/draws")
     trusted_calibration = require_approved_calibration(calibration)
     model = build_hqrc_model(data, trusted_calibration, variant, pooling, options)
     started = time.perf_counter()
-    target_accept = 0.99 if paper_profile else 0.9
+    resolved_target_accept = 0.99 if paper_profile else 0.9
+    if target_accept is not None:
+        if (
+            isinstance(target_accept, bool)
+            or not isinstance(target_accept, (int, float))
+            or not math.isfinite(float(target_accept))
+            or float(target_accept) != resolved_target_accept
+        ):
+            raise ValueError("target_accept differs from the approved profile setting")
     if backend == "pymc":
         import pymc as pm
 
@@ -125,16 +138,18 @@ def sample_hqrc(
                 random_seed=seed,
                 progressbar=False,
                 compute_convergence_checks=False,
-                target_accept=target_accept,
-                init=PYMC_INITIALIZATION,
+                target_accept=resolved_target_accept,
+                init=init,
             )
     elif backend == "nutpie":
+        if init != PYMC_INITIALIZATION:
+            raise ValueError("nutpie does not support a PyMC initialization override")
         try:
             import nutpie
         except ImportError as error:
             raise SamplingError("nutpie backend requested but nutpie is not installed") from error
         idata = nutpie.sample_pymc(
-            model, draws=draws, tune=tune, chains=chains, seed=seed, target_accept=target_accept
+            model, draws=draws, tune=tune, chains=chains, seed=seed, target_accept=resolved_target_accept
         )
     else:
         raise ValueError("backend must be 'pymc' or 'nutpie'")
@@ -162,9 +177,9 @@ def sample_hqrc(
                     "chains": chains,
                     "cores": cores,
                     "seed": seed,
-                    "target_accept": target_accept,
+                    "target_accept": resolved_target_accept,
                     "paper_profile": paper_profile,
-                    "init": PYMC_INITIALIZATION if backend == "pymc" else "nutpie-default",
+                    "init": init if backend == "pymc" else "nutpie-default",
                     "geometry": SAMPLER_GEOMETRY,
                 },
                 sort_keys=True,
