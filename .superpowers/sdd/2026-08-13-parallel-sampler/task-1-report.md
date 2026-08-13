@@ -20,4 +20,4 @@
 
 No sampler or paper run was started. `hqrc_v3/uv.lock` was already untracked and was deliberately left untouched; no artifacts were edited.
 
-Commit: pending
+Commit: `0660e0973a0e544b007d99dd86da9f3721b845dd` (`Add explicit HQRC sampler core contract`)
