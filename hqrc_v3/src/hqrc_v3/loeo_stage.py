@@ -292,13 +292,45 @@ def fit_loeo_fold(
         existing = publication_io.publication_entries(publication_handle) - {".loeo-fold.lock"}
         if existing:
             publication_io.guard_namespace(publication_handle)
-            idata, products, preserved = publication_io.load_resumable_checkpoint(
-                publication_handle,
-                identity=identity,
-                inputs=inputs,
-                sampler=sampler,
-            )
-            fit_count = 0
+            if existing == publication_io.INPUT_CHECKPOINT_TOP:
+                publication_io.validate_input_checkpoint(
+                    publication_handle,
+                    identity=identity,
+                    inputs=inputs,
+                )
+                idata = sample_hqrc(
+                    inputs.hqrc_data,
+                    inputs.approved,
+                    variant="H3",
+                    pooling="partial",
+                    options=MODEL_OPTIONS,
+                    draws=int(sampler["draws"]),
+                    tune=int(sampler["tune"]),
+                    chains=int(sampler["chains"]),
+                    cores=int(sampler["cores"]),
+                    seed=int(sampler["seed"]),
+                    backend="pymc",
+                    paper_profile=profile == "paper",
+                )
+                idata.attrs["hqrc_causal"] = "false"
+                publication_io.write_posterior_checkpoint(
+                    publication_handle,
+                    idata,
+                    inputs=inputs,
+                    sampler=sampler,
+                    identity_sha256=identity_sha256,
+                )
+                fit_count = 1
+                products = None
+                preserved = frozenset()
+            else:
+                idata, products, preserved = publication_io.load_resumable_checkpoint(
+                    publication_handle,
+                    identity=identity,
+                    inputs=inputs,
+                    sampler=sampler,
+                )
+                fit_count = 0
         else:
             publication_io.write_hqrc_checkpoint(
                 publication_handle,

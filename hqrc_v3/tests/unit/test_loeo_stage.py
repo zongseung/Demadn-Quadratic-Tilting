@@ -865,6 +865,40 @@ def test_checkpoint_recovery_complete_reuse_namespaces_and_fail_closed_products(
         load_loeo_fold_result(source, publication, approved, **fit_kwargs)
 
 
+def test_recovery_resamples_from_verified_input_only_checkpoint(
+    approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash after input publication must resume sampling, not reject the cache."""
+
+    source, publication, approved = approved_fold
+    calls = _install_fake_sampler(monkeypatch, source, publication, approved)
+    kwargs = _smoke_fit_kwargs(tmp_path / "input-only")
+    interrupted = True
+
+    def interrupt(name: str) -> None:
+        nonlocal interrupted
+        if name == "hqrc-data-published" and interrupted:
+            interrupted = False
+            raise OSError("leave input checkpoint")
+
+    monkeypatch.setattr(loeo_publication_module, "publication_boundary", interrupt)
+    with pytest.raises(OSError, match="leave input checkpoint"):
+        fit_loeo_fold(source, publication, approved, **kwargs)
+    assert calls == []
+    directory = next((tmp_path / "input-only").rglob("hqrc_data.current.json")).parent
+    assert {
+        entry.name for entry in directory.iterdir()
+    } == {".loeo-fold.lock", ".hqrc_data.generations", "hqrc_data.current.json"}
+    cache_before = _tree_snapshot(directory)
+
+    monkeypatch.setattr(loeo_publication_module, "publication_boundary", lambda _name: None)
+    recovered = fit_loeo_fold(source, publication, approved, **kwargs)
+    assert recovered.sampler_fit_count == 1 and recovered.reused is False
+    assert len(calls) == 1
+    for name in (".hqrc_data.generations", "hqrc_data.current.json"):
+        assert _tree_snapshot(directory)[name] == cache_before[name]
+
+
 def test_fully_rehashed_checkpoint_rejects_every_exact_posterior_semantic_mutation(
     approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

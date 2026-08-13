@@ -52,6 +52,10 @@ CHECKPOINT_TOP = {
     "posterior.nc",
     "posterior.checkpoint.json",
 }
+INPUT_CHECKPOINT_TOP = {
+    "hqrc_data.current.json",
+    ".hqrc_data.generations",
+}
 DOWNSTREAM_TOP = {*PRODUCT_FILES.values(), "manifest.json"}
 COMPLETE_TOP = {
     ".loeo-fold.lock",
@@ -1233,6 +1237,36 @@ def load_resumable_checkpoint(
     return idata, products, preserved
 
 
+def validate_input_checkpoint(
+    publication: LOEOPublicationHandle,
+    *,
+    identity: Mapping[str, Any],
+    inputs: LOEOFoldInputs,
+) -> None:
+    """Validate a cache written after HQRC data publication but before sampling.
+
+    This is the sole resumable state that contains no posterior.  It is safe to
+    continue only when the directory contains exactly the immutable HQRC-data
+    checkpoint and that checkpoint matches the freshly prepared fold inputs.
+    Any posterior, downstream product, foreign file, or mismatched data remains
+    fail-closed.
+    """
+
+    entries = publication_entries(publication) - {".loeo-fold.lock"}
+    if entries != INPUT_CHECKPOINT_TOP:
+        raise LOEOFoldError("unsafe input-only LOEO fold publication")
+    try:
+        data, settings = _load_hqrc_checkpoint(publication)
+    except (OSError, ValueError) as error:
+        raise LOEOFoldError("input-only LOEO HQRCData differs") from error
+    if not same_hqrc_data(data, inputs.hqrc_data) or settings != {
+        "identity_sha256": sha_json(identity),
+        "model": identity["model"],
+        "causal": False,
+    }:
+        raise LOEOFoldError("input-only LOEO HQRCData differs")
+
+
 def namespace(
     output_root: Path, inputs: LOEOFoldInputs, sampler: Mapping[str, object], identity: object
 ) -> LOEONamespace:
@@ -1288,6 +1322,7 @@ __all__ = [
     "fold_lock",
     "guard_namespace",
     "input_identity",
+    "INPUT_CHECKPOINT_TOP",
     "load_complete_material",
     "load_resumable_checkpoint",
     "manifest_payload",
@@ -1302,6 +1337,7 @@ __all__ = [
     "sampler_contract",
     "secure_namespace",
     "validate_complete",
+    "validate_input_checkpoint",
     "validate_downstream_prefix",
     "write_posterior_checkpoint",
     "write_products",
