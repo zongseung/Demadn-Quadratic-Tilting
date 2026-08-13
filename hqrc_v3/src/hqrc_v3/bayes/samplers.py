@@ -91,6 +91,7 @@ def sample_hqrc(
     draws: int = 1_000,
     tune: int = 1_000,
     chains: int = 4,
+    cores: int = 1,
     seed: int = 11,
     backend: Literal["pymc", "nutpie"] = "pymc",
     paper_profile: bool = False,
@@ -99,9 +100,11 @@ def sample_hqrc(
 
     if any(
         isinstance(value, bool) or not isinstance(value, int) or value <= 0
-        for value in (draws, tune, chains)
+        for value in (draws, tune, chains, cores)
     ):
-        raise ValueError("draws, tune, and chains must be positive integers")
+        raise ValueError("draws, tune, chains, and cores must be positive integers")
+    if cores > chains:
+        raise ValueError("cores must not exceed chains")
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise TypeError("seed must be an integer")
     if paper_profile and (chains != 4 or draws < 1_000 or tune < 1_000):
@@ -118,7 +121,7 @@ def sample_hqrc(
                 draws=draws,
                 tune=tune,
                 chains=chains,
-                cores=1,
+                cores=cores,
                 random_seed=seed,
                 progressbar=False,
                 compute_convergence_checks=False,
@@ -157,6 +160,7 @@ def sample_hqrc(
                     "draws": draws,
                     "tune": tune,
                     "chains": chains,
+                    "cores": cores,
                     "seed": seed,
                     "target_accept": target_accept,
                     "paper_profile": paper_profile,

@@ -10,14 +10,18 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 import arviz as az
+import numpy as np
+import pytest
+import xarray as xr
+from test_loeo_ar import _ar_source as ar_source_fixture
+from test_loeo_diagnostics import CONTEXT
+from test_loeo_diagnostics import source as source_fixture
+
 import hqrc_v3._loeo_contract as loeo_contract_module
 import hqrc_v3._loeo_posterior as loeo_posterior_module
 import hqrc_v3._loeo_products as loeo_products_module
 import hqrc_v3._loeo_publication as loeo_publication_module
 import hqrc_v3.loeo_stage as loeo_stage_module
-import numpy as np
-import pytest
-import xarray as xr
 from hqrc_v3.bayes.artifacts import load_hqrc_data
 from hqrc_v3.bayes.model import (
     CYCLIC_HOUR_PARAMETERIZATION,
@@ -46,9 +50,6 @@ from hqrc_v3.loeo_stage import (
     prepare_loeo_fold_inputs,
 )
 from hqrc_v3.provenance import file_sha256
-from test_loeo_ar import _ar_source as ar_source_fixture
-from test_loeo_diagnostics import CONTEXT
-from test_loeo_diagnostics import source as source_fixture
 
 base_source = source_fixture
 source = ar_source_fixture
@@ -314,6 +315,7 @@ def _install_fake_sampler(monkeypatch: pytest.MonkeyPatch, source, publication, 
                 "draws": kwargs["draws"],
                 "tune": kwargs["tune"],
                 "chains": kwargs["chains"],
+                "cores": kwargs["cores"],
                 "seed": kwargs["seed"],
                 "target_accept": 0.9,
                 "paper_profile": False,
@@ -339,6 +341,7 @@ def _smoke_fit_kwargs(output_root: Path, *, seed: int = 71) -> dict[str, object]
         "draws": 4,
         "tune": 3,
         "chains": 2,
+        "cores": 1,
         "output_root": output_root,
     }
 
@@ -687,6 +690,7 @@ def test_checkpoint_recovery_complete_reuse_namespaces_and_fail_closed_products(
                 "draws": kwargs["draws"],
                 "tune": kwargs["tune"],
                 "chains": kwargs["chains"],
+                "cores": kwargs["cores"],
                 "seed": kwargs["seed"],
                 "target_accept": 0.9,
                 "paper_profile": False,
@@ -1039,6 +1043,38 @@ def _namespace_material(approved_fold, root: Path):
     return publication, inputs, sampler, identity
 
 
+def test_sampler_cores_are_resolved_and_bound_to_loeo_identity(approved_fold, tmp_path: Path):
+    _, _, default_sampler, default_identity = _namespace_material(approved_fold, tmp_path)
+    source, publication, approved = approved_fold
+    inputs = prepare_loeo_fold_inputs(
+        source, publication, approved, held_out_occurrence_id="seollal-2024"
+    )
+    multi_core_sampler = loeo_publication_module.sampler_contract(
+        "smoke",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        draws=4,
+        tune=3,
+        chains=4,
+        cores=4,
+    )
+    assert default_sampler["cores"] == 1
+    assert multi_core_sampler["cores"] == 4
+    assert (
+        loeo_publication_module.input_identity(inputs, multi_core_sampler) != default_identity
+    )
+    with pytest.raises(LOEOFoldError, match="cores"):
+        loeo_publication_module.sampler_contract(
+            "smoke",
+            root_seed=71,
+            held_out_occurrence_id="seollal-2024",
+            draws=4,
+            tune=3,
+            chains=2,
+            cores=4,
+        )
+
+
 def test_namespace_rejects_intermediate_symlink_without_touching_external_target(
     approved_fold, tmp_path: Path
 ) -> None:
@@ -1329,6 +1365,7 @@ def test_strict_diagnostic_failure_publishes_no_complete_result(
                 "draws": kwargs["draws"],
                 "tune": kwargs["tune"],
                 "chains": kwargs["chains"],
+                "cores": kwargs["cores"],
                 "seed": kwargs["seed"],
                 "target_accept": 0.99,
                 "paper_profile": True,

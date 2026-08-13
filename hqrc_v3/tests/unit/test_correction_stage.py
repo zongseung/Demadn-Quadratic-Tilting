@@ -7,10 +7,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import arviz as az
-import hqrc_v3.correction_stage as stage
 import numpy as np
 import polars as pl
 import pytest
+
+import hqrc_v3.correction_stage as stage
 from hqrc_v3.bayes.samplers import PYMC_INITIALIZATION, SAMPLER_GEOMETRY, SamplingError
 from hqrc_v3.correction_stage import (
     CausalCorrectionError,
@@ -381,6 +382,7 @@ def _fake_sample(
     *,
     draws: int,
     chains: int,
+    cores: int = 1,
     tune: int,
     seed: int,
     paper_profile: bool = False,
@@ -441,6 +443,7 @@ def _fake_sample(
                     "draws": draws,
                     "tune": tune,
                     "chains": chains,
+                    "cores": cores,
                     "seed": seed,
                     "target_accept": 0.99 if paper_profile else 0.9,
                     "paper_profile": paper_profile,
@@ -464,6 +467,7 @@ def _install_fake_stage(monkeypatch, inputs: CausalCorrectionInputs) -> list[dic
             approved,
             draws=kwargs["draws"],
             chains=kwargs["chains"],
+            cores=kwargs["cores"],
             tune=kwargs["tune"],
             seed=kwargs["seed"],
             paper_profile=kwargs["paper_profile"],
@@ -492,8 +496,20 @@ def _stage_arguments(
         "draws": draws,
         "tune": tune,
         "chains": chains,
+        "cores": 1,
         "output_root": tmp_path / "output",
     }
+
+
+def test_causal_sampler_contract_resolves_and_validates_cores():
+    assert stage._sampler_contract(
+        "smoke", seed=19, draws=3, tune=3, chains=2
+    )["cores"] == 1
+    assert stage._sampler_contract(
+        "smoke", seed=19, draws=3, tune=3, chains=4, cores=4
+    )["cores"] == 4
+    with pytest.raises(CausalCorrectionError, match="cores"):
+        stage._sampler_contract("smoke", seed=19, draws=3, tune=3, chains=2, cores=3)
 
 
 def _canonical_json(value: object) -> bytes:
@@ -627,7 +643,7 @@ def test_partial_resume_fails_closed_on_unsafe_or_invalid_checkpoint(
         tmp_path
         / "output/corrections/causal-2024/lightgbm/B1/seed-7/smoke/sampler-seed-19"
         / GEOMETRY_NAMESPACE
-        / "draws-3-tune-3-chains-2"
+        / "draws-3-tune-3-chains-2-cores-1"
     )
     if mutation == "unknown":
         (output_dir / "unknown.txt").write_text("unknown", encoding="utf-8")
@@ -710,7 +726,7 @@ def test_partial_resume_rejects_unsafe_current_generation_entries(
         tmp_path
         / "output/corrections/causal-2024/lightgbm/B1/seed-7/smoke/sampler-seed-19"
         / GEOMETRY_NAMESPACE
-        / "draws-3-tune-3-chains-2"
+        / "draws-3-tune-3-chains-2-cores-1"
     )
     pointer = json.loads((output_dir / "hqrc_data.current.json").read_bytes())
     generation_dir = output_dir / ".hqrc_data.generations"
@@ -776,9 +792,9 @@ def test_sampler_profile_and_rng_seed_have_distinct_namespaces(tmp_path, monkeyp
         GEOMETRY_NAMESPACE in result.output_dir.parts
         for result in (smoke_19, smoke_23, paper_29)
     )
-    assert smoke_19.output_dir.name == "draws-3-tune-3-chains-2"
-    assert smoke_23.output_dir.name == "draws-3-tune-3-chains-2"
-    assert paper_29.output_dir.name == "draws-1000-tune-1000-chains-4"
+    assert smoke_19.output_dir.name == "draws-3-tune-3-chains-2-cores-1"
+    assert smoke_23.output_dir.name == "draws-3-tune-3-chains-2-cores-1"
+    assert paper_29.output_dir.name == "draws-1000-tune-1000-chains-4-cores-1"
     assert all(
         (result.output_dir / "COMPLETE").is_file()
         for result in (smoke_19, smoke_23, paper_29)
@@ -820,6 +836,7 @@ def test_failed_sampler_contract_and_retry_sizes_have_independent_namespaces(
             approved,
             draws=kwargs["draws"],
             chains=kwargs["chains"],
+            cores=kwargs["cores"],
             tune=kwargs["tune"],
             seed=kwargs["seed"],
             paper_profile=kwargs["paper_profile"],
@@ -847,14 +864,14 @@ def test_failed_sampler_contract_and_retry_sizes_have_independent_namespaces(
         fit_causal_2024_correction(**initial_arguments)
     completed = fit_causal_2024_correction(**retry_arguments)
     failed_directory = completed.output_dir.parent / (
-        f"draws-{initial[0]}-tune-{initial[1]}-chains-{initial[2]}"
+        f"draws-{initial[0]}-tune-{initial[1]}-chains-{initial[2]}-cores-1"
     )
 
     assert failed_directory != completed.output_dir
     assert (failed_directory / "hqrc_data.current.json").is_file()
     assert not (failed_directory / "COMPLETE").exists()
     assert completed.output_dir.name == (
-        f"draws-{retry[0]}-tune-{retry[1]}-chains-{retry[2]}"
+        f"draws-{retry[0]}-tune-{retry[1]}-chains-{retry[2]}-cores-1"
     )
     assert (completed.output_dir / "COMPLETE").is_file()
     assert len(calls) == 2

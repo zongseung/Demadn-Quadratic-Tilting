@@ -253,6 +253,7 @@ def fit_loeo_fold(
     draws: int | None = None,
     tune: int | None = None,
     chains: int | None = None,
+    cores: int | None = None,
     output_root: Path,
 ) -> LOEOFoldResult:
     """Fit or strictly reuse exactly one immutable H3 partial-pooling LOEO fold."""
@@ -270,6 +271,7 @@ def fit_loeo_fold(
         draws=draws,
         tune=tune,
         chains=chains,
+        cores=cores,
     )
     if profile == "paper" and inputs.source.source_profile != "paper":
         raise LOEOFoldError("paper sampler requires a paper-profile correction source")
@@ -317,6 +319,7 @@ def fit_loeo_fold(
                 draws=int(sampler["draws"]),
                 tune=int(sampler["tune"]),
                 chains=int(sampler["chains"]),
+                cores=int(sampler["cores"]),
                 seed=int(sampler["seed"]),
                 backend="pymc",
                 paper_profile=profile == "paper",
@@ -379,6 +382,7 @@ def load_loeo_fold_result(
     draws: int | None = None,
     tune: int | None = None,
     chains: int | None = None,
+    cores: int | None = None,
     output_root: Path,
 ) -> LOEOFoldResult:
     """Load and semantically revalidate one completed result without fitting."""
@@ -396,6 +400,7 @@ def load_loeo_fold_result(
         draws=draws,
         tune=tune,
         chains=chains,
+        cores=cores,
     )
     identity = publication_io.input_identity(inputs, sampler)
     namespace = publication_io.namespace(Path(output_root), inputs, sampler, identity)
@@ -421,6 +426,7 @@ def load_loeo_fold_material(
     draws: int | None = None,
     tune: int | None = None,
     chains: int | None = None,
+    cores: int | None = None,
     output_root: Path,
 ) -> LOEOFoldMaterial:
     """Securely load one completed fold's products and in-memory posterior."""
@@ -438,6 +444,7 @@ def load_loeo_fold_material(
         draws=draws,
         tune=tune,
         chains=chains,
+        cores=cores,
     )
     if profile == "paper" and inputs.source.source_profile != "paper":
         raise LOEOFoldError("paper sampler requires a paper-profile correction source")

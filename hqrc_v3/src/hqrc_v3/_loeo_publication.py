@@ -83,6 +83,7 @@ def sampler_contract(
     draws: int | None,
     tune: int | None,
     chains: int | None,
+    cores: int | None = None,
 ) -> dict[str, object]:
     derived_seed = derive_loeo_seed(root_seed, f"H3-fold-sampler:{held_out_occurrence_id}")
     if profile == "paper":
@@ -99,10 +100,19 @@ def sampler_contract(
         resolved = (draws, tune, chains)
     else:
         raise LOEOFoldError("profile must be paper or smoke")
+    resolved_cores = 1 if cores is None else cores
     if any(
         isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in resolved
     ):
         raise LOEOFoldError("draws, tune, and chains must be positive integers")
+    if (
+        isinstance(resolved_cores, bool)
+        or not isinstance(resolved_cores, int)
+        or resolved_cores <= 0
+    ):
+        raise LOEOFoldError("cores must be a positive integer")
+    if resolved_cores > resolved[2]:
+        raise LOEOFoldError("cores must not exceed chains")
     return {
         "backend": "pymc",
         "root_seed": root_seed,
@@ -110,6 +120,7 @@ def sampler_contract(
         "draws": resolved[0],
         "tune": resolved[1],
         "chains": resolved[2],
+        "cores": resolved_cores,
         "target_accept": 0.99 if profile == "paper" else 0.9,
         "profile": profile,
         "init": PYMC_INITIALIZATION,
@@ -269,6 +280,7 @@ def _posterior_metadata_matches(
         "draws": sampler["draws"],
         "tune": sampler["tune"],
         "chains": sampler["chains"],
+        "cores": sampler["cores"],
         "seed": sampler["seed"],
         "target_accept": sampler["target_accept"],
         "paper_profile": sampler["profile"] == "paper",

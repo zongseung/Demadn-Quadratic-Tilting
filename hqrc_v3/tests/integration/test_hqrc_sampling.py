@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import arviz as az
 import numpy as np
 import pymc as pm
 import pytest
+
 from hqrc_v3.bayes.model import HQRCData
-from hqrc_v3.bayes.samplers import SamplingError, sample_hqrc, validate_inference_data
+from hqrc_v3.bayes.samplers import (
+    SamplingDiagnostics,
+    SamplingError,
+    sample_hqrc,
+    validate_inference_data,
+)
 from hqrc_v3.diagnostics.ar import (
     EventResidualContext,
     approve_calibration,
@@ -129,9 +136,51 @@ def test_pymc_sampler_uses_fixed_stable_initialization_and_records_geometry(
     model = json.loads(idata.attrs["hqrc_model_json"])
 
     assert captured["init"] == "adapt_diag"
+    assert captured["cores"] == 1
+    assert sampler["cores"] == 1
     assert sampler["init"] == "adapt_diag"
     assert sampler["geometry"] == "noncentered-cyclic-hour-rw1-v1"
     assert model["cyclic_hour_parameterization"] == "noncentered-rw1-v1"
+
+
+def test_sampler_records_requested_cores_and_rejects_invalid_values(tmp_path, monkeypatch):
+    data = HQRCData(
+        observations=np.array([0.1, 0.2]),
+        occurrence_index=np.array([0, 0]), holiday_type_index=np.array([0, 0]),
+        tau_days=np.array([0.0, 1.0 / 24.0]), hour=np.array([0, 1]), restriction=np.array([0, 0]),
+        occurrence_ids=("a",),
+    )
+    approved = SimpleNamespace(
+        artifact_path=tmp_path / "approved.json",
+        artifact_digest="digest",
+        residual_sha256="residual",
+        config_sha256="config",
+        event_sha256="event",
+        context=EventResidualContext("model", "B0", 5, ("oof-2020",)),
+        a=0.1,
+        b=0.2,
+    )
+    monkeypatch.setattr("hqrc_v3.bayes.samplers.require_approved_calibration", lambda value: value)
+    monkeypatch.setattr(
+        "hqrc_v3.bayes.samplers.build_hqrc_model",
+        lambda *_args: __import__("contextlib").nullcontext(),
+    )
+    captured = {}
+    monkeypatch.setattr(pm, "sample", lambda **kwargs: captured.update(kwargs) or az.from_dict(
+        posterior={"event_log_likelihood": np.zeros((2, 2, 1))},
+        sample_stats={"diverging": np.zeros((2, 2), dtype=np.int8)},
+    ))
+    monkeypatch.setattr(
+        "hqrc_v3.bayes.samplers.validate_inference_data",
+        lambda *_args, **_kwargs: SamplingDiagnostics(1.0, 1.0, 1.0, 0),
+    )
+    monkeypatch.setattr("hqrc_v3.bayes.samplers.importlib.metadata.version", lambda _: "test")
+    idata = sample_hqrc(data, approved, draws=2, tune=2, chains=2, cores=2)
+    assert captured["cores"] == 2
+    assert json.loads(idata.attrs["hqrc_sampler_json"])["cores"] == 2
+    for invalid in (0, True, 3):
+        with pytest.raises(ValueError):
+            sample_hqrc(data, approved, draws=2, tune=2, chains=2, cores=invalid)
 
 
 def test_paper_diagnostics_fail_closed_without_divergence_statistics():

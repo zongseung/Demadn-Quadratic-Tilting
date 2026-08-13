@@ -34,6 +34,7 @@ def _selected_folds(
     draws: int | None,
     tune: int | None,
     chains: int | None,
+    cores: int | None,
     output_root: Path,
 ) -> tuple[str, ...]:
     if not isinstance(source, ValidatedCorrectionSource):
@@ -78,6 +79,7 @@ def _selected_folds(
             draws=draws,
             tune=tune,
             chains=chains,
+            cores=cores,
         )
     except (TypeError, ValueError) as error:
         raise LOEOPrimaryError("LOEO primary sampler contract is invalid") from error
@@ -191,6 +193,7 @@ def fit_loeo_primary(
     draws: int | None = None,
     tune: int | None = None,
     chains: int | None = None,
+    cores: int | None = None,
     output_root: Path,
 ) -> LOEOPrimaryResult:
     """Fit/reuse selected reviewed folds and publish one immutable H3 aggregate."""
@@ -205,6 +208,7 @@ def fit_loeo_primary(
         draws=draws,
         tune=tune,
         chains=chains,
+        cores=cores,
         output_root=output_root,
     )
     fold_fit_counts: dict[str, int] = {}
@@ -221,6 +225,7 @@ def fit_loeo_primary(
                 draws=draws,
                 tune=tune,
                 chains=chains,
+                cores=cores,
                 output_root=output_root,
             )
             fold_fit_counts[held_out] = fitted.sampler_fit_count
@@ -235,6 +240,7 @@ def fit_loeo_primary(
                     draws=draws,
                     tune=tune,
                     chains=chains,
+                    cores=cores,
                     output_root=output_root,
                 )
             )

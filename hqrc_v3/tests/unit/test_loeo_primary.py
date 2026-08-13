@@ -9,20 +9,21 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-import hqrc_v3._loeo_primary_products as primary_products_module
-import hqrc_v3._loeo_publication as fold_publication_module
-import hqrc_v3.loeo_primary as primary_module
 import numpy as np
 import polars as pl
 import pytest
-from hqrc_v3._loeo_contract import sha_json
-from hqrc_v3._loeo_types import LOEOFoldMaterial, LOEOFoldResult
-from hqrc_v3.loeo_primary import LOEOPrimaryError, fit_loeo_primary
-from hqrc_v3.loeo_stage import generate_loeo_fold_products, prepare_loeo_fold_inputs
 from test_loeo_stage import _fake_idata
 from test_loeo_stage import approved_fold as approved_fold_fixture
 from test_loeo_stage import base_source as base_source_fixture
 from test_loeo_stage import source as source_fixture
+
+import hqrc_v3._loeo_primary_products as primary_products_module
+import hqrc_v3._loeo_publication as fold_publication_module
+import hqrc_v3.loeo_primary as primary_module
+from hqrc_v3._loeo_contract import sha_json
+from hqrc_v3._loeo_types import LOEOFoldMaterial, LOEOFoldResult
+from hqrc_v3.loeo_primary import LOEOPrimaryError, fit_loeo_primary
+from hqrc_v3.loeo_stage import generate_loeo_fold_products, prepare_loeo_fold_inputs
 
 approved_fold = approved_fold_fixture
 base_source = base_source_fixture
@@ -51,6 +52,7 @@ def _fake_material(approved_fold, held_out: str, root: Path) -> LOEOFoldMaterial
             "draws": 4,
             "tune": 3,
             "chains": 2,
+            "cores": 1,
             "seed": sampler["seed"],
             "target_accept": 0.9,
             "paper_profile": False,
