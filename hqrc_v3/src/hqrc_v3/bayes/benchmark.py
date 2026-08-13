@@ -150,6 +150,7 @@ def write_sampler_request(
     draws: int,
     tune: int,
     chains: int,
+    cores: int = 1,
     profile: str,
     bound_hashes: Mapping[str, str] | None = None,
 ) -> Path:
@@ -186,6 +187,10 @@ def write_sampler_request(
         current_config_sha256=config_sha256,
         current_event_sha256=event_sha256,
     )
+    resolved_chains = _positive_integer(chains, "chains")
+    resolved_cores = _positive_integer(cores, "cores")
+    if resolved_cores > resolved_chains:
+        raise SamplerWorkerError("cores must not exceed chains")
     payload: dict[str, Any] = {
         "schema_version": _VERSION,
         "inputs": inputs,
@@ -201,7 +206,8 @@ def write_sampler_request(
             "seed": seed,
             "draws": _positive_integer(draws, "draws"),
             "tune": _positive_integer(tune, "tune"),
-            "chains": _positive_integer(chains, "chains"),
+            "chains": resolved_chains,
+            "cores": resolved_cores,
             "profile": profile,
         },
     }
@@ -276,6 +282,7 @@ def load_sampler_request(path: Path) -> dict[str, Any]:
         "draws",
         "tune",
         "chains",
+        "cores",
         "profile",
     }:
         raise SamplerWorkerError("sampler request sampler schema differs")
@@ -290,8 +297,10 @@ def load_sampler_request(path: Path) -> dict[str, Any]:
         or sampler["seed"] < 0
     ):
         raise SamplerWorkerError("sampler request seed differs")
-    for name in ("draws", "tune", "chains"):
+    for name in ("draws", "tune", "chains", "cores"):
         _positive_integer(sampler[name], name)
+    if sampler["cores"] > sampler["chains"]:
+        raise SamplerWorkerError("sampler request cores exceed chains")
     return payload
 
 

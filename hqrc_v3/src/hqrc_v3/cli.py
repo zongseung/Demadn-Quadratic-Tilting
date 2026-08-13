@@ -256,6 +256,7 @@ def fit_corrections_handler(arguments: argparse.Namespace) -> object:
         draws=arguments.draws,
         tune=arguments.tune,
         chains=arguments.chains,
+        cores=arguments.cores,
     )
 
 
@@ -414,6 +415,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--chains",
         type=int,
         help="chains (smoke: required; paper: optional/default 4 and must equal 4)",
+    )
+    corrections.add_argument(
+        "--cores",
+        type=int,
+        help="PyMC worker cores (optional/default 1; must not exceed chains)",
     )
     corrections.add_argument("--profile", choices=("smoke", "paper"), required=True)
 

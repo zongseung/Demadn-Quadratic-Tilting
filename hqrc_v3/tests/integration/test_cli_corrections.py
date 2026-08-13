@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from hqrc_v3.bayes.samplers import SamplingError
-
 from hqrc_v3 import cli
+from hqrc_v3.bayes.samplers import SamplingError
 
 PAPER_DRAWS_HELP = "retained draws (smoke: required; paper: optional, minimum/default 1000)"
 PAPER_TUNE_HELP = "warm-up draws (smoke: required; paper: optional, minimum/default 1000)"
@@ -50,8 +49,26 @@ def test_causal_cli_routes_rng_seed_and_explicit_smoke_limits(monkeypatch):
             "draws": 12,
             "tune": 13,
             "chains": 2,
+            "cores": None,
         }
     ]
+
+
+def test_causal_cli_forwards_explicit_cores(monkeypatch):
+    received = []
+    monkeypatch.setattr(cli, "fit_causal_2024_correction", lambda **kwargs: received.append(kwargs))
+
+    result = cli.main(
+        [
+            "fit-corrections", "--run-dir", "run", "--config", "experiment.toml",
+            "--approved-ar", "approved.json", "--evaluation", "causal-2024", "--seed", "19",
+            "--profile", "smoke", "--draws", "12", "--tune", "13", "--chains", "4",
+            "--cores", "4",
+        ]
+    )
+
+    assert result == 0
+    assert received[0]["cores"] == 4
 
 
 def test_correction_cli_help_describes_smoke_and_paper_sampler_overrides():

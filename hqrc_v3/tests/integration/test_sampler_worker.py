@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+import hqrc_v3.bayes.sampler_worker as sampler_worker_module
 from hqrc_v3.bayes.benchmark import (
     SamplerWorkerError,
     load_sampler_request,
@@ -34,7 +36,7 @@ def _digest(value):
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
-def _request(tmp_path, *, backend="pymc"):
+def _request(tmp_path, *, backend="pymc", cores=1):
     files = {}
     for name in ("data.npz", "data.json"):
         path = tmp_path / name
@@ -72,9 +74,46 @@ def _request(tmp_path, *, backend="pymc"):
         draws=20,
         tune=20,
         chains=2,
+        cores=cores,
         profile="smoke",
         bound_hashes={path.name: file_sha256(path) for path in files.values()},
     )
+
+
+@pytest.mark.parametrize("backend", ("pymc", "nutpie"))
+def test_sampler_request_binds_requested_cores_for_each_worker_backend(tmp_path, backend):
+    request = load_sampler_request(_request(tmp_path, backend=backend, cores=2))
+    assert request["sampler"]["backend"] == backend
+    assert request["sampler"]["cores"] == 2
+
+
+@pytest.mark.parametrize("cores", (0, True, 3))
+def test_sampler_request_rejects_invalid_cores(tmp_path, cores):
+    with pytest.raises(SamplerWorkerError, match="cores"):
+        _request(tmp_path, cores=cores)
+
+
+@pytest.mark.parametrize("backend", ("pymc", "nutpie"))
+def test_worker_forwards_request_cores_to_each_sampler_backend(tmp_path, monkeypatch, backend):
+    request = load_sampler_request(_request(tmp_path, backend=backend, cores=2))
+    captured = {}
+    monkeypatch.setattr(sampler_worker_module, "load_sampler_request", lambda _path: request)
+    monkeypatch.setattr(sampler_worker_module, "load_hqrc_data", lambda *_args: (object(), {}))
+    monkeypatch.setattr(
+        sampler_worker_module,
+        "load_approved_calibration",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    def stop_after_capture(*_args, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("captured")
+
+    monkeypatch.setattr(sampler_worker_module, "sample_hqrc", stop_after_capture)
+    with pytest.raises(RuntimeError, match="captured"):
+        sampler_worker_module.execute(tmp_path / "request.json", tmp_path / "result.json")
+    assert captured["backend"] == backend
+    assert captured["cores"] == 2
 
 
 def test_parent_launches_separate_worker_and_verifies_pid_and_digest(tmp_path):

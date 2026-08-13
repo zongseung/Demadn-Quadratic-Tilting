@@ -78,7 +78,7 @@ def execute(request_path: Path, result_path: Path) -> Path:
         draws=sampler["draws"],
         tune=sampler["tune"],
         chains=sampler["chains"],
-        cores=sampler.get("cores", 1),
+        cores=sampler["cores"],
         paper_profile=sampler["profile"] == "paper",
     )
     wall = time.perf_counter() - started

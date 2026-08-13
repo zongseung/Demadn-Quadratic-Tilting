@@ -81,7 +81,7 @@ def _selected_folds(
             chains=chains,
             cores=cores,
         )
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, LOEOFoldError) as error:
         raise LOEOPrimaryError("LOEO primary sampler contract is invalid") from error
     if profile == "paper":
         try:

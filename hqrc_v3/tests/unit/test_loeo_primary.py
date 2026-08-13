@@ -230,6 +230,24 @@ def test_paper_preflight_rejects_nonpaper_source_and_smoke_sampler_before_fold_c
     assert calls == []
 
 
+def test_primary_translates_invalid_core_contract_to_primary_error(approved_fold, tmp_path: Path):
+    source, publication, approved = approved_fold
+    with pytest.raises(LOEOPrimaryError, match="sampler contract"):
+        fit_loeo_primary(
+            source,
+            publication,
+            approved,
+            held_out_occurrence_ids=("seollal-2024",),
+            root_seed=71,
+            profile="smoke",
+            draws=4,
+            tune=3,
+            chains=2,
+            cores=3,
+            output_root=tmp_path,
+        )
+
+
 def test_paper_preflight_revalidates_all_physical_folds_before_any_fold_call(
     approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
