@@ -69,6 +69,53 @@ editable PEP 517 package that provides the `hqrc` console script. Do not create 
 use a member-local lock file; `uv.lock` at the repository root is the reproducible
 runtime and test lock.
 
+## One-command manuscript runner
+
+`run-paper` is the portable operator entry point.  It first completes the shared
+baseline source in its fixed order (all five models, B0 then B1, OOF then final
+2024 forecast, then standardized residuals).  It then completes HQRC contexts in
+the following order, with every context's LOEO universe, AR diagnostics, ten H3
+folds, and aggregate product completed before the next one starts:
+
+```text
+XGBoost -> LightGBM -> SVR -> Seq2Seq-LSTM -> Transformer
+```
+
+The default HQRC scope is B1, the holiday-aware baseline.  Use
+`--hqrc-feature-set all` only when the B0 comparison is deliberately required.
+The baseline source must be generated on the computer that runs the sampler:
+its immutable manifests bind input files by digest and absolute local path, so
+copying an old prepared artifact to a different path is not a valid substitute
+for rebuilding it from the raw input there.
+
+```bash
+MODEL_SHA256="$(openssl dgst -sha256 hqrc_v3/configs/model_spaces.toml | awk '{print $NF}')"
+
+uv run --project hqrc_v3 --locked hqrc run-paper \
+  --data power_demand_final.csv \
+  --config hqrc_v3/configs/experiment.toml \
+  --frozen-model-config hqrc_v3/configs/model_spaces.toml \
+  --frozen-model-hash "$MODEL_SHA256" \
+  --event-registry hqrc_v3/configs/events.csv \
+  --holiday-calendar hqrc_v3/configs/holiday_calendar.csv \
+  --temporary-holiday-availability hqrc_v3/configs/temporary_holiday_availability.csv \
+  --run-dir artifacts/hqrc-v3-paper-local \
+  --output-root artifacts/hqrc-v3-loeo-paper-local \
+  --baseline-seed 7 --root-seed 20260813 \
+  --hqrc-model all --hqrc-feature-set B1 \
+  --draws 5000 --tune 5000 --chains 4 --cores 4 \
+  --init jitter+adapt_diag --target-accept 0.99 \
+  --approve-derived-ar
+```
+
+The `--approve-derived-ar` flag is intentionally explicit.  Without it, the same
+command builds/reuses all ACF/PACF plots and data-derived Beta-prior proposals,
+prints their exact proposal digests, and stops before NUTS.  After reviewing those
+plots, rerun the identical command with that flag; completed baseline, LOEO, and
+AR artifacts are strictly reused.  To run only the correction half after a
+baseline source already exists, use `run-loeo-primary` with `--source-run-dir`,
+`--output-root`, and the same HQRC sampler arguments.
+
 For a paper baseline run, calculate the model-config digest and run both stages
 with all models and both feature sets:
 

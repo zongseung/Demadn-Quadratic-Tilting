@@ -33,6 +33,7 @@ from hqrc_v3.diagnostics.ar import (
 )
 from hqrc_v3.events import load_event_registry, load_holiday_calendar
 from hqrc_v3.features import attach_calendar_features, build_daily_forecast_matrix
+from hqrc_v3.paper_pipeline import run_paper_loeo_pipeline
 from hqrc_v3.provenance import file_sha256
 from hqrc_v3.residual_stage import (
     load_standardized_residual_manifest,
@@ -268,6 +269,94 @@ def report_handler(arguments: argparse.Namespace) -> object:
     return build_report(Path(arguments.run_dir), profile=arguments.profile)
 
 
+def _pipeline_models(value: str) -> tuple[str, ...]:
+    return MODEL_NAMES if value == "all" else (value,)
+
+
+def _pipeline_feature_sets(value: str) -> tuple[str, ...]:
+    return ("B0", "B1") if value == "all" else (value,)
+
+
+def _print_pipeline_result(result: object) -> None:
+    """Emit one compact, machine-independent completion line per HQRC context."""
+
+    for item in result:
+        label = f"{item.context.model}/{item.context.feature_set}/seed-{item.context.seed}"
+        if item.status == "COMPLETE":
+            print(
+                f"[HQRC] {label} COMPLETE fits={item.sampler_fit_count} "
+                f"reused={item.reused} output={item.primary_dir}"
+            )
+        else:
+            print(
+                f"[HQRC] {label} {item.status} proposal={item.proposal_set_sha256} "
+                f"ar_dir={item.ar_dir}"
+            )
+
+
+def run_loeo_primary_handler(arguments: argparse.Namespace) -> object:
+    """Run one or all model contexts in the fixed manuscript order."""
+
+    result = run_paper_loeo_pipeline(
+        source_run_dir=Path(arguments.source_run_dir),
+        config_path=Path(arguments.config),
+        output_root=Path(arguments.output_root),
+        models=_pipeline_models(arguments.model),
+        feature_sets=_pipeline_feature_sets(arguments.feature_set),
+        root_seed=arguments.root_seed,
+        profile=arguments.profile,
+        draws=arguments.draws,
+        tune=arguments.tune,
+        chains=arguments.chains,
+        cores=arguments.cores,
+        init=arguments.init,
+        target_accept=arguments.target_accept,
+        approve_derived_ar=arguments.approve_derived_ar,
+        progress=print,
+    )
+    _print_pipeline_result(result)
+    return result
+
+
+def run_paper_handler(arguments: argparse.Namespace) -> object:
+    """Build/reuse the common baseline source, then finish HQRC contexts in order."""
+
+    # A paper-profile residual publication must cover every manuscript baseline
+    # and both feature sets.  The subsequent HQRC selection can be a subset.
+    arguments.seed = arguments.baseline_seed
+    arguments.model = "all"
+    arguments.feature_set = "all"
+    arguments.oof_years = None
+    print("[baseline] OOF: models in manuscript order, B0 then B1")
+    generate_oof_handler(arguments)
+    print("[baseline] final 2019--2023 fit and 2024 evaluation forecast")
+    fit_final_baselines_handler(arguments)
+    print("[residuals] fold-standardized OOF residual publication")
+    prepare_residuals_handler(arguments)
+
+    # The baseline stage reuses --model/--feature-set names, so the HQRC scope
+    # is intentionally held in distinct parsed fields and cannot be overwritten.
+    result = run_paper_loeo_pipeline(
+        source_run_dir=Path(arguments.run_dir),
+        config_path=Path(arguments.config),
+        output_root=Path(arguments.output_root),
+        models=_pipeline_models(arguments.hqrc_model),
+        feature_sets=_pipeline_feature_sets(arguments.hqrc_feature_set),
+        root_seed=arguments.root_seed,
+        profile=arguments.profile,
+        draws=arguments.draws,
+        tune=arguments.tune,
+        chains=arguments.chains,
+        cores=arguments.cores,
+        init=arguments.init,
+        target_accept=arguments.target_accept,
+        approve_derived_ar=arguments.approve_derived_ar,
+        progress=print,
+    )
+    _print_pipeline_result(result)
+    return result
+
+
 def _add_data_inputs(parser: argparse.ArgumentParser, *, config: bool = True) -> None:
     parser.add_argument("--data", required=True, help="hourly source data path")
     if config:
@@ -298,6 +387,44 @@ def _add_frozen_model_inputs(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--temporary-holiday-availability",
         help="temporary-holiday availability CSV; defaults beside --config",
+    )
+
+
+def _add_loeo_pipeline_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--output-root",
+        required=True,
+        help="portable artifact root for LOEO, AR, posterior, and aggregate products",
+    )
+    parser.add_argument(
+        "--root-seed",
+        type=int,
+        default=20260813,
+        help="root seed from which all fold sampler/predictive seeds are derived",
+    )
+    parser.add_argument("--draws", type=int, help="retained draws per chain")
+    parser.add_argument("--tune", type=int, help="warm-up draws per chain")
+    parser.add_argument("--chains", type=int, help="number of NUTS chains")
+    parser.add_argument("--cores", type=int, help="parallel PyMC chain worker count")
+    parser.add_argument(
+        "--init",
+        choices=("adapt_diag", "jitter+adapt_diag"),
+        default="jitter+adapt_diag",
+        help="explicit NUTS initialization contract",
+    )
+    parser.add_argument(
+        "--target-accept",
+        type=float,
+        default=0.99,
+        help="NUTS target acceptance probability",
+    )
+    parser.add_argument(
+        "--approve-derived-ar",
+        action="store_true",
+        help=(
+            "freeze the generated ACF/PACF-derived proposal digest and continue to H3 sampling; "
+            "without this flag the run stops after AR diagnostics"
+        ),
     )
 
 
@@ -442,6 +569,55 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--chains", type=int, required=True)
     benchmark.add_argument("--profile", choices=("smoke", "paper"), required=True)
 
+    loeo_primary = subcommands.add_parser(
+        "run-loeo-primary",
+        help="sequentially run ACF/AR/H3 LOEO for one or more existing baseline contexts",
+    )
+    loeo_primary.add_argument(
+        "--source-run-dir", required=True, help="completed local baseline/residual publication"
+    )
+    loeo_primary.add_argument("--config", required=True, help="experiment TOML bound to source")
+    loeo_primary.add_argument("--model", choices=(*MODEL_NAMES, "all"), default="all")
+    loeo_primary.add_argument(
+        "--feature-set", choices=("B0", "B1", "all"), default="B1"
+    )
+    loeo_primary.add_argument("--profile", choices=("smoke", "paper"), default="paper")
+    _add_loeo_pipeline_options(loeo_primary)
+
+    paper = subcommands.add_parser(
+        "run-paper",
+        help="build all baseline sources then process HQRC models sequentially",
+    )
+    _add_data_inputs(paper)
+    paper.add_argument("--frozen-model-config", required=True, help="frozen manuscript model TOML")
+    paper.add_argument("--frozen-model-hash", required=True, help="SHA-256 of frozen model TOML")
+    paper.add_argument("--event-registry", required=True, help="fixed correction registry")
+    paper.add_argument("--holiday-calendar", required=True, help="holiday feature calendar")
+    paper.add_argument(
+        "--temporary-holiday-availability",
+        required=True,
+        help="known-at-origin temporary-holiday registry",
+    )
+    paper.add_argument("--run-dir", required=True, help="local immutable baseline/residual root")
+    paper.add_argument(
+        "--cache-dir", help="baseline prediction-stream cache; defaults below run-dir"
+    )
+    paper.add_argument("--baseline-seed", type=int, default=7, help="classical baseline RNG seed")
+    paper.add_argument("--profile", choices=("smoke", "paper"), default="paper")
+    paper.add_argument(
+        "--smoke-boosting-rounds", type=int, help="explicit reduced-round smoke override"
+    )
+    paper.add_argument(
+        "--hqrc-model", choices=(*MODEL_NAMES, "all"), default="all", help="HQRC model scope"
+    )
+    paper.add_argument(
+        "--hqrc-feature-set",
+        choices=("B0", "B1", "all"),
+        default="B1",
+        help="HQRC feature-set scope after the common baseline source is complete",
+    )
+    _add_loeo_pipeline_options(paper)
+
     report = subcommands.add_parser(
         "report", help="validate a completed run and emit normalized outputs"
     )
@@ -462,6 +638,8 @@ def _default_handlers() -> dict[str, StageHandler]:
         "fit-corrections": fit_corrections_handler,
         "run-ablations": _unavailable_handler("run-ablations"),
         "benchmark-samplers": _unavailable_handler("benchmark-samplers"),
+        "run-loeo-primary": run_loeo_primary_handler,
+        "run-paper": run_paper_handler,
         "report": report_handler,
     }
 
