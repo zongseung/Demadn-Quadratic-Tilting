@@ -12,13 +12,10 @@ from typing import NoReturn
 import numpy as np
 import polars as pl
 
-from hqrc_v3.artifact_import import import_archived_correction_source
 from hqrc_v3.baselines.config import MODEL_NAMES, load_paper_baselines
-from hqrc_v3.baselines.paper import run_paper_final_stage, run_paper_oof_stage
 from hqrc_v3.bayes.samplers import SamplingError
 from hqrc_v3.config import ConfigError, load_config
 from hqrc_v3.contracts import DataContractError
-from hqrc_v3.correction_stage import fit_causal_2024_correction
 from hqrc_v3.data import (
     FIXED_PUBLIC_HOLIDAY_DATES,
     FIXED_SUBSTITUTE_OR_TEMPORARY_DATES,
@@ -34,13 +31,7 @@ from hqrc_v3.diagnostics.ar import (
 )
 from hqrc_v3.events import load_event_registry, load_holiday_calendar
 from hqrc_v3.features import attach_calendar_features, build_daily_forecast_matrix
-from hqrc_v3.paper_pipeline import run_paper_loeo_pipeline
 from hqrc_v3.provenance import file_sha256
-from hqrc_v3.residual_stage import (
-    load_standardized_residual_manifest,
-    prepare_standardized_residual_artifact,
-    select_diagnostic_residual_context,
-)
 
 StageHandler = Callable[[argparse.Namespace], object]
 _EXPECTED_START = "2019-01-01T00:00:00"
@@ -49,6 +40,56 @@ _EXPECTED_ROWS = 51_144
 _DEFAULT_TEMPORARY_AVAILABILITY = (
     Path(__file__).resolve().parents[2] / "configs/temporary_holiday_availability.csv"
 )
+
+
+# These entry points transitively import Torch-backed baseline modules. Keep
+# them lazy so the accelerated parent reaches its isolated device probes first.
+def import_archived_correction_source(*args, **kwargs):
+    from hqrc_v3.artifact_import import import_archived_correction_source as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def run_paper_oof_stage(*args, **kwargs):
+    from hqrc_v3.baselines.paper import run_paper_oof_stage as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def run_paper_final_stage(*args, **kwargs):
+    from hqrc_v3.baselines.paper import run_paper_final_stage as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def prepare_standardized_residual_artifact(*args, **kwargs):
+    from hqrc_v3.residual_stage import prepare_standardized_residual_artifact as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def load_standardized_residual_manifest(*args, **kwargs):
+    from hqrc_v3.residual_stage import load_standardized_residual_manifest as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def select_diagnostic_residual_context(*args, **kwargs):
+    from hqrc_v3.residual_stage import select_diagnostic_residual_context as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def fit_causal_2024_correction(*args, **kwargs):
+    from hqrc_v3.correction_stage import fit_causal_2024_correction as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def run_paper_loeo_pipeline(*args, **kwargs):
+    from hqrc_v3.paper_pipeline import run_paper_loeo_pipeline as implementation
+
+    return implementation(*args, **kwargs)
 
 
 class StageInputError(ValueError):
@@ -345,6 +386,19 @@ def run_loeo_primary_handler(arguments: argparse.Namespace) -> object:
     return result
 
 
+def run_loeo_accelerated_handler(arguments: argparse.Namespace) -> object:
+    """Route native accelerator scheduling without loading Torch in this parent."""
+
+    from hqrc_v3.accelerated_scheduler import request_from_namespace, run_accelerated_loeo
+
+    result = run_accelerated_loeo(request_from_namespace(arguments))
+    print(f"accelerator={result.accelerator}")
+    print(f"logical_device={result.logical_device}")
+    print(f"fallback_reason={result.fallback_reason or ''}")
+    print(f"completed_models={','.join(result.completed_models)}")
+    return result
+
+
 def run_paper_handler(arguments: argparse.Namespace) -> object:
     """Build/reuse the common baseline source, then finish HQRC contexts in order."""
 
@@ -638,6 +692,42 @@ def build_parser() -> argparse.ArgumentParser:
     loeo_primary.add_argument("--profile", choices=("smoke", "paper"), default="paper")
     _add_loeo_pipeline_options(loeo_primary)
 
+    accelerated = subcommands.add_parser(
+        "run-loeo-accelerated",
+        help="schedule H1--H3 LOEO across native CUDA, MPS, or CPU workers",
+    )
+    accelerated.add_argument("--source-run-dir", required=True)
+    accelerated.add_argument("--config", required=True)
+    accelerated.add_argument("--output-root", required=True)
+    accelerated.add_argument("--profile", choices=("smoke", "paper"), default="paper")
+    accelerated.add_argument(
+        "--models",
+        nargs="+",
+        choices=MODEL_NAMES,
+        default=("lightgbm", "svr", "seq2seq_lstm", "transformer"),
+    )
+    accelerated.add_argument(
+        "--feature-sets", nargs="+", choices=("B0", "B1"), default=("B0", "B1")
+    )
+    accelerated.add_argument(
+        "--variants",
+        nargs="+",
+        choices=("H1", "H2", "H3"),
+        default=("H1", "H2", "H3"),
+    )
+    accelerated.add_argument("--devices", nargs="+", type=int, default=(0, 1))
+    accelerated.add_argument(
+        "--accelerator", choices=("auto", "cuda", "mps", "cpu"), default="auto"
+    )
+    accelerated.add_argument("--root-seed", type=int, default=20260813)
+    accelerated.add_argument("--draws", type=int)
+    accelerated.add_argument("--tune", type=int)
+    accelerated.add_argument("--chains", type=int)
+    accelerated.add_argument("--cores", type=int)
+    accelerated.add_argument("--init", choices=("adapt_diag", "jitter+adapt_diag"))
+    accelerated.add_argument("--target-accept", type=float)
+    accelerated.add_argument("--approve-derived-ar", action="store_true")
+
     paper = subcommands.add_parser(
         "run-paper",
         help="build all baseline sources then process HQRC models sequentially",
@@ -701,6 +791,7 @@ def _default_handlers() -> dict[str, StageHandler]:
         "run-ablations": _unavailable_handler("run-ablations"),
         "benchmark-samplers": _unavailable_handler("benchmark-samplers"),
         "run-loeo-primary": run_loeo_primary_handler,
+        "run-loeo-accelerated": run_loeo_accelerated_handler,
         "run-paper": run_paper_handler,
         "report": report_handler,
     }

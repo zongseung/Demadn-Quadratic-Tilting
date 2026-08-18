@@ -156,6 +156,17 @@ def test_help_succeeds(capsys):
             ],
         ),
         (
+            "run-loeo-accelerated",
+            [
+                "--source-run-dir",
+                "imported",
+                "--config",
+                "imported/sources/experiment.toml",
+                "--output-root",
+                "products",
+            ],
+        ),
+        (
             "run-paper",
             [
                 "--data",
@@ -238,6 +249,41 @@ def test_loeo_commands_parse_backend_and_device_without_resolving_them(command, 
     )
     assert received[0].backend == "pyro"
     assert received[0].device == "cuda:0"
+
+
+def test_accelerated_cli_parses_scope_and_routes_without_importing_scheduler():
+    received = []
+    arguments = [
+        "run-loeo-accelerated",
+        "--source-run-dir",
+        "imported",
+        "--config",
+        "imported/sources/experiment.toml",
+        "--output-root",
+        "products",
+        "--profile",
+        "smoke",
+        "--models",
+        "svr",
+        "transformer",
+        "--feature-sets",
+        "B1",
+        "--variants",
+        "H1",
+        "H3",
+        "--devices",
+        "0",
+        "1",
+        "--accelerator",
+        "auto",
+    ]
+    assert cli.main(arguments, handlers={"run-loeo-accelerated": received.append}) == 0
+    parsed = received[0]
+    assert parsed.models == ["svr", "transformer"]
+    assert parsed.feature_sets == ["B1"]
+    assert parsed.variants == ["H1", "H3"]
+    assert parsed.devices == [0, 1]
+    assert parsed.accelerator == "auto"
 
 
 def test_loeo_cli_handlers_preserve_pymc_init_and_leave_non_pymc_at_default(

@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib.metadata
 import os
 import platform
-import resource
 import sys
 import time
 from hashlib import sha256
@@ -23,11 +22,11 @@ from hqrc_v3.bayes.benchmark import (
 from hqrc_v3.bayes.model import HQRCModelOptions
 from hqrc_v3.bayes.samplers import sample_hqrc, validate_inference_data
 from hqrc_v3.diagnostics.ar import load_approved_calibration
+from hqrc_v3.peak_rss import peak_rss_mb
 
 
 def _rss_mb() -> float:
-    value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    return value / (1024.0 * 1024.0) if platform.system() == "Darwin" else value / 1024.0
+    return peak_rss_mb()
 
 
 def _posterior_summary(idata) -> dict[str, dict[str, object]]:

@@ -11,13 +11,14 @@ import json
 import math
 import os
 import platform
-import resource
 import statistics
 import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+from hqrc_v3.peak_rss import peak_rss_mb
 
 _REQUEST_KEYS = {
     "schema_version",
@@ -128,9 +129,7 @@ def _elapsed(start: float) -> float:
 
 
 def _peak_rss_mb() -> float:
-    raw = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    divisor = 1024.0**2 if sys.platform == "darwin" else 1024.0
-    return max(raw / divisor, sys.float_info.epsilon)
+    return peak_rss_mb()
 
 
 def _canonical_aggregate_value(value: object) -> dict[str, object]:
@@ -160,10 +159,7 @@ def _aggregate_checksum(
 ) -> str:
     if any(len(row) != len(columns) for row in rows):
         raise DataBenchmarkError("workload aggregate shape differs")
-    values = [
-        [_canonical_aggregate_value(value) for value in row]
-        for row in rows
-    ]
+    values = [[_canonical_aggregate_value(value) for value in row] for row in rows]
     return _digest(
         {
             "identity": identity,
@@ -186,11 +182,7 @@ def _workload(pl: Any, request: dict[str, Any]) -> str:
                 pl.col(name).len().alias(f"{position}_row_count"),
             )
         )
-    result = (
-        pl.scan_parquet(request["input"]["path"])
-        .select(expressions)
-        .collect()
-    )
+    result = pl.scan_parquet(request["input"]["path"]).select(expressions).collect()
     return _aggregate_checksum(
         identity=request["workload"],
         seed=request["seed"],
