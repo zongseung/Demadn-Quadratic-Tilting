@@ -10,7 +10,13 @@ import polars as pl
 import pytest
 
 import hqrc_v3._loeo_publication as fold_contract
-from hqrc_v3.loeo_ablation import _aggregate_products
+from hqrc_v3.bayes.samplers import SamplingError
+from hqrc_v3.loeo_ablation import (
+    _aggregate_products,
+    _record_rejection,
+    _sampler_attempt,
+    _validate_rejection,
+)
 
 
 def _occurrence_ids() -> tuple[str, ...]:
@@ -76,3 +82,61 @@ def test_variant_sampler_seeds_are_separate_and_h3_is_backward_compatible() -> N
     default_h3 = fold_contract.sampler_contract(**common)["seed"]
     assert len(set(seeds.values())) == 3
     assert seeds["H3"] == default_h3
+
+
+def test_diagnostic_retry_uses_distinct_deterministic_seed_without_changing_primary() -> None:
+    primary = fold_contract.sampler_contract(
+        "paper",
+        root_seed=20260813,
+        held_out_occurrence_id="seollal-2022",
+        variant="H2",
+        draws=5_000,
+        tune=5_000,
+        chains=4,
+        cores=4,
+        init="jitter+adapt_diag",
+    )
+
+    attempt_zero = _sampler_attempt(
+        primary,
+        root_seed=20260813,
+        held_out="seollal-2022",
+        variant="H2",
+        attempt=0,
+    )
+    retry_one = _sampler_attempt(
+        primary,
+        root_seed=20260813,
+        held_out="seollal-2022",
+        variant="H2",
+        attempt=1,
+    )
+    repeated = _sampler_attempt(
+        primary,
+        root_seed=20260813,
+        held_out="seollal-2022",
+        variant="H2",
+        attempt=1,
+    )
+
+    assert attempt_zero == primary
+    assert retry_one == repeated
+    assert retry_one["seed"] != primary["seed"]
+    assert retry_one["diagnostic_attempt"] == 1
+    assert retry_one["diagnostic_retry_policy"] == "alternate-derived-seed-v1"
+
+
+def test_rejected_diagnostic_attempt_is_recorded_and_reusable(tmp_path: Path) -> None:
+    identity = {"fold": "seollal-2022", "variant": "H2"}
+    sampler = {"seed": 17, "draws": 5_000, "chains": 4}
+    path = tmp_path / "rejection.json"
+    error = SamplingError(
+        "SamplingDiagnostics(max_rhat=1.02, min_bulk_ess=357.0, "
+        "min_tail_ess=131.0, divergences=0)"
+    )
+
+    _record_rejection(path, identity=identity, sampler=sampler, error=error)
+    _record_rejection(path, identity=identity, sampler=sampler, error=error)
+    _validate_rejection(path, identity=identity, sampler=sampler)
+
+    assert path.is_file()

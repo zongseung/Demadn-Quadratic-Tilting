@@ -18,7 +18,7 @@ from scipy import stats
 import hqrc_v3._loeo_publication as fold_contract
 from hqrc_v3._loeo_contract import MODEL_OPTIONS, derive_loeo_seed, sha_json
 from hqrc_v3._loeo_products import generate_loeo_fold_products
-from hqrc_v3.bayes.samplers import sample_hqrc
+from hqrc_v3.bayes.samplers import SamplingError, sample_hqrc
 from hqrc_v3.correction_source import ValidatedCorrectionSource
 from hqrc_v3.diagnostics.loeo import LOEOPublication
 from hqrc_v3.diagnostics.loeo_ar import ApprovedLOEOARSet
@@ -39,6 +39,7 @@ _PRIMARY_FILES = (
     "per_event_metrics.parquet",
     "aggregate_metrics.parquet",
 )
+_DIAGNOSTIC_RETRY_POLICY = "alternate-derived-seed-v1"
 
 
 class LOEOAblationError(ValueError):
@@ -79,6 +80,102 @@ def _write_json(path: Path, value: Mapping[str, object]) -> None:
         json.dumps(dict(value), sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n",
         encoding="utf-8",
     )
+
+
+def _sampler_attempt(
+    sampler: Mapping[str, object],
+    *,
+    root_seed: int,
+    held_out: str,
+    variant: AblationVariant,
+    attempt: int,
+) -> dict[str, object]:
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+        raise LOEOAblationError("diagnostic attempt must be a non-negative integer")
+    resolved = dict(sampler)
+    if attempt == 0:
+        return resolved
+    resolved.update(
+        {
+            "seed": derive_loeo_seed(
+                root_seed,
+                f"{variant}-fold-sampler:{held_out}:diagnostic-retry-{attempt}",
+            ),
+            "diagnostic_attempt": attempt,
+            "diagnostic_retry_policy": _DIAGNOSTIC_RETRY_POLICY,
+        }
+    )
+    return resolved
+
+
+def _rejection_path(
+    output_root: Path,
+    publication: LOEOPublication,
+    *,
+    held_out: str,
+    variant: AblationVariant,
+    profile: str,
+    identity: Mapping[str, object],
+) -> Path:
+    context = publication.context
+    return (
+        output_root
+        / "loeo-ablation-rejections"
+        / variant.lower()
+        / context.model
+        / context.feature_set
+        / f"seed-{context.seed}"
+        / held_out
+        / profile
+        / f"identity-{sha_json(identity)}.json"
+    )
+
+
+def _record_rejection(
+    path: Path,
+    *,
+    identity: Mapping[str, object],
+    sampler: Mapping[str, object],
+    error: SamplingError,
+) -> None:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "state": "REJECTED_BY_DIAGNOSTIC_GATE",
+        "identity_sha256": sha_json(identity),
+        "sampler": dict(sampler),
+        "error": str(error),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if _read_json(path, "ablation rejection record") != payload:
+            raise LOEOAblationError("ablation rejection record differs")
+        return
+    descriptor, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(raw)
+    try:
+        os.close(descriptor)
+        _write_json(temporary, payload)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _validate_rejection(
+    path: Path,
+    *,
+    identity: Mapping[str, object],
+    sampler: Mapping[str, object],
+) -> None:
+    payload = _read_json(path, "ablation rejection record")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("state") != "REJECTED_BY_DIAGNOSTIC_GATE"
+        or payload.get("identity_sha256") != sha_json(identity)
+        or payload.get("sampler") != dict(sampler)
+        or not isinstance(payload.get("error"), str)
+        or not str(payload["error"]).startswith("SamplingDiagnostics(")
+    ):
+        raise LOEOAblationError("ablation rejection record is invalid")
 
 
 def _output_records(directory: Path, files: tuple[str, ...]) -> dict[str, dict[str, str]]:
@@ -226,12 +323,13 @@ def _fit_fold(
     cores: int | None,
     init: str | None,
     target_accept: float | None,
+    diagnostic_attempts: int,
     output_root: Path,
 ) -> tuple[Path, int, bool]:
     inputs = prepare_loeo_fold_inputs(
         source, publication, approved_set, held_out_occurrence_id=held_out
     )
-    sampler = fold_contract.sampler_contract(
+    base_sampler = fold_contract.sampler_contract(
         profile,
         root_seed=root_seed,
         held_out_occurrence_id=held_out,
@@ -245,69 +343,115 @@ def _fit_fold(
     )
     if profile == "paper" and source.source_profile != "paper":
         raise LOEOAblationError("paper ablation requires a paper-profile residual source")
-    identity = _fold_identity(
-        source,
-        publication,
-        approved_set,
-        held_out=held_out,
-        variant=variant,
-        sampler=sampler,
-    )
     context = publication.context
-    directory = (
-        output_root
-        / f"loeo-ablation-{variant.lower()}"
-        / context.model
-        / context.feature_set
-        / f"seed-{context.seed}"
-        / held_out
-        / profile
-        / f"identity-{sha_json(identity)}"
-    )
-    if directory.exists():
-        _validate_complete(directory, identity=identity, files=_FOLD_FILES)
-        return directory, 0, True
-
-    idata = sample_hqrc(
-        inputs.hqrc_data,
-        inputs.approved,
-        variant=variant,
-        pooling="partial",
-        options=MODEL_OPTIONS,
-        draws=int(sampler["draws"]),
-        tune=int(sampler["tune"]),
-        chains=int(sampler["chains"]),
-        cores=int(sampler["cores"]),
-        seed=int(sampler["seed"]),
-        init=str(sampler["init"]),
-        target_accept=float(sampler["target_accept"]),
-        backend="pymc",
-        paper_profile=profile == "paper",
-    )
-    idata.attrs["hqrc_causal"] = "false"
-    products = generate_loeo_fold_products(
-        inputs,
-        idata,
-        variant=variant,
-        predictive_seed=int(identity["predictive_seed"]),
-        predictive_draws=int(sampler["draws"]) * int(sampler["chains"]),
-    )
-
-    def write(temporary: Path) -> None:
-        az.to_netcdf(idata, temporary / "posterior.nc")
-        products.hourly_predictions.with_columns(pl.lit(variant).alias("variant")).write_parquet(
-            temporary / "hourly_predictions.parquet"
+    attempts: list[tuple[dict[str, object], dict[str, object], Path, Path]] = []
+    for attempt in range(diagnostic_attempts):
+        sampler = _sampler_attempt(
+            base_sampler,
+            root_seed=root_seed,
+            held_out=held_out,
+            variant=variant,
+            attempt=attempt,
         )
-        products.metrics.with_columns(pl.lit(variant).alias("variant")).write_parquet(
-            temporary / "metrics.parquet"
+        identity = _fold_identity(
+            source,
+            publication,
+            approved_set,
+            held_out=held_out,
+            variant=variant,
+            sampler=sampler,
         )
-        _write_json(temporary / "posterior_summary.json", products.posterior_summary)
+        directory = (
+            output_root
+            / f"loeo-ablation-{variant.lower()}"
+            / context.model
+            / context.feature_set
+            / f"seed-{context.seed}"
+            / held_out
+            / profile
+            / f"identity-{sha_json(identity)}"
+        )
+        rejection = _rejection_path(
+            output_root,
+            publication,
+            held_out=held_out,
+            variant=variant,
+            profile=profile,
+            identity=identity,
+        )
+        attempts.append((sampler, identity, directory, rejection))
 
-    _publish_directory(directory, identity=identity, files=_FOLD_FILES, writer=write)
-    close = getattr(idata, "close", None)
-    if callable(close):
-        close()
-    return directory, 1, False
+    # A completed fallback is authoritative on resume even when an earlier
+    # attempt was interrupted before its rejection record could be written.
+    for _sampler, identity, directory, _rejection in attempts:
+        if directory.exists():
+            _validate_complete(directory, identity=identity, files=_FOLD_FILES)
+            return directory, 0, True
+
+    sampler_fit_count = 0
+    last_error: SamplingError | None = None
+    for sampler, identity, directory, rejection in attempts:
+        if rejection.exists():
+            _validate_rejection(rejection, identity=identity, sampler=sampler)
+            continue
+        try:
+            idata = sample_hqrc(
+                inputs.hqrc_data,
+                inputs.approved,
+                variant=variant,
+                pooling="partial",
+                options=MODEL_OPTIONS,
+                draws=int(sampler["draws"]),
+                tune=int(sampler["tune"]),
+                chains=int(sampler["chains"]),
+                cores=int(sampler["cores"]),
+                seed=int(sampler["seed"]),
+                init=str(sampler["init"]),
+                target_accept=float(sampler["target_accept"]),
+                backend="pymc",
+                paper_profile=profile == "paper",
+            )
+            sampler_fit_count += 1
+        except SamplingError as error:
+            sampler_fit_count += 1
+            if not str(error).startswith("SamplingDiagnostics("):
+                raise
+            _record_rejection(
+                rejection,
+                identity=identity,
+                sampler=sampler,
+                error=error,
+            )
+            last_error = error
+            continue
+
+        idata.attrs["hqrc_causal"] = "false"
+        products = generate_loeo_fold_products(
+            inputs,
+            idata,
+            variant=variant,
+            predictive_seed=int(identity["predictive_seed"]),
+            predictive_draws=int(sampler["draws"]) * int(sampler["chains"]),
+        )
+
+        def write(temporary: Path) -> None:
+            az.to_netcdf(idata, temporary / "posterior.nc")
+            products.hourly_predictions.with_columns(
+                pl.lit(variant).alias("variant")
+            ).write_parquet(temporary / "hourly_predictions.parquet")
+            products.metrics.with_columns(pl.lit(variant).alias("variant")).write_parquet(
+                temporary / "metrics.parquet"
+            )
+            _write_json(temporary / "posterior_summary.json", products.posterior_summary)
+
+        _publish_directory(directory, identity=identity, files=_FOLD_FILES, writer=write)
+        close = getattr(idata, "close", None)
+        if callable(close):
+            close()
+        return directory, sampler_fit_count, False
+    if last_error is not None:
+        raise last_error
+    raise LOEOAblationError("all configured diagnostic attempts were already rejected")
 
 
 def _point_row(event_id: str, observed: np.ndarray, forecast: np.ndarray) -> dict[str, object]:
@@ -445,6 +589,7 @@ def fit_loeo_ablation(
     cores: int | None = None,
     init: str | None = None,
     target_accept: float | None = None,
+    diagnostic_attempts: int = 1,
     output_root: Path,
 ) -> LOEOAblationResult:
     """Fit/reuse all selected H1 or H2 folds and publish table-ready metrics."""
@@ -454,6 +599,12 @@ def fit_loeo_ablation(
         raise LOEOAblationError("paper ablation requires all canonical LOEO occurrences")
     if len(held_out_occurrence_ids) != 10:
         raise LOEOAblationError("paper ablation requires exactly ten held-out occurrences")
+    if (
+        isinstance(diagnostic_attempts, bool)
+        or not isinstance(diagnostic_attempts, int)
+        or diagnostic_attempts <= 0
+    ):
+        raise LOEOAblationError("diagnostic_attempts must be a positive integer")
     if not Path(output_root).is_absolute():
         raise LOEOAblationError("ablation output root must be absolute")
     validate_loeo_fold_sources(source, publication, approved_set)
@@ -475,6 +626,7 @@ def fit_loeo_ablation(
             cores=cores,
             init=init,
             target_accept=target_accept,
+            diagnostic_attempts=diagnostic_attempts,
             output_root=Path(output_root),
         )
         fold_dirs.append(directory)

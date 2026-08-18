@@ -313,6 +313,7 @@ def run_loeo_primary_handler(arguments: argparse.Namespace) -> object:
         cores=arguments.cores,
         init=arguments.init,
         target_accept=arguments.target_accept,
+        diagnostic_attempts=arguments.diagnostic_attempts,
         approve_derived_ar=arguments.approve_derived_ar,
         progress=print,
     )
@@ -353,6 +354,7 @@ def run_paper_handler(arguments: argparse.Namespace) -> object:
         cores=arguments.cores,
         init=arguments.init,
         target_accept=arguments.target_accept,
+        diagnostic_attempts=arguments.diagnostic_attempts,
         approve_derived_ar=arguments.approve_derived_ar,
         progress=print,
     )
@@ -420,6 +422,15 @@ def _add_loeo_pipeline_options(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=0.99,
         help="NUTS target acceptance probability",
+    )
+    parser.add_argument(
+        "--diagnostic-attempts",
+        type=int,
+        default=1,
+        help=(
+            "maximum deterministic sampler attempts per H1/H2 fold; rejected diagnostics "
+            "are recorded and retries use separately derived seeds"
+        ),
     )
     parser.add_argument(
         "--approve-derived-ar",

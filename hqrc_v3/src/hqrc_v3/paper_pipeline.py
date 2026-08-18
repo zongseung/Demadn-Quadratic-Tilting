@@ -111,6 +111,7 @@ def run_paper_loeo_pipeline(
     cores: int | None = None,
     init: str | None = None,
     target_accept: float | None = None,
+    diagnostic_attempts: int = 1,
     approve_derived_ar: bool = False,
     progress: Progress | None = None,
 ) -> tuple[PipelineContextResult, ...]:
@@ -127,6 +128,12 @@ def run_paper_loeo_pipeline(
         raise PaperPipelineError("profile must be paper or smoke")
     if isinstance(root_seed, bool) or not isinstance(root_seed, int) or root_seed < 0:
         raise PaperPipelineError("root seed must be a non-negative integer")
+    if (
+        isinstance(diagnostic_attempts, bool)
+        or not isinstance(diagnostic_attempts, int)
+        or diagnostic_attempts <= 0
+    ):
+        raise PaperPipelineError("diagnostic_attempts must be a positive integer")
     selected_variants = tuple(variants)
     if (
         not selected_variants
@@ -206,6 +213,7 @@ def run_paper_loeo_pipeline(
                     cores=cores,
                     init=init,
                     target_accept=target_accept,
+                    diagnostic_attempts=diagnostic_attempts,
                     output_root=output,
                 )
                 variant_outputs.append((variant, ablation.output_dir))
