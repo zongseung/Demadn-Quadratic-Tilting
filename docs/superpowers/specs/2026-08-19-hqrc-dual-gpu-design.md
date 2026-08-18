@@ -1,5 +1,10 @@
 # HQRC H1--H3 Dual-GPU Execution Design
 
+> Superseded by
+> `docs/superpowers/specs/2026-08-19-hqrc-cross-platform-accelerator-design.md`.
+> The replacement removes the WSL-only requirement and defines the approved
+> Windows, macOS, and Linux execution contract.
+
 ## 1. Purpose
 
 Reuse the validated baseline and standardized-residual publications in
