@@ -1,13 +1,32 @@
 import hashlib
 import json
+import os
+import subprocess
 import threading
 from pathlib import Path
 
 import numpy as np
 import pytest
+
 from hqrc_v3.bayes import artifacts as artifacts_module
 from hqrc_v3.bayes.artifacts import HQRCArtifactError, load_hqrc_data, write_hqrc_data
 from hqrc_v3.bayes.model import HQRCData
+
+
+def _make_directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        if os.name != "nt":
+            pytest.skip(f"cannot create a directory link: {error}")
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if completed.returncode:
+            pytest.skip(f"cannot create a directory junction: {completed.stderr}")
 
 
 def _data():
@@ -86,7 +105,7 @@ def test_writer_rejects_generation_namespace_symlink_without_touching_outside(tm
     (outside / "sentinel.txt").write_bytes(b"outside")
     destination = parent / "hqrc.npz"
     namespace = parent / ".hqrc.generations"
-    namespace.symlink_to(outside, target_is_directory=True)
+    _make_directory_link(namespace, outside)
     parent_before = sorted(path.name for path in parent.iterdir())
     outside_before = {
         path.name: path.read_bytes() for path in outside.iterdir() if path.is_file()
@@ -99,7 +118,7 @@ def test_writer_rejects_generation_namespace_symlink_without_touching_outside(tm
     assert {
         path.name: path.read_bytes() for path in outside.iterdir() if path.is_file()
     } == outside_before
-    assert namespace.is_symlink()
+    assert namespace.is_symlink() or getattr(namespace, "is_junction", lambda: False)()
 
 
 def test_writer_rejects_regular_file_generation_namespace_without_mutation(tmp_path):
@@ -249,7 +268,7 @@ def test_writer_rejects_post_open_namespace_swap_without_external_writes(
         nonlocal swapped
         if name == "generation-namespace-opened":
             namespace.rename(detached)
-            namespace.symlink_to(outside, target_is_directory=True)
+            _make_directory_link(namespace, outside)
             swapped = True
 
     monkeypatch.setattr(
@@ -281,7 +300,7 @@ def test_writer_rejects_post_open_namespace_swap_without_external_writes(
             path.name: path.read_bytes() for path in detached.iterdir() if path.is_file()
         } == generation_before
     finally:
-        if namespace.is_symlink():
+        if namespace.is_symlink() or getattr(namespace, "is_junction", lambda: False)():
             namespace.unlink()
         if detached.is_dir():
             detached.rename(namespace)
@@ -293,32 +312,39 @@ def test_writer_rejects_post_open_namespace_swap_without_external_writes(
     assert current.occurrence_ids == stale.occurrence_ids == ("a", "b")
 
 
-def test_generation_namespace_descriptor_closes_on_injected_failure(tmp_path, monkeypatch):
+def test_generation_namespace_handle_closes_on_injected_failure(tmp_path, monkeypatch):
     destination = tmp_path / "hqrc.npz"
     write_hqrc_data(destination, _data(), settings={"generation": "a"})
     namespace = destination.with_name(".hqrc.generations")
-    real_open = artifacts_module.os.open
-    directory_descriptors: list[int] = []
+    real_trusted_directory = artifacts_module.trusted_directory
+    real_close = artifacts_module.TrustedDirectory.close
+    opened = []
+    closed = []
 
-    def tracked_open(path, flags, *args, **kwargs):
-        descriptor = real_open(path, flags, *args, **kwargs)
-        if Path(path) == namespace and flags & getattr(artifacts_module.os, "O_DIRECTORY", 0):
-            directory_descriptors.append(descriptor)
-        return descriptor
+    def tracked_directory(root, path, **kwargs):
+        directory = real_trusted_directory(root, path, **kwargs)
+        if directory.path == namespace.resolve():
+            opened.append(directory)
+        return directory
+
+    def tracked_close(directory):
+        if directory in opened:
+            closed.append(directory)
+        real_close(directory)
 
     def fail_after_open(name):
         if name == "generation-namespace-opened":
             raise RuntimeError("injected failure after namespace open")
 
-    monkeypatch.setattr(artifacts_module.os, "open", tracked_open)
+    monkeypatch.setattr(artifacts_module, "trusted_directory", tracked_directory)
+    monkeypatch.setattr(artifacts_module.TrustedDirectory, "close", tracked_close)
     monkeypatch.setattr(artifacts_module, "_publication_boundary", fail_after_open)
     with pytest.raises(RuntimeError, match="injected failure after namespace open"):
         write_hqrc_data(destination, _second_data(), settings={"generation": "b"})
 
-    assert directory_descriptors
-    for descriptor in directory_descriptors:
-        with pytest.raises(OSError):
-            artifacts_module.os.fstat(descriptor)
+    assert opened
+    assert closed == opened
+    assert all(directory.descriptor is None for directory in opened)
 
 
 def test_concurrent_pointer_reader_sees_complete_generation_and_writer_terminates(

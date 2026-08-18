@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -21,6 +22,9 @@ import hqrc_v3._loeo_contract as loeo_contract_module
 import hqrc_v3._loeo_posterior as loeo_posterior_module
 import hqrc_v3._loeo_products as loeo_products_module
 import hqrc_v3._loeo_publication as loeo_publication_module
+import hqrc_v3.diagnostics.ar as ar_diagnostics_module
+import hqrc_v3.diagnostics.loeo as loeo_diagnostics_module
+import hqrc_v3.diagnostics.loeo_ar as loeo_ar_module
 import hqrc_v3.loeo_stage as loeo_stage_module
 from hqrc_v3.bayes.artifacts import load_hqrc_data
 from hqrc_v3.bayes.model import (
@@ -50,6 +54,9 @@ from hqrc_v3.loeo_stage import (
     prepare_loeo_fold_inputs,
 )
 from hqrc_v3.provenance import file_sha256
+from hqrc_v3.publication_fs import _fsync_directory as portable_fsync_directory
+from hqrc_v3.publication_fs import _fsync_file as portable_fsync_file
+from hqrc_v3.publication_fs import exclusive_lock as portable_exclusive_lock
 
 base_source = source_fixture
 source = ar_source_fixture
@@ -234,12 +241,47 @@ def _plant_foreign_entry(target: Path, kind: str, outside: Path) -> tuple[object
     if kind == "regular":
         target.write_bytes(b"foreign-publication-evidence")
     elif kind == "symlink":
-        target.symlink_to(outside / "marker")
+        try:
+            target.symlink_to(outside / "marker")
+        except OSError as error:
+            pytest.skip(f"cannot create a file symlink on this platform: {error}")
     elif kind == "fifo":
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO entries are unavailable on this platform")
         os.mkfifo(target)
     else:  # pragma: no cover - closed test parameter set
         raise AssertionError(kind)
     return _entry_snapshot(target)
+
+
+def _make_directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        if os.name != "nt":
+            pytest.skip(f"cannot create a directory link: {error}")
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if completed.returncode:
+            pytest.skip(f"cannot create a directory junction: {completed.stderr}")
+
+
+def _make_file_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        pytest.skip(f"cannot create a file symlink on this platform: {error}")
+
+
+@contextmanager
+def _persistent_windows_lock(path: Path):
+    with portable_exclusive_lock(path):
+        yield
+    path.touch(exist_ok=True)
 
 
 def _pending_publication_target(directory: Path, boundary: str) -> Path:
@@ -347,7 +389,15 @@ def _smoke_fit_kwargs(output_root: Path, *, seed: int = 71) -> dict[str, object]
 
 
 @pytest.fixture
-def approved_fold(source: ValidatedCorrectionSource, tmp_path: Path):
+def approved_fold(source: ValidatedCorrectionSource, tmp_path: Path, monkeypatch):
+    if os.name == "nt":
+        monkeypatch.setattr(
+            loeo_diagnostics_module, "_fsync_directory", portable_fsync_directory
+        )
+        monkeypatch.setattr(loeo_diagnostics_module, "_fsync_file", portable_fsync_file)
+        monkeypatch.setattr(loeo_ar_module, "_fsync_directory", portable_fsync_directory)
+        monkeypatch.setattr(ar_diagnostics_module, "exclusive_lock", _persistent_windows_lock)
+        monkeypatch.setattr(loeo_ar_module, "exclusive_lock", _persistent_windows_lock)
     publication = publish_loeo_universe(source, CONTEXT, output_dir=tmp_path / "loeo")
     proposal = prepare_loeo_ar_proposal_set(source, publication, output_dir=tmp_path / "loeo-ar")
     approve_loeo_ar_proposal_set(
@@ -827,7 +877,7 @@ def test_checkpoint_recovery_complete_reuse_namespaces_and_fail_closed_products(
     target = tmp_path / "metrics-target"
     target.write_bytes(metrics_bytes)
     recovered.metrics_path.unlink()
-    recovered.metrics_path.symlink_to(target)
+    _make_file_link(recovered.metrics_path, target)
     with pytest.raises(LOEOFoldError, match="unsafe|manifest"):
         load_loeo_fold_result(source, publication, approved, **fit_kwargs)
     recovered.metrics_path.unlink()
@@ -1218,7 +1268,7 @@ def test_namespace_rejects_intermediate_symlink_without_touching_external_target
     marker.write_bytes(b"untouched")
     root = tmp_path / "symlink-root"
     root.mkdir()
-    (root / "loeo-h3").symlink_to(outside, target_is_directory=True)
+    _make_directory_link(root / "loeo-h3", outside)
     with pytest.raises(LOEOFoldError, match="unsafe|symlink|namespace"):
         loeo_publication_module.namespace(root, inputs, sampler, identity)
     assert marker.read_bytes() == b"untouched"
@@ -1242,7 +1292,7 @@ def test_fit_rejects_intermediate_swap_after_namespace_without_touching_outside(
         original_component = output_root / "loeo-h3"
         moved_component = outside / "loeo-h3"
         original_component.rename(moved_component)
-        original_component.symlink_to(moved_component, target_is_directory=True)
+        _make_directory_link(original_component, moved_component)
         assert Path(directory).is_relative_to(original_component)
         outside_before.append(_tree_snapshot(outside))
         return namespace
@@ -1275,7 +1325,7 @@ def test_fit_rejects_intermediate_swap_at_boundary_before_sampler_or_outside_wri
         swapped = True
         component = output_root / "loeo-h3"
         component.rename(output_root / "quarantined-loeo-h3")
-        component.symlink_to(outside, target_is_directory=True)
+        _make_directory_link(component, outside)
 
     monkeypatch.setattr(loeo_publication_module, "publication_boundary", swap_at_boundary)
     with pytest.raises(LOEOFoldError, match="namespace|changed|unsafe"):
@@ -1318,7 +1368,7 @@ def test_every_publication_class_uses_held_directory_after_prewrite_namespace_sw
         swapped = True
         component = output_root / "loeo-h3"
         component.rename(output_root / "quarantined-loeo-h3")
-        component.symlink_to(outside, target_is_directory=True)
+        _make_directory_link(component, outside)
 
     monkeypatch.setattr(loeo_publication_module, "publication_boundary", swap_before_write)
     with pytest.raises(LOEOFoldError, match="namespace|changed|unsafe"):
@@ -1358,6 +1408,34 @@ def test_publication_primitive_never_replaces_foreign_target_inserted_at_prewrit
     assert _entry_snapshot(target) == planted[0]
     assert _tree_snapshot(outside) == outside_before
     assert _publication_temporaries(directory) == []
+
+
+def test_windows_backend_fold_publication_writes_loads_validates_and_reuses(tmp_path):
+    namespace = loeo_publication_module.secure_namespace(
+        (tmp_path / "results").resolve(), ("fold",)
+    )
+    payload = {"schema_version": 1, "state": "COMPLETE"}
+
+    with loeo_publication_module.fold_lock(namespace, backend="windows") as publication:
+        loeo_publication_module.publish_json(
+            publication, "manifest.json", payload, boundary="manifest-prewrite"
+        )
+        loeo_publication_module.guard_namespace(publication)
+        assert loeo_publication_module._relative_json(
+            publication.directory, "manifest.json", "manifest"
+        ) == payload
+        directory_identity = publication.directory.identity
+        artifact_identity = (publication.path / "manifest.json").stat().st_ino
+
+    with loeo_publication_module.fold_lock(namespace, backend="windows") as publication:
+        loeo_publication_module.guard_namespace(publication)
+        assert publication.directory.identity == directory_identity
+        assert loeo_publication_module.publication_has(publication, "manifest.json")
+        assert loeo_publication_module._relative_json(
+            publication.directory, "manifest.json", "manifest"
+        ) == payload
+        assert (publication.path / "manifest.json").stat().st_ino == artifact_identity
+    assert _publication_temporaries(namespace.path) == []
 
 
 @pytest.mark.parametrize(
@@ -1416,12 +1494,12 @@ def test_fold_lock_rejects_dangling_fifo_and_special_without_escape_or_block(
     approved_fold, tmp_path: Path, kind: str
 ) -> None:
     del approved_fold
-    directory = Path(tempfile.mkdtemp(prefix="hqrc-lock-", dir="/private/tmp"))
+    directory = Path(tempfile.mkdtemp(prefix="hqrc-lock-", dir=tmp_path))
     try:
         lock_path = directory / ".loeo-fold.lock"
         if kind == "dangling":
             external_lock = tmp_path / "external-lock"
-            lock_path.symlink_to(external_lock)
+            _make_file_link(lock_path, external_lock)
             with pytest.raises(LOEOFoldError, match="lock|unsafe"):
                 with loeo_publication_module.fold_lock(directory):
                     pass
@@ -1429,6 +1507,8 @@ def test_fold_lock_rejects_dangling_fifo_and_special_without_escape_or_block(
             assert lock_path.is_symlink()
             return
         if kind == "fifo":
+            if not hasattr(os, "mkfifo"):
+                pytest.skip("FIFO entries are unavailable on this platform")
             os.mkfifo(lock_path)
             before = lock_path.lstat()
             command = (

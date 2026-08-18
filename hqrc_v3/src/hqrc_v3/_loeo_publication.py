@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import math
@@ -40,6 +39,18 @@ from hqrc_v3.bayes.samplers import (
 )
 from hqrc_v3.correction_source import ValidatedCorrectionSource
 from hqrc_v3.provenance import file_sha256
+from hqrc_v3.publication_fs import (
+    PublicationFSError,
+    TrustedDirectory,
+    atomic_write_bytes,
+    exclusive_lock,
+    guard_trusted_directory,
+    replace_entry,
+    require_local_entry,
+    trusted_directory,
+    unlink_entry,
+)
+from hqrc_v3.publication_fs import _fsync_file as _portable_fsync_file
 
 PRODUCT_FILES = {
     "hourly_predictions": "hourly_predictions.parquet",
@@ -314,25 +325,35 @@ def _posterior_metadata_matches(
 
 
 def _fsync_file(path: Path) -> None:
-    with path.open("rb") as stream:
-        os.fsync(stream.fileno())
+    _portable_fsync_file(path)
 
 
 def _safe_name(name: str) -> str:
-    if not name or name in {".", ".."} or "/" in name:
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
         raise LOEOFoldError("LOEO publication filename is unsafe")
     return name
 
 
-def _relative_file_fd(directory_fd: int, name: str) -> int:
+def _relative_file_fd(directory: TrustedDirectory, name: str) -> int:
+    guard_trusted_directory(directory)
     try:
-        descriptor = os.open(
-            _safe_name(name),
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=directory_fd,
-        )
+        safe = _safe_name(name)
+        if directory.backend == "posix":
+            descriptor = os.open(
+                safe,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory.descriptor,
+            )
+        else:
+            path = require_local_entry(directory.path / safe, kind="file")
+            descriptor = os.open(path, os.O_RDONLY)
         identity = os.fstat(descriptor)
-    except OSError as error:
+        if directory.backend == "windows":
+            current = path.stat(follow_symlinks=False)
+            guard_trusted_directory(directory)
+            if (current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino):
+                raise LOEOFoldError("LOEO publication file identity changed")
+    except (OSError, PublicationFSError) as error:
         raise LOEOFoldError("LOEO publication file is missing or unsafe") from error
     if not stat.S_ISREG(identity.st_mode):
         os.close(descriptor)
@@ -340,8 +361,8 @@ def _relative_file_fd(directory_fd: int, name: str) -> int:
     return descriptor
 
 
-def _relative_bytes(directory_fd: int, name: str) -> bytes:
-    descriptor = _relative_file_fd(directory_fd, name)
+def _relative_bytes(directory: TrustedDirectory, name: str) -> bytes:
+    descriptor = _relative_file_fd(directory, name)
     try:
         with os.fdopen(descriptor, "rb") as stream:
             descriptor = -1
@@ -351,33 +372,64 @@ def _relative_bytes(directory_fd: int, name: str) -> bytes:
             os.close(descriptor)
 
 
-def _relative_sha256(directory_fd: int, name: str) -> str:
-    return hashlib.sha256(_relative_bytes(directory_fd, name)).hexdigest()
+def _relative_sha256(directory: TrustedDirectory, name: str) -> str:
+    return hashlib.sha256(_relative_bytes(directory, name)).hexdigest()
+
+
+def _entry_exists(directory: TrustedDirectory, name: str) -> bool:
+    try:
+        if directory.backend == "posix":
+            os.stat(_safe_name(name), dir_fd=directory.descriptor, follow_symlinks=False)
+        else:
+            (directory.path / _safe_name(name)).stat(follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise LOEOFoldError("LOEO publication entry is unsafe") from error
 
 
 def publication_entries(publication: LOEOPublicationHandle) -> frozenset[str]:
     try:
-        return frozenset(os.listdir(publication.directory_fd))
-    except OSError as error:
+        guard_trusted_directory(publication.directory)
+        source = (
+            publication.directory.descriptor
+            if publication.directory.backend == "posix"
+            else publication.directory.path
+        )
+        entries = frozenset(os.listdir(source))
+        guard_trusted_directory(publication.directory)
+        return entries
+    except (OSError, PublicationFSError) as error:
         raise LOEOFoldError("LOEO publication directory is unreadable") from error
 
 
 def publication_has(publication: LOEOPublicationHandle, name: str) -> bool:
     try:
-        identity = os.stat(_safe_name(name), dir_fd=publication.directory_fd, follow_symlinks=False)
+        safe = _safe_name(name)
+        guard_trusted_directory(publication.directory)
+        if publication.directory.backend == "posix":
+            identity = os.stat(
+                safe,
+                dir_fd=publication.directory.descriptor,
+                follow_symlinks=False,
+            )
+        else:
+            identity = (publication.directory.path / safe).stat(follow_symlinks=False)
+        guard_trusted_directory(publication.directory)
     except FileNotFoundError:
         return False
-    except OSError as error:
+    except (OSError, PublicationFSError) as error:
         raise LOEOFoldError("LOEO publication entry is unsafe") from error
     return stat.S_ISREG(identity.st_mode)
 
 
 def relative_sha256(publication: LOEOPublicationHandle, name: str) -> str:
-    return _relative_sha256(publication.directory_fd, name)
+    return _relative_sha256(publication.directory, name)
 
 
-def _materialize_relative(directory_fd: int, name: str, destination: Path) -> None:
-    descriptor = _relative_file_fd(directory_fd, name)
+def _materialize_relative(directory: TrustedDirectory, name: str, destination: Path) -> None:
+    descriptor = _relative_file_fd(directory, name)
     try:
         with os.fdopen(descriptor, "rb") as source, destination.open("xb") as output:
             descriptor = -1
@@ -388,8 +440,8 @@ def _materialize_relative(directory_fd: int, name: str, destination: Path) -> No
             os.close(descriptor)
 
 
-def _relative_json(directory_fd: int, name: str, description: str) -> dict[str, Any]:
-    raw = _relative_bytes(directory_fd, name)
+def _relative_json(directory: TrustedDirectory, name: str, description: str) -> dict[str, Any]:
+    raw = _relative_bytes(directory, name)
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as error:
@@ -405,79 +457,54 @@ def _publish_bytes(
     payload: bytes,
     *,
     boundary: str,
-    directory_fd: int | None = None,
+    directory: TrustedDirectory | None = None,
 ) -> tuple[int, int]:
-    target_fd = publication.directory_fd if directory_fd is None else directory_fd
-    temporary = f".{_safe_name(name)}.{uuid.uuid4().hex}.tmp"
-    descriptor: int | None = None
-    identity: os.stat_result | None = None
-    temporary_unlinked = False
+    target = publication.directory if directory is None else directory
+    safe = _safe_name(name)
+    if _entry_exists(target, safe):
+        raise LOEOFoldError("LOEO publication target already exists")
+    temporary = f".{safe}.{uuid.uuid4().hex}.tmp"
+    temporary_identity: tuple[int, int] | None = None
+    published = False
     try:
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-            dir_fd=target_fd,
-        )
-        identity = os.fstat(descriptor)
-        if not stat.S_ISREG(identity.st_mode):
-            raise LOEOFoldError("LOEO publication temporary file is unsafe")
-        remaining = memoryview(payload)
-        while remaining:
-            written = os.write(descriptor, remaining)
-            if written <= 0:
-                raise OSError("LOEO publication temporary write made no progress")
-            remaining = remaining[written:]
-        os.fsync(descriptor)
+        atomic_write_bytes(target, temporary, payload)
+        temporary_descriptor = _relative_file_fd(target, temporary)
+        try:
+            identity = os.fstat(temporary_descriptor)
+            temporary_identity = (identity.st_dev, identity.st_ino)
+        finally:
+            os.close(temporary_descriptor)
         publication_boundary(boundary)
-        os.link(
-            temporary,
-            name,
-            src_dir_fd=target_fd,
-            dst_dir_fd=target_fd,
-            follow_symlinks=False,
-        )
-        temporary_identity = os.stat(temporary, dir_fd=target_fd, follow_symlinks=False)
-        target_descriptor = os.open(
-            name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=target_fd,
-        )
+        try:
+            guard_trusted_directory(target)
+        except PublicationFSError as error:
+            raise LOEOFoldError("LOEO publication namespace changed") from error
+        if _entry_exists(target, safe):
+            raise OSError("LOEO publication target already exists")
+        path = replace_entry(target, temporary, safe)
+        published = True
+        target_descriptor = _relative_file_fd(target, safe)
         try:
             target_identity = os.fstat(target_descriptor)
         finally:
             os.close(target_descriptor)
-        expected = (identity.st_dev, identity.st_ino)
-        if (
-            (temporary_identity.st_dev, temporary_identity.st_ino) != expected
-            or (target_identity.st_dev, target_identity.st_ino) != expected
-            or not stat.S_ISREG(target_identity.st_mode)
-        ):
-            raise LOEOFoldError("LOEO publication link identity changed")
-        os.unlink(temporary, dir_fd=target_fd)
-        temporary_unlinked = True
-        os.fsync(target_fd)
-        return expected
-    except OSError as error:
+        if path != target.path / safe or not stat.S_ISREG(target_identity.st_mode):
+            raise LOEOFoldError("LOEO publication identity changed")
+        return target_identity.st_dev, target_identity.st_ino
+    except (OSError, PublicationFSError) as error:
         raise LOEOFoldError("LOEO publication failed safely") from error
     finally:
-        if descriptor is not None and identity is not None and not temporary_unlinked:
+        if not published and temporary_identity is not None:
             try:
-                descriptor_identity = os.fstat(descriptor)
-                entry_identity = os.stat(temporary, dir_fd=target_fd, follow_symlinks=False)
-            except FileNotFoundError:
+                current_descriptor = _relative_file_fd(target, temporary)
+                try:
+                    current = os.fstat(current_descriptor)
+                finally:
+                    os.close(current_descriptor)
+                if (current.st_dev, current.st_ino) == temporary_identity:
+                    unlink_entry(target, temporary, missing_ok=True)
+            except (OSError, PublicationFSError, LOEOFoldError):
                 pass
-            else:
-                expected = (identity.st_dev, identity.st_ino)
-                if (
-                    stat.S_ISREG(descriptor_identity.st_mode)
-                    and (descriptor_identity.st_dev, descriptor_identity.st_ino) == expected
-                    and (entry_identity.st_dev, entry_identity.st_ino) == expected
-                ):
-                    os.unlink(temporary, dir_fd=target_fd)
-                    os.fsync(target_fd)
-        if descriptor is not None:
-            os.close(descriptor)
 
 
 def publish_json(
@@ -497,7 +524,7 @@ def publish_json(
 
 @contextmanager
 def _external_temporary(suffix: str):
-    with tempfile.TemporaryDirectory(prefix="hqrc-v3-task15d-", dir="/private/tmp") as root:
+    with tempfile.TemporaryDirectory(prefix="hqrc-v3-task15d-") as root:
         yield Path(root) / f"serialization{suffix}"
 
 
@@ -509,17 +536,38 @@ def _copy_external_file(
     _publish_bytes(publication, name, payload, boundary=boundary)
 
 
-def _open_or_create_child(publication: LOEOPublicationHandle, name: str) -> int:
+def _open_or_create_child(publication: LOEOPublicationHandle, name: str) -> TrustedDirectory:
     name = _safe_name(name)
+    guard_namespace(publication)
+    path = publication.path / name
     try:
-        os.mkdir(name, 0o700, dir_fd=publication.directory_fd)
+        if publication.directory.backend == "posix":
+            os.mkdir(name, 0o700, dir_fd=publication.directory.descriptor)
+        else:
+            path.mkdir(mode=0o700)
     except FileExistsError:
         pass
     except OSError as error:
         raise LOEOFoldError("LOEO child publication namespace is unsafe") from error
-    return _open_directory(
-        Path(name), "LOEO child publication namespace", dir_fd=publication.directory_fd
-    )
+    try:
+        return trusted_directory(
+            publication.directory.root,
+            path,
+            backend=publication.directory.backend,
+        )
+    except PublicationFSError as error:
+        raise LOEOFoldError("LOEO child publication namespace is unsafe") from error
+
+
+def _open_child(directory: TrustedDirectory, name: str) -> TrustedDirectory:
+    try:
+        return trusted_directory(
+            directory.root,
+            directory.path / _safe_name(name),
+            backend=directory.backend,
+        )
+    except PublicationFSError as error:
+        raise LOEOFoldError("LOEO child publication namespace is unsafe") from error
 
 
 def write_hqrc_checkpoint(
@@ -530,7 +578,7 @@ def write_hqrc_checkpoint(
 ) -> None:
     """Serialize HQRCData externally, then publish one held-dirfd generation."""
 
-    with tempfile.TemporaryDirectory(prefix="hqrc-v3-task15d-hqrc-", dir="/private/tmp") as root:
+    with tempfile.TemporaryDirectory(prefix="hqrc-v3-task15d-hqrc-") as root:
         external = Path(root)
         source_npz, source_metadata = write_hqrc_data(
             external / "hqrc_data.npz", data, settings=settings
@@ -564,17 +612,17 @@ def write_hqrc_checkpoint(
                 npz_name,
                 npz_payload,
                 boundary="hqrc-generation-npz-prewrite",
-                directory_fd=child_fd,
+                directory=child_fd,
             )
             _publish_bytes(
                 publication,
                 metadata_name,
                 metadata_payload,
                 boundary="hqrc-generation-metadata-prewrite",
-                directory_fd=child_fd,
+                directory=child_fd,
             )
         finally:
-            os.close(child_fd)
+            child_fd.close()
         publish_json(
             publication,
             "hqrc_data.current.json",
@@ -590,36 +638,6 @@ def require_real_directory(path: Path, description: str) -> None:
         raise LOEOFoldError(f"{description} is missing or unsafe") from error
     if not stat.S_ISDIR(identity.st_mode):
         raise LOEOFoldError(f"{description} is missing or unsafe")
-
-
-def _directory_flags() -> int:
-    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-
-
-def _open_directory(path: Path, description: str, *, dir_fd: int | None = None) -> int:
-    try:
-        descriptor = os.open(
-            path if dir_fd is None else path.name, _directory_flags(), dir_fd=dir_fd
-        )
-        identity = os.fstat(descriptor)
-    except OSError as error:
-        raise LOEOFoldError(f"{description} is missing or unsafe") from error
-    if not stat.S_ISDIR(identity.st_mode):
-        os.close(descriptor)
-        raise LOEOFoldError(f"{description} is missing or unsafe")
-    return descriptor
-
-
-def _ensure_directory_component(parent_fd: int, name: str, description: str) -> int:
-    if not name or name in {".", ".."} or "/" in name:
-        raise LOEOFoldError(f"{description} is unsafe")
-    try:
-        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
-    except FileExistsError:
-        pass
-    except OSError as error:
-        raise LOEOFoldError(f"{description} is unsafe") from error
-    return _open_directory(Path(name), description, dir_fd=parent_fd)
 
 
 @dataclass(frozen=True, slots=True)
@@ -638,75 +656,58 @@ class LOEONamespace:
 
 @dataclass(frozen=True, slots=True)
 class LOEOPublicationHandle:
-    """A locked final-directory descriptor plus its canonical path identity."""
+    """A locked trusted directory plus its canonical path identity."""
 
     namespace: LOEONamespace
-    directory_fd: int
+    directory: TrustedDirectory
 
     @property
     def path(self) -> Path:
         return self.namespace.path
 
 
-def _identity(descriptor: int, description: str) -> tuple[int, int]:
+def _open_namespace_final(
+    namespace: LOEONamespace, *, backend: str | None = None
+) -> TrustedDirectory:
     try:
-        current = os.fstat(descriptor)
-    except OSError as error:
-        raise LOEOFoldError(f"{description} descriptor is unavailable") from error
-    if not stat.S_ISDIR(current.st_mode):
-        raise LOEOFoldError(f"{description} is unsafe")
-    return current.st_dev, current.st_ino
-
-
-def _open_namespace_final(namespace: LOEONamespace) -> int:
-    descriptors: list[int] = []
-    try:
-        descriptors.append(_open_directory(namespace.root, "LOEO fold trusted output root"))
-        if _identity(descriptors[0], "LOEO fold trusted output root") != namespace.root_identity:
-            raise LOEOFoldError("LOEO fold trusted output root changed")
-        for component in namespace.components:
-            descriptors.append(
-                _open_directory(
-                    Path(component),
-                    "LOEO fold namespace component",
-                    dir_fd=descriptors[-1],
-                )
-            )
-        final = descriptors[-1]
-        if _identity(final, "LOEO fold result directory") != namespace.final_identity:
+        directory = trusted_directory(namespace.root, namespace.path, backend=backend)
+        root = trusted_directory(namespace.root, namespace.root, backend=directory.backend)
+        try:
+            if root.identity != namespace.root_identity:
+                raise LOEOFoldError("LOEO fold trusted output root changed")
+        finally:
+            root.close()
+        if directory.identity != namespace.final_identity:
+            directory.close()
             raise LOEOFoldError("LOEO fold namespace identity changed")
-        for descriptor in descriptors[:-1]:
-            os.close(descriptor)
-        return final
-    except Exception:
-        for descriptor in descriptors:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        raise
+        return directory
+    except PublicationFSError as error:
+        raise LOEOFoldError("LOEO fold namespace is missing or unsafe") from error
 
 
 def _namespace_for_existing_directory(directory: Path) -> LOEONamespace:
     path = Path(directory)
     if not path.is_absolute() or path.parent == path:
         raise LOEOFoldError("LOEO fold result directory requires an absolute trusted parent")
-    require_real_directory(path.parent, "LOEO fold trusted output root")
-    root_fd = _open_directory(path.parent, "LOEO fold trusted output root")
-    final_fd: int | None = None
+    root: TrustedDirectory | None = None
+    final: TrustedDirectory | None = None
     try:
-        final_fd = _open_directory(Path(path.name), "LOEO fold result directory", dir_fd=root_fd)
+        root = trusted_directory(path.parent, path.parent)
+        final = trusted_directory(path.parent, path, backend=root.backend)
         return LOEONamespace(
-            root=path.parent,
+            root=root.root,
             components=(path.name,),
-            path=path,
-            root_identity=_identity(root_fd, "LOEO fold trusted output root"),
-            final_identity=_identity(final_fd, "LOEO fold result directory"),
+            path=final.path,
+            root_identity=root.identity,
+            final_identity=final.identity,
         )
+    except PublicationFSError as error:
+        raise LOEOFoldError("LOEO fold result directory is missing or unsafe") from error
     finally:
-        if final_fd is not None:
-            os.close(final_fd)
-        os.close(root_fd)
+        if final is not None:
+            final.close()
+        if root is not None:
+            root.close()
 
 
 def guard_namespace(publication: LOEOPublicationHandle) -> None:
@@ -714,49 +715,46 @@ def guard_namespace(publication: LOEOPublicationHandle) -> None:
 
     if not isinstance(publication, LOEOPublicationHandle):
         raise TypeError("publication must be an LOEOPublicationHandle")
-    held_identity = _identity(publication.directory_fd, "LOEO fold result directory")
+    held_identity = publication.directory.identity
     if held_identity != publication.namespace.final_identity:
         raise LOEOFoldError("LOEO fold held namespace identity changed")
-    current_fd = _open_namespace_final(publication.namespace)
     try:
-        if _identity(current_fd, "LOEO fold result directory") != held_identity:
-            raise LOEOFoldError("LOEO fold namespace identity changed")
-    finally:
-        os.close(current_fd)
+        guard_trusted_directory(publication.directory)
+    except PublicationFSError as error:
+        raise LOEOFoldError("LOEO fold namespace identity changed") from error
 
 
 @contextmanager
-def fold_lock(directory: LOEONamespace | Path, *, lock_name: str = ".loeo-fold.lock"):
+def fold_lock(
+    directory: LOEONamespace | Path,
+    *,
+    lock_name: str = ".loeo-fold.lock",
+    backend: str | None = None,
+):
     namespace_value = (
         directory
         if isinstance(directory, LOEONamespace)
         else _namespace_for_existing_directory(Path(directory))
     )
-    directory_fd = _open_namespace_final(namespace_value)
-    lock_fd: int | None = None
-    locked = False
+    held = _open_namespace_final(namespace_value, backend=backend)
     try:
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-        try:
-            lock_fd = os.open(_safe_name(lock_name), flags, 0o600, dir_fd=directory_fd)
-            identity = os.fstat(lock_fd)
-        except OSError as error:
-            raise LOEOFoldError("LOEO fold result lock is unsafe") from error
-        if not stat.S_ISREG(identity.st_mode):
-            raise LOEOFoldError("LOEO fold result lock is unsafe")
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        locked = True
-        publication = LOEOPublicationHandle(namespace_value, directory_fd)
-        guard_namespace(publication)
-        yield publication
-    finally:
-        if lock_fd is not None:
+        evidence_name = _safe_name(lock_name)
+        if _entry_exists(held, evidence_name):
+            publication = LOEOPublicationHandle(namespace_value, held)
+            if not publication_has(publication, evidence_name):
+                raise LOEOFoldError("LOEO fold result lock is unsafe")
+        else:
             try:
-                if locked:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            finally:
-                os.close(lock_fd)
-        os.close(directory_fd)
+                atomic_write_bytes(held, evidence_name, b"")
+            except PublicationFSError as error:
+                raise LOEOFoldError("LOEO fold result lock is unsafe") from error
+        guard_name = f".loeo-lock-{hashlib.sha256(str(held.path).encode()).hexdigest()}.guard"
+        with exclusive_lock(namespace_value.root / guard_name):
+            publication = LOEOPublicationHandle(namespace_value, held)
+            guard_namespace(publication)
+            yield publication
+    finally:
+        held.close()
 
 
 def publication_boundary(_: str) -> None:
@@ -806,7 +804,7 @@ def write_posterior_checkpoint(
             "state": "POSTERIOR_COMPLETE",
             "causal": False,
             "identity_sha256": identity_sha256,
-            "posterior_sha256": _relative_sha256(publication.directory_fd, "posterior.nc"),
+            "posterior_sha256": _relative_sha256(publication.directory, "posterior.nc"),
             "diagnostics": _diagnostic_payload(diagnostics),
         },
         boundary="posterior-checkpoint-prewrite",
@@ -821,7 +819,7 @@ def _load_posterior_checkpoint(
     identity_sha256: str,
 ):
     checkpoint = _relative_json(
-        publication.directory_fd, "posterior.checkpoint.json", "LOEO posterior checkpoint"
+        publication.directory, "posterior.checkpoint.json", "LOEO posterior checkpoint"
     )
     if (
         set(checkpoint)
@@ -839,10 +837,10 @@ def _load_posterior_checkpoint(
         or checkpoint["identity_sha256"] != identity_sha256
     ):
         raise LOEOFoldError("LOEO posterior checkpoint differs")
-    if _relative_sha256(publication.directory_fd, "posterior.nc") != checkpoint["posterior_sha256"]:
+    if _relative_sha256(publication.directory, "posterior.nc") != checkpoint["posterior_sha256"]:
         raise LOEOFoldError("LOEO posterior checkpoint hash differs")
     with _external_temporary(".nc") as posterior_path:
-        _materialize_relative(publication.directory_fd, "posterior.nc", posterior_path)
+        _materialize_relative(publication.directory, "posterior.nc", posterior_path)
         try:
             idata = az.from_netcdf(posterior_path).load()
         except (OSError, ValueError) as error:
@@ -858,13 +856,9 @@ def _hqrc_generation_names(
     publication: LOEOPublicationHandle,
 ) -> tuple[dict[str, Any], str, str]:
     pointer = _relative_json(
-        publication.directory_fd, "hqrc_data.current.json", "LOEO HQRCData pointer"
+        publication.directory, "hqrc_data.current.json", "LOEO HQRCData pointer"
     )
-    generation_fd = _open_directory(
-        Path(".hqrc_data.generations"),
-        "LOEO HQRCData generation namespace",
-        dir_fd=publication.directory_fd,
-    )
+    generation_fd = _open_child(publication.directory, ".hqrc_data.generations")
     names: list[str] = []
     for key in ("npz", "metadata"):
         relative = pointer.get(key)
@@ -879,26 +873,27 @@ def _hqrc_generation_names(
             raise LOEOFoldError("LOEO HQRCData pointer path is unsafe")
         names.append(path.name)
     try:
-        if names[0] == names[1] or set(os.listdir(generation_fd)) != set(names):
+        source = (
+            generation_fd.descriptor
+            if generation_fd.backend == "posix"
+            else generation_fd.path
+        )
+        if names[0] == names[1] or set(os.listdir(source)) != set(names):
             raise LOEOFoldError("LOEO HQRCData generation namespace differs")
         for name in names:
             descriptor = _relative_file_fd(generation_fd, name)
             os.close(descriptor)
     finally:
-        os.close(generation_fd)
+        generation_fd.close()
     return pointer, names[0], names[1]
 
 
 def _load_hqrc_checkpoint(publication: LOEOPublicationHandle):
     pointer, npz_name, metadata_name = _hqrc_generation_names(publication)
-    generation_fd = _open_directory(
-        Path(".hqrc_data.generations"),
-        "LOEO HQRCData generation namespace",
-        dir_fd=publication.directory_fd,
-    )
+    generation_fd = _open_child(publication.directory, ".hqrc_data.generations")
     try:
         with tempfile.TemporaryDirectory(
-            prefix="hqrc-v3-task15d-load-", dir="/private/tmp"
+            prefix="hqrc-v3-task15d-load-"
         ) as root:
             directory = Path(root)
             child = directory / ".hqrc_data.generations"
@@ -908,31 +903,29 @@ def _load_hqrc_checkpoint(publication: LOEOPublicationHandle):
             (directory / "hqrc_data.current.json").write_bytes(canonical_json(pointer) + b"\n")
             return load_hqrc_data(directory / "hqrc_data.npz")
     finally:
-        os.close(generation_fd)
+        generation_fd.close()
 
 
 def _artifact_records(publication: LOEOPublicationHandle) -> dict[str, dict[str, str]]:
     _, data_npz, data_metadata = _hqrc_generation_names(publication)
     names = {
         "hqrc_data_pointer": (
-            publication.directory_fd,
+            publication.directory,
             "hqrc_data.current.json",
             "hqrc_data.current.json",
         ),
-        "posterior": (publication.directory_fd, "posterior.nc", "posterior.nc"),
+        "posterior": (publication.directory, "posterior.nc", "posterior.nc"),
         "posterior_checkpoint": (
-            publication.directory_fd,
+            publication.directory,
             "posterior.checkpoint.json",
             "posterior.checkpoint.json",
         ),
         **{
-            name: (publication.directory_fd, filename, filename)
+            name: (publication.directory, filename, filename)
             for name, filename in PRODUCT_FILES.items()
         },
     }
-    generation_fd = _open_directory(
-        Path(".hqrc_data.generations"), "LOEO HQRCData namespace", dir_fd=publication.directory_fd
-    )
+    generation_fd = _open_child(publication.directory, ".hqrc_data.generations")
     names["hqrc_data_npz"] = (generation_fd, data_npz, f".hqrc_data.generations/{data_npz}")
     names["hqrc_data_metadata"] = (
         generation_fd,
@@ -947,7 +940,7 @@ def _artifact_records(publication: LOEOPublicationHandle) -> dict[str, dict[str,
                 "sha256": _relative_sha256(descriptor, filename),
             }
     finally:
-        os.close(generation_fd)
+        generation_fd.close()
     return records
 
 
@@ -970,14 +963,14 @@ def _existing_downstream_matches(
 ) -> bool:
     if filename.endswith(".parquet"):
         with _external_temporary(".parquet") as temporary:
-            _materialize_relative(publication.directory_fd, filename, temporary)
+            _materialize_relative(publication.directory, filename, temporary)
             try:
                 actual = pl.read_parquet(temporary)
             except (OSError, pl.exceptions.PolarsError) as error:
                 raise LOEOFoldError("partial LOEO downstream product is unreadable") from error
         return isinstance(expected, pl.DataFrame) and _frames_equal(actual, expected)
     return (
-        _relative_json(publication.directory_fd, filename, "partial LOEO downstream JSON")
+        _relative_json(publication.directory, filename, "partial LOEO downstream JSON")
         == expected
     )
 
@@ -1050,14 +1043,14 @@ def _read_products(publication: LOEOPublicationHandle) -> LOEOFoldProducts:
     frames = []
     for name in (PRODUCT_FILES["hourly_predictions"], PRODUCT_FILES["metrics"]):
         with _external_temporary(".parquet") as temporary:
-            _materialize_relative(publication.directory_fd, name, temporary)
+            _materialize_relative(publication.directory, name, temporary)
             try:
                 frames.append(pl.read_parquet(temporary))
             except (OSError, pl.exceptions.PolarsError) as error:
                 raise LOEOFoldError("LOEO fold product is unreadable") from error
     hourly, metrics = frames
     summary = _relative_json(
-        publication.directory_fd,
+        publication.directory,
         PRODUCT_FILES["posterior_summary"],
         "LOEO posterior summary",
     )
@@ -1115,8 +1108,8 @@ def load_complete_material(
     directory = publication.path
     if publication_entries(publication) != COMPLETE_TOP:
         raise LOEOFoldError("completed LOEO fold directory contains unknown or partial entries")
-    manifest = _relative_json(publication.directory_fd, "manifest.json", "LOEO fold manifest")
-    complete = _relative_json(publication.directory_fd, "COMPLETE", "LOEO fold completion marker")
+    manifest = _relative_json(publication.directory, "manifest.json", "LOEO fold manifest")
+    complete = _relative_json(publication.directory, "COMPLETE", "LOEO fold completion marker")
     unsigned = {
         key: manifest[key]
         for key in ("schema_version", "state", "causal", "identity", "outputs", "rows")
@@ -1140,7 +1133,7 @@ def load_complete_material(
         or manifest.get("manifest_digest") != sha_json(unsigned)
         or complete
         != {
-            "manifest_sha256": _relative_sha256(publication.directory_fd, "manifest.json"),
+            "manifest_sha256": _relative_sha256(publication.directory, "manifest.json"),
             "state": "COMPLETE",
             "causal": False,
         }
@@ -1311,26 +1304,35 @@ def secure_namespace(output_root: Path, components: tuple[str, ...]) -> LOEOName
         raise LOEOFoldError("LOEO output root is unsafe") from error
     if not components:
         raise LOEOFoldError("LOEO output namespace components are empty")
-    require_real_directory(root, "LOEO output root")
-    root_fd = _open_directory(root, "LOEO output root")
-    root_identity = _identity(root_fd, "LOEO trusted output root")
-    current_fd = root_fd
-    final_identity: tuple[int, int] | None = None
+    root_directory: TrustedDirectory | None = None
+    current: TrustedDirectory | None = None
     try:
+        root_directory = trusted_directory(root, root)
+        current = root_directory
         for component in components:
-            next_fd = _ensure_directory_component(current_fd, component, "LOEO namespace component")
-            if current_fd != root_fd:
-                os.close(current_fd)
-            current_fd = next_fd
-        final_identity = _identity(current_fd, "LOEO result directory")
+            safe = _safe_name(component)
+            child = current.path / safe
+            try:
+                if current.backend == "posix":
+                    os.mkdir(safe, mode=0o700, dir_fd=current.descriptor)
+                else:
+                    child.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            if current is not root_directory:
+                current.close()
+            current = trusted_directory(root_directory.root, child, backend=root_directory.backend)
+        path = current.path
+        root_identity = root_directory.identity
+        final_identity = current.identity
+    except (OSError, PublicationFSError) as error:
+        raise LOEOFoldError("LOEO namespace component is unsafe") from error
     finally:
-        if current_fd != root_fd:
-            os.close(current_fd)
-        os.close(root_fd)
-    if final_identity is None:
-        raise LOEOFoldError("LOEO namespace could not be established")
-    path = root.joinpath(*components)
-    return LOEONamespace(root, components, path, root_identity, final_identity)
+        if current is not None and current is not root_directory:
+            current.close()
+        if root_directory is not None:
+            root_directory.close()
+    return LOEONamespace(root.resolve(), components, path, root_identity, final_identity)
 
 
 __all__ = [

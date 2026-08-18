@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
-import stat
-import tempfile
+import sys
 import uuid
 from hashlib import sha256
 from pathlib import Path
@@ -16,6 +16,16 @@ import numpy as np
 
 from hqrc_v3.bayes.model import HQRCData
 from hqrc_v3.provenance import file_sha256
+from hqrc_v3.publication_fs import (
+    PublicationFSError,
+    TrustedDirectory,
+    atomic_write_bytes,
+    guard_trusted_directory,
+    replace_entry,
+    require_local_entry,
+    trusted_directory,
+    unlink_entry,
+)
 
 _LEGACY_VERSION = 1
 _GENERATION_VERSION = 2
@@ -99,20 +109,19 @@ def _safe_json(value: object) -> object:
     raise HQRCArtifactError("settings must be JSON-safe")
 
 
-def _write_json_temporary(path: Path, value: dict[str, Any]) -> Path:
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+def _write_json_temporary(
+    directory: TrustedDirectory, path: Path, value: dict[str, Any]
+) -> Path:
+    name = f".{path.name}.{uuid.uuid4().hex}.tmp"
     try:
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(_canonical(value) + b"\n")
-            output.flush()
-            os.fsync(output.fileno())
-        return Path(temporary)
-    except Exception:
-        Path(temporary).unlink(missing_ok=True)
-        raise
+        return atomic_write_bytes(directory, name, _canonical(value) + b"\n")
+    except PublicationFSError as error:
+        raise HQRCArtifactError("HQRC current pointer temporary cannot be written") from error
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     descriptor: int | None = None
     try:
@@ -133,128 +142,61 @@ def _generation_directory(destination: Path) -> Path:
     return destination.with_name(f".{destination.stem}.generations")
 
 
-def _generation_namespace_identity(namespace: Path, parent: Path) -> os.stat_result:
-    try:
-        initial = namespace.lstat()
-    except OSError as error:
-        raise HQRCArtifactError("HQRC generation namespace is unavailable") from error
-    if stat.S_ISLNK(initial.st_mode) or not stat.S_ISDIR(initial.st_mode):
-        raise HQRCArtifactError("HQRC generation namespace must be a real directory")
-    try:
-        expected = parent.resolve(strict=True) / namespace.name
-        resolved = namespace.resolve(strict=True)
-        confirmed = namespace.lstat()
-    except OSError as error:
-        raise HQRCArtifactError("HQRC generation namespace cannot be resolved") from error
-    if (
-        resolved != expected
-        or stat.S_ISLNK(confirmed.st_mode)
-        or not stat.S_ISDIR(confirmed.st_mode)
-        or (confirmed.st_dev, confirmed.st_ino) != (initial.st_dev, initial.st_ino)
-    ):
-        raise HQRCArtifactError("HQRC generation namespace escapes its parent")
-    return confirmed
-
-
-def _open_generation_namespace(destination: Path) -> tuple[Path, int, tuple[int, int]]:
+def _open_generation_namespace(destination: Path) -> TrustedDirectory:
     parent = destination.parent
     namespace = _generation_directory(destination)
+    parent_directory: TrustedDirectory | None = None
     try:
-        namespace.lstat()
-    except FileNotFoundError:
+        parent_directory = trusted_directory(parent, parent)
         try:
-            os.mkdir(namespace, mode=0o700)
+            if parent_directory.backend == "posix":
+                os.mkdir(namespace.name, mode=0o700, dir_fd=parent_directory.descriptor)
+            else:
+                namespace.mkdir(mode=0o700)
         except FileExistsError:
             pass
-        except OSError as error:
-            raise HQRCArtifactError("HQRC generation namespace cannot be created") from error
-    except OSError as error:
-        raise HQRCArtifactError("HQRC generation namespace is unavailable") from error
-    path_identity = _generation_namespace_identity(namespace, parent)
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(namespace, flags)
-        held = os.fstat(descriptor)
-        if (
-            not stat.S_ISDIR(held.st_mode)
-            or (held.st_dev, held.st_ino) != (path_identity.st_dev, path_identity.st_ino)
-        ):
-            raise HQRCArtifactError("HQRC generation namespace changed while opening")
-        identity = (held.st_dev, held.st_ino)
-        _revalidate_generation_namespace(namespace, parent, descriptor, identity)
-        return namespace, descriptor, identity
-    except OSError as error:
-        if descriptor is not None:
-            os.close(descriptor)
+        directory = trusted_directory(parent, namespace, backend=parent_directory.backend)
+        guard_trusted_directory(directory)
+        return directory
+    except (OSError, PublicationFSError) as error:
         raise HQRCArtifactError("HQRC generation namespace cannot be opened safely") from error
-    except Exception:
-        if descriptor is not None:
-            os.close(descriptor)
-        raise
+    finally:
+        if parent_directory is not None:
+            parent_directory.close()
 
 
-def _revalidate_generation_namespace(
-    namespace: Path,
-    parent: Path,
-    descriptor: int,
-    identity: tuple[int, int],
-) -> None:
-    path_identity = _generation_namespace_identity(namespace, parent)
+def _revalidate_generation_namespace(directory: TrustedDirectory) -> None:
     try:
-        held = os.fstat(descriptor)
-    except OSError as error:
-        raise HQRCArtifactError("HQRC generation namespace descriptor is unavailable") from error
-    if (
-        not stat.S_ISDIR(held.st_mode)
-        or (held.st_dev, held.st_ino) != identity
-        or (path_identity.st_dev, path_identity.st_ino) != identity
-    ):
-        raise HQRCArtifactError("HQRC generation namespace identity changed")
+        guard_trusted_directory(directory)
+    except PublicationFSError as error:
+        raise HQRCArtifactError("HQRC generation namespace identity changed") from error
 
 
 def _relative_open_flags(base: int) -> int:
     return base | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
-def _create_relative_file(directory_fd: int, name: str) -> int:
+def _write_relative_json(directory: TrustedDirectory, name: str, value: dict[str, Any]) -> None:
     try:
-        return os.open(
-            name,
-            _relative_open_flags(os.O_RDWR | os.O_CREAT | os.O_EXCL),
-            0o600,
-            dir_fd=directory_fd,
-        )
-    except OSError as error:
-        raise HQRCArtifactError("HQRC generation temporary file cannot be created") from error
+        atomic_write_bytes(directory, name, _canonical(value) + b"\n")
+    except PublicationFSError as error:
+        raise HQRCArtifactError("HQRC generation temporary file cannot be written") from error
 
 
-def _write_relative_json(directory_fd: int, name: str, value: dict[str, Any]) -> None:
-    descriptor = _create_relative_file(directory_fd, name)
+def _relative_sha256(directory: TrustedDirectory, name: str) -> str:
     try:
-        with os.fdopen(descriptor, "wb") as output:
-            descriptor = -1
-            output.write(_canonical(value) + b"\n")
-            output.flush()
-            os.fsync(output.fileno())
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
-def _relative_sha256(directory_fd: int, name: str) -> str:
-    try:
-        descriptor = os.open(
-            name,
-            _relative_open_flags(os.O_RDONLY),
-            dir_fd=directory_fd,
-        )
-    except OSError as error:
+        guard_trusted_directory(directory)
+        if directory.backend == "posix":
+            descriptor = os.open(
+                name,
+                _relative_open_flags(os.O_RDONLY),
+                dir_fd=directory.descriptor,
+            )
+        else:
+            descriptor = os.open(
+                require_local_entry(directory.path / name, kind="file"), os.O_RDONLY
+            )
+    except (OSError, PublicationFSError) as error:
         raise HQRCArtifactError("HQRC generation file cannot be opened safely") from error
     try:
         digest = sha256()
@@ -268,31 +210,20 @@ def _relative_sha256(directory_fd: int, name: str) -> str:
             os.close(descriptor)
 
 
-def _replace_relative(directory_fd: int, source: str, destination: str) -> None:
+def _replace_relative(directory: TrustedDirectory, source: str, destination: str) -> None:
     try:
-        os.replace(
-            source,
-            destination,
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
-        )
-    except OSError as error:
+        replace_entry(directory, source, destination)
+    except PublicationFSError as error:
         raise HQRCArtifactError("HQRC generation file cannot be published") from error
 
 
-def _cleanup_relative(directory_fd: int, names: set[str]) -> None:
-    cleanup_error: OSError | None = None
+def _cleanup_relative(directory: TrustedDirectory, names: set[str]) -> None:
+    cleanup_error: PublicationFSError | None = None
     for name in sorted(names):
         try:
-            os.unlink(name, dir_fd=directory_fd)
-        except FileNotFoundError:
-            continue
-        except OSError as error:
+            unlink_entry(directory, name, missing_ok=True)
+        except PublicationFSError as error:
             cleanup_error = cleanup_error or error
-    try:
-        os.fsync(directory_fd)
-    except OSError as error:
-        cleanup_error = cleanup_error or error
     if cleanup_error is not None:
         raise HQRCArtifactError("HQRC generation cleanup failed") from cleanup_error
 
@@ -316,18 +247,17 @@ def write_hqrc_data(
     if destination.suffix != ".npz":
         raise HQRCArtifactError("HQRC data artifact must use .npz")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    generation_directory: Path
-    directory_fd: int | None = None
-    identity: tuple[int, int]
+    directory: TrustedDirectory | None = None
+    parent_directory: TrustedDirectory | None = None
     temporary_names: set[str] = set()
     generation_names: set[str] = set()
     temporary_pointer: Path | None = None
     pointer_published = False
     try:
-        generation_directory, directory_fd, identity = _open_generation_namespace(
-            destination
-        )
+        directory = _open_generation_namespace(destination)
+        generation_directory = directory.path
         _publication_boundary("generation-namespace-opened")
+        _revalidate_generation_namespace(directory)
         generation = uuid.uuid4().hex
         generation_npz_name = f"{generation}.npz"
         generation_metadata_name = f"{generation}.json"
@@ -344,44 +274,37 @@ def write_hqrc_data(
             "hour": np.asarray(data.hour, dtype=np.int64),
             "restriction": np.asarray(data.restriction, dtype=np.int64),
         }
-        descriptor = _create_relative_file(directory_fd, temporary_npz_name)
         try:
-            with os.fdopen(descriptor, "w+b") as artifact:
-                descriptor = -1
-                np.savez_compressed(artifact, **arrays)
-                artifact.flush()
-                os.fsync(artifact.fileno())
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
+            artifact = io.BytesIO()
+            np.savez_compressed(artifact, **arrays)
+            atomic_write_bytes(directory, temporary_npz_name, artifact.getvalue())
+        except PublicationFSError as error:
+            raise HQRCArtifactError("HQRC generation temporary file cannot be written") from error
         payload: dict[str, Any] = {
             "schema_version": _GENERATION_VERSION,
             "artifact_kind": _GENERATION_KIND,
             "generation": generation,
-            "npz_sha256": _relative_sha256(directory_fd, temporary_npz_name),
+            "npz_sha256": _relative_sha256(directory, temporary_npz_name),
             "arrays": {name: name for name in sorted(_ARRAYS)},
             "occurrence_ids": list(data.occurrence_ids),
             "settings": _safe_json(settings),
         }
         payload["artifact_sha256"] = _digest(payload)
         temporary_names.add(temporary_metadata_name)
-        _write_relative_json(directory_fd, temporary_metadata_name, payload)
+        _write_relative_json(directory, temporary_metadata_name, payload)
 
         _publication_boundary("before-generation-npz-publish")
         generation_names.add(generation_npz_name)
-        _replace_relative(directory_fd, temporary_npz_name, generation_npz_name)
+        _replace_relative(directory, temporary_npz_name, generation_npz_name)
         temporary_names.discard(temporary_npz_name)
         _publication_boundary("generation-npz-published")
         generation_names.add(generation_metadata_name)
         _replace_relative(
-            directory_fd, temporary_metadata_name, generation_metadata_name
+            directory, temporary_metadata_name, generation_metadata_name
         )
         temporary_names.discard(temporary_metadata_name)
         _publication_boundary("generation-metadata-published")
-        try:
-            os.fsync(directory_fd)
-        except OSError as error:
-            raise HQRCArtifactError("HQRC generation namespace cannot be synchronized") from error
+        _revalidate_generation_namespace(directory)
         _publication_boundary("generation-directory-synced")
 
         pointer_path = _pointer_path(destination)
@@ -391,40 +314,55 @@ def write_hqrc_data(
             "generation": generation,
             "npz": generation_npz.relative_to(destination.parent).as_posix(),
             "metadata": generation_metadata.relative_to(destination.parent).as_posix(),
-            "npz_sha256": _relative_sha256(directory_fd, generation_npz_name),
+            "npz_sha256": _relative_sha256(directory, generation_npz_name),
             "metadata_sha256": _relative_sha256(
-                directory_fd, generation_metadata_name
+                directory, generation_metadata_name
             ),
         }
         pointer["pointer_digest"] = _digest(pointer)
-        _revalidate_generation_namespace(
-            generation_directory, destination.parent, directory_fd, identity
+        _revalidate_generation_namespace(directory)
+        parent_directory = trusted_directory(
+            destination.parent, destination.parent, backend=directory.backend
         )
-        temporary_pointer = _write_json_temporary(pointer_path, pointer)
+        temporary_pointer = _write_json_temporary(parent_directory, pointer_path, pointer)
         _publication_boundary("before-pointer-swap")
-        _revalidate_generation_namespace(
-            generation_directory, destination.parent, directory_fd, identity
-        )
-        os.replace(temporary_pointer, pointer_path)
+        _revalidate_generation_namespace(directory)
+        try:
+            replace_entry(parent_directory, temporary_pointer.name, pointer_path.name)
+        except PublicationFSError as error:
+            raise HQRCArtifactError("HQRC current pointer cannot be published") from error
         temporary_pointer = None
         pointer_published = True
         _publication_boundary("pointer-swapped")
         _fsync_directory(destination.parent)
         _publication_boundary("parent-directory-synced")
     finally:
+        active_error = sys.exc_info()[0] is not None
         try:
-            if directory_fd is not None:
+            if directory is not None:
                 cleanup_names = set(temporary_names)
                 if not pointer_published:
                     cleanup_names.update(generation_names)
                 try:
                     if cleanup_names:
-                        _cleanup_relative(directory_fd, cleanup_names)
+                        try:
+                            _cleanup_relative(directory, cleanup_names)
+                        except HQRCArtifactError:
+                            if not active_error:
+                                raise
                 finally:
-                    os.close(directory_fd)
+                    directory.close()
         finally:
             if temporary_pointer is not None:
-                temporary_pointer.unlink(missing_ok=True)
+                try:
+                    if parent_directory is not None:
+                        unlink_entry(parent_directory, temporary_pointer.name, missing_ok=True)
+                    else:
+                        temporary_pointer.unlink(missing_ok=True)
+                except PublicationFSError:
+                    pass
+            if parent_directory is not None:
+                parent_directory.close()
     return generation_npz, generation_metadata
 
 

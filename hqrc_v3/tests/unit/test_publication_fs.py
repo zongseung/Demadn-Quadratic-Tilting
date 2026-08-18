@@ -11,9 +11,11 @@ from filelock import Timeout
 import hqrc_v3.publication_fs as publication_fs
 from hqrc_v3.publication_fs import (
     PublicationFSError,
+    atomic_write_bytes,
     exclusive_lock,
     require_local_entry,
     require_within,
+    trusted_directory,
 )
 
 
@@ -54,6 +56,17 @@ def _make_platform_link(link: Path, target: Path) -> Path:
         if completed.returncode:
             pytest.skip(f"cannot create a directory link or junction: {error}")
     return link
+
+
+def _trusted_windows_directory(tmp_path: Path):
+    root = tmp_path / "root"
+    target = root / "fold"
+    target.mkdir(parents=True)
+    return trusted_directory(root, target, backend="windows")
+
+
+def _raise_permission_error(*_args, **_kwargs):
+    raise PermissionError("injected replace failure")
 
 
 def test_exclusive_lock_blocks_a_spawned_writer(tmp_path):
@@ -114,3 +127,22 @@ def test_windows_fsync_directory_skips_unsupported_descriptor_open(tmp_path, mon
     )
 
     publication_fs._fsync_directory(tmp_path)
+
+
+def test_windows_backend_publishes_atomically_without_dir_fd(tmp_path):
+    root = tmp_path / "root"
+    target = root / "fold"
+    target.mkdir(parents=True)
+    directory = trusted_directory(root, target, backend="windows")
+    atomic_write_bytes(directory, "COMPLETE", b"ok\n")
+    assert (target / "COMPLETE").read_bytes() == b"ok\n"
+    assert not list(target.glob(".publication-*.tmp"))
+
+
+def test_windows_backend_preserves_existing_target_on_replace_failure(tmp_path, monkeypatch):
+    directory = _trusted_windows_directory(tmp_path)
+    (directory.path / "result.json").write_bytes(b"old")
+    monkeypatch.setattr(os, "replace", _raise_permission_error)
+    with pytest.raises(PublicationFSError):
+        atomic_write_bytes(directory, "result.json", b"new")
+    assert (directory.path / "result.json").read_bytes() == b"old"

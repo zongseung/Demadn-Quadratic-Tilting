@@ -14,6 +14,7 @@ import polars as pl
 import hqrc_v3._loeo_publication as publication_io
 from hqrc_v3._loeo_contract import sha_json
 from hqrc_v3._loeo_primary_types import LOEOPrimaryError, LOEOPrimaryProducts, LOEOPrimaryResult
+from hqrc_v3.publication_fs import PublicationFSError, unlink_entry
 
 PRODUCT_FILES = {
     "hourly_predictions": "hourly_predictions.parquet",
@@ -54,9 +55,9 @@ def _product_items(products: LOEOPrimaryProducts) -> tuple[tuple[str, pl.DataFra
 
 
 def _read_frame(publication: publication_io.LOEOPublicationHandle, name: str) -> pl.DataFrame:
-    with tempfile.TemporaryDirectory(prefix="hqrc-v3-task15e-read-", dir="/private/tmp") as root:
+    with tempfile.TemporaryDirectory(prefix="hqrc-v3-task15e-read-") as root:
         path = Path(root) / "artifact.parquet"
-        publication_io._materialize_relative(publication.directory_fd, name, path)
+        publication_io._materialize_relative(publication.directory, name, path)
         try:
             return pl.read_parquet(path)
         except (OSError, pl.exceptions.PolarsError) as error:
@@ -68,7 +69,7 @@ def _publish_frame(
     name: str,
     frame: pl.DataFrame,
 ) -> None:
-    with tempfile.TemporaryDirectory(prefix="hqrc-v3-task15e-write-", dir="/private/tmp") as root:
+    with tempfile.TemporaryDirectory(prefix="hqrc-v3-task15e-write-") as root:
         path = Path(root) / "artifact.parquet"
         frame.write_parquet(path)
         publication_io._fsync_file(path)
@@ -210,7 +211,7 @@ def validate_complete(
     for filename, frame in _product_items(products):
         _validate_product(publication, filename, frame)
     manifest = publication_io._relative_json(
-        publication.directory_fd, "manifest.json", "LOEO primary manifest"
+        publication.directory, "manifest.json", "LOEO primary manifest"
     )
     recorded_execution = _recorded_execution(
         manifest.get("fold_execution"), selected_occurrence_ids
@@ -222,7 +223,7 @@ def validate_complete(
         fold_execution=recorded_execution,
     )
     complete = publication_io._relative_json(
-        publication.directory_fd, "COMPLETE", "LOEO primary completion marker"
+        publication.directory, "COMPLETE", "LOEO primary completion marker"
     )
     if manifest != expected_manifest or complete != {
         "manifest_sha256": publication_io.relative_sha256(publication, "manifest.json"),
@@ -251,7 +252,7 @@ def _validate_ready(
     for filename, frame in _product_items(products):
         _validate_product(publication, filename, frame)
     manifest = publication_io._relative_json(
-        publication.directory_fd, "manifest.json", "LOEO primary manifest"
+        publication.directory, "manifest.json", "LOEO primary manifest"
     )
     recorded = _recorded_execution(manifest.get("fold_execution"), selected_occurrence_ids)
     if recorded != fold_execution or manifest != manifest_payload(
@@ -267,30 +268,23 @@ def _remove_owned_complete(
     publication: publication_io.LOEOPublicationHandle, owned: tuple[int, int]
 ) -> bool:
     try:
-        descriptor = os.open(
-            "COMPLETE",
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=publication.directory_fd,
-        )
-    except OSError:
+        descriptor = publication_io._relative_file_fd(publication.directory, "COMPLETE")
+    except ValueError:
         return False
     removed = False
     try:
         descriptor_identity = os.fstat(descriptor)
-        entry_identity = os.stat("COMPLETE", dir_fd=publication.directory_fd, follow_symlinks=False)
         current = (descriptor_identity.st_dev, descriptor_identity.st_ino)
-        if (
-            current == owned
-            and (entry_identity.st_dev, entry_identity.st_ino) == owned
-            and stat.S_ISREG(descriptor_identity.st_mode)
-        ):
-            os.unlink("COMPLETE", dir_fd=publication.directory_fd)
-            os.fsync(publication.directory_fd)
+        if current == owned and stat.S_ISREG(descriptor_identity.st_mode):
+            os.close(descriptor)
+            descriptor = -1
+            unlink_entry(publication.directory, "COMPLETE")
             removed = True
-    except OSError:
+    except (OSError, PublicationFSError):
         pass
     finally:
-        os.close(descriptor)
+        if descriptor >= 0:
+            os.close(descriptor)
     return removed
 
 
@@ -321,7 +315,7 @@ def publish_or_resume(
         for filename in present:
             if filename == "manifest.json":
                 partial_manifest = publication_io._relative_json(
-                    publication.directory_fd, filename, "partial LOEO primary manifest"
+                    publication.directory, filename, "partial LOEO primary manifest"
                 )
                 recorded_execution = _recorded_execution(
                     partial_manifest.get("fold_execution"), selected_occurrence_ids
@@ -352,7 +346,7 @@ def publish_or_resume(
             else:
                 _publish_frame(publication, filename, product_by_name[filename])
         manifest = publication_io._relative_json(
-            publication.directory_fd, "manifest.json", "LOEO primary manifest"
+            publication.directory, "manifest.json", "LOEO primary manifest"
         )
         recorded_execution = _recorded_execution(
             manifest.get("fold_execution"), selected_occurrence_ids

@@ -650,8 +650,13 @@ def test_partial_matrix_rejects_and_preserves_foreign_or_gapped_evidence(
     if kind in {"unknown", "gap"}:
         target.write_bytes(b"foreign")
     elif kind == "symlink":
-        target.symlink_to(outside)
+        try:
+            target.symlink_to(outside)
+        except OSError as error:
+            pytest.skip(f"cannot create a file symlink on this platform: {error}")
     else:
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO entries are unavailable on this platform")
         os.mkfifo(target)
     before = target.lstat()
     payload = (
