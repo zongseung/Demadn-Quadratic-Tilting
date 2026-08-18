@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -57,6 +59,27 @@ def test_fixed_two_cuda_queues_exclude_xgboost():
 
 def test_single_cuda_device_runs_all_models_in_one_sequential_queue():
     assert model_queues((3,)) == (("cuda:3", PAPER_MODELS),)
+
+
+@pytest.mark.parametrize("devices", ((1, 0), (2, 3)))
+def test_two_cuda_devices_require_physical_zero_then_one_before_validation_or_logs(
+    tmp_path, monkeypatch, devices
+):
+    calls = []
+    monkeypatch.setattr(
+        scheduler, "validate_correction_source", lambda **kwargs: calls.append(kwargs)
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_preflight_accelerator",
+        lambda *_args, **_kwargs: scheduler._ResolvedAccelerator("cpu", "cpu", None, "probe", None),
+    )
+    monkeypatch.setattr(scheduler, "_run_job", lambda job: scheduler._JobOutcome(job, 0))
+    request = _request(tmp_path, devices=devices)
+    with pytest.raises(AcceleratedRunError, match="exactly physical devices 0 then 1"):
+        run_accelerated_loeo(request)
+    assert calls == []
+    assert not request.output_root.exists()
 
 
 @pytest.mark.parametrize(
@@ -131,6 +154,7 @@ def test_invalid_smoke_sampler_contract_fails_before_validation_or_logs(
         ("paper", {"cores": 1.0}),
         ("paper", {"target_accept": float("nan")}),
         ("paper", {"target_accept": "0.99"}),
+        ("paper", {"target_accept": Fraction(99, 100)}),
         (
             "smoke",
             {"draws": 4.0, "tune": 4, "chains": 4, "cores": 1, "target_accept": 0.9},
@@ -357,6 +381,43 @@ def test_worker_tees_stdout_and_stderr_to_console_and_durable_log(tmp_path, monk
     assert calls[0][1]["env"]["CUDA_VISIBLE_DEVICES"] == "1"
 
 
+def test_worker_second_attempt_appends_delimiter_and_preserves_first_log(
+    tmp_path, monkeypatch, capsys
+):
+    request = _request(tmp_path)
+    job = scheduler._build_job(request, "svr", physical_device=1, device="cuda:0")
+    outputs = iter((("first\n",), ("second\n",)))
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = iter(next(outputs))
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(scheduler.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+    scheduler._run_job(job)
+    scheduler._run_job(job)
+
+    assert job.log_path.read_text() == (
+        "[CUDA 1 svr] first\n\n=== HQRC WORKER ATTEMPT ===\n[CUDA 1 svr] second\n"
+    )
+    assert capsys.readouterr().out == "[CUDA 1 svr] first\n[CUDA 1 svr] second\n"
+
+
+def test_restart_command_quotes_adversarial_paths_for_each_native_shell():
+    command = (
+        "python",
+        "--config",
+        "/tmp/source path/'quoted'/experiment.toml",
+        "literal;not-a-command",
+    )
+    assert scheduler._restart_command(command, platform_name="nt") == subprocess.list2cmdline(
+        command
+    )
+    assert scheduler._restart_command(command, platform_name="posix") == shlex.join(command)
+
+
 def test_windows_workers_import_and_report_positive_peak_rss():
     from hqrc_v3 import peak_rss
     from hqrc_v3.bayes import sampler_worker
@@ -428,6 +489,38 @@ def test_native_launchers_sync_locked_and_only_forward_to_shared_cli(
         "sync --project hqrc_v3 --extra accelerator --locked",
         f"run --project hqrc_v3 --extra accelerator --locked {expected}",
     ]
+
+
+@pytest.mark.parametrize(
+    ("script", "shell"),
+    [
+        ("run_hqrc_windows.ps1", "powershell"),
+        ("run_hqrc_linux.sh", r"C:\Program Files\Git\bin\bash.exe"),
+        ("run_hqrc_macos.sh", r"C:\Program Files\Git\bin\bash.exe"),
+    ],
+)
+@pytest.mark.parametrize("override", (("--profile", "smoke"), ("--profile=smoke",)))
+def test_native_launchers_reject_raw_profile_override_before_uv_sync(
+    tmp_path, script, shell, override
+):
+    scripts = Path(__file__).parents[3] / "scripts"
+    capture = tmp_path / "calls.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv.cmd").write_text(f'@echo %*>>"{capture}"\n')
+    uv_sh = fake_bin / "uv"
+    uv_sh.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{capture.as_posix()}"\n')
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    command = (
+        [shell, "-NoProfile", "-File", str(scripts / script), "paper", *override]
+        if shell == "powershell"
+        else [shell, str(scripts / script), "paper", *override]
+    )
+    result = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "profile is owned by the launcher action" in result.stderr
+    assert not capture.exists()
 
 
 def test_windows_launcher_translates_approved_named_parameters(tmp_path):

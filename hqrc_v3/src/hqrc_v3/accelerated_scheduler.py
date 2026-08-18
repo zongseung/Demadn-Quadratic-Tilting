@@ -6,12 +6,12 @@ import json
 import math
 import os
 import platform
+import shlex
 import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -99,9 +99,13 @@ def model_queues(devices: tuple[int, ...]) -> tuple[tuple[str, tuple[str, ...]],
         raise AcceleratedRunError("CUDA scheduling requires one or two unique non-negative devices")
     if len(devices) == 1:
         return ((f"cuda:{devices[0]}", PAPER_MODELS),)
+    if devices != (0, 1):
+        raise AcceleratedRunError(
+            "two-device scheduling requires exactly physical devices 0 then 1"
+        )
     return (
-        (f"cuda:{devices[0]}", ("lightgbm", "seq2seq_lstm")),
-        (f"cuda:{devices[1]}", ("svr", "transformer")),
+        ("cuda:0", ("lightgbm", "seq2seq_lstm")),
+        ("cuda:1", ("svr", "transformer")),
     )
 
 
@@ -121,7 +125,7 @@ def _exact_int(value: object, *, minimum: int) -> bool:
 
 def _exact_target(value: object, expected: float) -> bool:
     return (
-        isinstance(value, Real)
+        isinstance(value, (int, float))
         and not isinstance(value, bool)
         and math.isfinite(float(value))
         and float(value) == expected
@@ -379,7 +383,10 @@ def _run_job(job: _Job) -> _JobOutcome:
         if job.physical_device is not None
         else job.command[-1].upper()
     )
-    with job.log_path.open("w", encoding="utf-8", buffering=1) as log:
+    prior_evidence = job.log_path.is_file() and job.log_path.stat().st_size > 0
+    with job.log_path.open("a", encoding="utf-8", buffering=1) as log:
+        if prior_evidence:
+            log.write("\n=== HQRC WORKER ATTEMPT ===\n")
         try:
             process = subprocess.Popen(
                 job.command,
@@ -403,6 +410,14 @@ def _run_job(job: _Job) -> _JobOutcome:
         log.flush()
         os.fsync(log.fileno())
     return _JobOutcome(job, returncode)
+
+
+def _restart_command(command: tuple[str, ...], *, platform_name: str | None = None) -> str:
+    return (
+        subprocess.list2cmdline(command)
+        if (os.name if platform_name is None else platform_name) == "nt"
+        else shlex.join(command)
+    )
 
 
 def _result(
@@ -480,7 +495,7 @@ def run_accelerated_loeo(request: AcceleratedRequest) -> AcceleratedResult:
                 f"log={item.job.log_path} restart_env="
                 f"CUDA_VISIBLE_DEVICES={item.job.environment.get('CUDA_VISIBLE_DEVICES', 'unset')},"
                 f"HQRC_PHYSICAL_DEVICE={item.job.environment.get('HQRC_PHYSICAL_DEVICE', 'unset')} "
-                f"restart_command={subprocess.list2cmdline(item.job.command)}"
+                f"restart_command={_restart_command(item.job.command)}"
             )
         detail = "; ".join(details)
         raise AcceleratedRunError(f"accelerated LOEO failed: {detail}", result=result)

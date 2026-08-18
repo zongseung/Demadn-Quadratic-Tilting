@@ -20,6 +20,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+foreach ($Argument in $ForwardArgs) {
+    if ($Argument -eq "--profile" -or $Argument -like "--profile=*") {
+        [Console]::Error.WriteLine("profile is owned by the launcher action")
+        exit 2
+    }
+}
+
 uv sync --project hqrc_v3 --extra accelerator --locked
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

@@ -4,6 +4,12 @@ set -eu
 action=${1:?usage: run_hqrc_linux.sh import|proposal|smoke|paper|resume [arguments...]}
 shift
 
+for argument in "$@"; do
+    case "$argument" in
+        --profile|--profile=*) echo "profile is owned by the launcher action" >&2; exit 2 ;;
+    esac
+done
+
 uv sync --project hqrc_v3 --extra accelerator --locked
 
 case "$action" in
