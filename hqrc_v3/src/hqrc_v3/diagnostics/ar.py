@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import math
 import os
@@ -21,6 +20,8 @@ from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.tsa.stattools import acf, pacf
 
 from hqrc_v3.provenance import ArtifactMismatch
+from hqrc_v3.publication_fs import _fsync_directory as _portable_fsync_directory
+from hqrc_v3.publication_fs import exclusive_lock
 from hqrc_v3.splits import is_oof_split_id
 
 _SCHEMA_VERSION = "hqrc-v3.ar-calibration.v1"
@@ -632,12 +633,8 @@ def _lock_path(path: Path) -> Path:
 def _artifact_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
     lock_path = _lock_path(path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with exclusive_lock(lock_path):
+        yield
 
 
 def _write_atomic(path: Path, payload: dict[str, Any]) -> Path:
@@ -660,11 +657,7 @@ def _write_atomic(path: Path, payload: dict[str, Any]) -> Path:
                 destination.flush()
                 os.fsync(destination.fileno())
             os.replace(temporary, path)
-            directory = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            _portable_fsync_directory(path.parent)
         except Exception:
             temporary.unlink(missing_ok=True)
             raise

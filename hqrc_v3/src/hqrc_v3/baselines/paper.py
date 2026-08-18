@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -48,6 +47,7 @@ from hqrc_v3.oof import (
     generate_oof_stream,
 )
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
+from hqrc_v3.publication_fs import exclusive_lock
 from hqrc_v3.residuals import PredictionCache
 from hqrc_v3.splits import (
     AnnualFold,
@@ -1008,12 +1008,8 @@ def _expected_fit_units(
 @contextmanager
 def _publication_lock(directory: Path) -> Iterator[None]:
     directory.mkdir(parents=True, exist_ok=True)
-    with (directory / ".baseline-publication.lock").open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    with exclusive_lock(directory / ".baseline-publication.lock"):
+        yield
 
 
 def _temporary_path(directory: Path, suffix: str) -> Path:

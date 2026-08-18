@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import multiprocessing
 import os
@@ -10,8 +9,11 @@ from pathlib import Path
 
 import polars as pl
 import pytest
+from filelock import Timeout
+
 from hqrc_v3.contracts import DataContractError
 from hqrc_v3.provenance import ArtifactMismatch
+from hqrc_v3.publication_fs import exclusive_lock
 from hqrc_v3.residuals import PredictionCache
 
 
@@ -98,17 +100,11 @@ def _concurrent_write(
 
 
 def _probe_key_lock(lock_path: str, result_queue) -> None:
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            result_queue.put("blocked")
-        else:
+        with exclusive_lock(Path(lock_path), timeout=0):
             result_queue.put("acquired")
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-    finally:
-        os.close(descriptor)
+    except Timeout:
+        result_queue.put("blocked")
 
 
 def _join_or_terminate(process) -> None:

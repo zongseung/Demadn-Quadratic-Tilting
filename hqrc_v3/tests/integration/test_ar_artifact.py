@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import multiprocessing
 import threading
@@ -8,6 +7,8 @@ from dataclasses import replace
 from hashlib import sha256
 
 import pytest
+from filelock import Timeout
+
 from hqrc_v3.diagnostics.ar import (
     ARCalibration,
     ARCalibrationError,
@@ -19,6 +20,7 @@ from hqrc_v3.diagnostics.ar import (
     write_ar_diagnostics,
 )
 from hqrc_v3.provenance import ArtifactMismatch
+from hqrc_v3.publication_fs import exclusive_lock
 
 
 @pytest.fixture
@@ -250,11 +252,9 @@ def test_resealed_handcrafted_invalid_calibration_is_rejected(tmp_path, calibrat
 
 
 def _hold_artifact_lock(lock_path, acquired, release) -> None:
-    with open(lock_path, "a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    with exclusive_lock(lock_path):
         acquired.set()
         release.wait()
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def test_concurrent_incompatible_writers_leave_one_immutable_winner(tmp_path, calibration):
@@ -265,9 +265,9 @@ def test_concurrent_incompatible_writers_leave_one_immutable_winner(tmp_path, ca
     holder = context.Process(target=_hold_artifact_lock, args=(str(lock_path), acquired, release))
     holder.start()
     assert acquired.wait(timeout=10)
-    with open(lock_path, "a+", encoding="utf-8") as probe:
-        with pytest.raises(BlockingIOError):
-            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with pytest.raises(Timeout):
+        with exclusive_lock(lock_path, timeout=0):
+            pass
     changed = calibrate_beta_prior([0.3, 0.4, 0.5], event_ids=("event-a", "event-b", "event-c"))
     results: list[object] = []
 

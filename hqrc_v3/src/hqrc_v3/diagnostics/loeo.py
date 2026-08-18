@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import math
 import os
@@ -23,6 +22,7 @@ from hqrc_v3.correction_source import CorrectionSourceError, ValidatedCorrection
 from hqrc_v3.diagnostics.ar import EventResidualContext
 from hqrc_v3.events import EventOccurrence
 from hqrc_v3.provenance import file_sha256
+from hqrc_v3.publication_fs import exclusive_lock
 from hqrc_v3.residual_stage import STANDARDIZED_RESIDUAL_COLUMNS
 
 _SCHEMA_VERSION = "hqrc-v3.loeo-universe.v1"
@@ -304,12 +304,8 @@ def _publication_lock(root: Path) -> Iterator[None]:
     lock_path = root / ".loeo.lock"
     if lock_path.exists():
         _require_real_file(lock_path, "LOEO publication lock")
-    with lock_path.open("a+b") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    with exclusive_lock(lock_path):
+        yield
 
 
 def _context_mapping(context: EventResidualContext) -> dict[str, object]:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
 import re
 import stat
@@ -62,6 +61,7 @@ from hqrc_v3.diagnostics.loeo import (
     load_loeo_universe,
 )
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
+from hqrc_v3.publication_fs import exclusive_lock
 
 _SCHEMA_VERSION = "hqrc-v3.loeo-ar-set.v1"
 _APPROVED_SCHEMA_VERSION = "hqrc-v3.loeo-ar-approved-set.v1"
@@ -695,26 +695,8 @@ def _publication_lock(root: Path) -> Iterator[None]:
     else:
         if stat.S_ISLNK(existing_mode) or not stat.S_ISREG(existing_mode):
             raise LOEOARProposalError("LOEO AR publication lock is unsafe")
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
-    try:
-        descriptor = os.open(lock_path, flags, 0o600)
-    except OSError as error:
-        raise LOEOARProposalError("LOEO AR publication lock is unsafe") from error
-    locked = False
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise LOEOARProposalError("LOEO AR publication lock is unsafe")
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        locked = True
-        try:
-            yield
-        finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-            locked = False
-    finally:
-        if locked:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
+    with exclusive_lock(lock_path):
+        yield
 
 
 def _write_pointer(root: Path, proposal_set_sha256: str) -> None:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import math
@@ -47,6 +46,7 @@ from hqrc_v3.diagnostics.ar import (
 from hqrc_v3.evaluation.metrics import point_metric_frame, probabilistic_metric_frame
 from hqrc_v3.events import EventOccurrence
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
+from hqrc_v3.publication_fs import exclusive_lock
 
 _CAUSAL_SPLITS = tuple(f"oof-{year}" for year in range(2020, 2024))
 _HOLIDAY_INDEX = {"seollal": 0, "chuseok": 1}
@@ -640,12 +640,8 @@ def _context_lock(directory: Path):
     lock_path = candidate / ".correction.lock"
     if lock_path.is_symlink():
         raise CausalCorrectionError("correction context lock is unsafe")
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    with exclusive_lock(lock_path):
+        yield
 
 
 def _sampler_contract(

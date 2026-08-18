@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import math
@@ -45,6 +44,7 @@ from hqrc_v3.features import (
     history_columns,
 )
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
+from hqrc_v3.publication_fs import exclusive_lock
 from hqrc_v3.residuals import compute_fold_scale, standardize_event_residuals
 from hqrc_v3.splits import expanding_oof_folds, fold_for_split_id, is_oof_split_id
 
@@ -1100,12 +1100,8 @@ def _publication_lock(directory: Path) -> Iterator[None]:
     lock_path = directory / ".standardized-residuals.lock"
     if lock_path.is_symlink():
         raise ArtifactMismatch("standardized residual lock path is unsafe")
-    with lock_path.open("a+b") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    with exclusive_lock(lock_path):
+        yield
 
 
 def _temporary_path(directory: Path, suffix: str) -> Path:

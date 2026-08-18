@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import math
@@ -18,6 +17,9 @@ import polars as pl
 
 from hqrc_v3.contracts import PREDICTION_COLUMNS, DataContractError
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
+from hqrc_v3.publication_fs import _fsync_directory as _portable_fsync_directory
+from hqrc_v3.publication_fs import _fsync_file as _portable_fsync_file
+from hqrc_v3.publication_fs import exclusive_lock
 from hqrc_v3.splits import is_oof_split_id
 
 _RESIDUAL_COLUMNS = ("is_event", "residual_mw")
@@ -252,13 +254,8 @@ class PredictionCache:
 
         self._paths(key)
         lock_path = self.root / f".{key}.lock"
-        with lock_path.open("a+") as lock_file:
-            mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-            fcntl.flock(lock_file.fileno(), mode)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        with exclusive_lock(lock_path):
+            yield
 
     def _cleanup_stale_partial(self, key: str) -> None:
         """Remove only an incomplete pair while holding the exclusive key lock."""
@@ -373,8 +370,7 @@ class PredictionCache:
 
     @staticmethod
     def _fsync_file(path: Path) -> None:
-        with path.open("rb") as artifact:
-            os.fsync(artifact.fileno())
+        _portable_fsync_file(path)
 
     @staticmethod
     def _write_metadata(path: Path, metadata: Mapping[str, object]) -> None:
@@ -384,8 +380,4 @@ class PredictionCache:
             os.fsync(artifact.fileno())
 
     def _fsync_directory(self) -> None:
-        descriptor = os.open(self.root, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        _portable_fsync_directory(self.root)
