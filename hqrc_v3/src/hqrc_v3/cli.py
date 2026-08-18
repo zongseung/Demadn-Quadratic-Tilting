@@ -523,7 +523,11 @@ def _add_loeo_pipeline_options(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="hqrc", description="HQRC v3 staged forecasting pipeline")
+    parser = argparse.ArgumentParser(
+        prog="hqrc",
+        description="HQRC v3 staged forecasting pipeline",
+        allow_abbrev=False,
+    )
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     imported = subcommands.add_parser(
@@ -774,6 +778,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report.add_argument("--run-dir", required=True)
     report.add_argument("--profile", choices=("smoke", "paper"), required=True)
+    for subparser in subcommands.choices.values():
+        subparser.allow_abbrev = False
     return parser
 
 

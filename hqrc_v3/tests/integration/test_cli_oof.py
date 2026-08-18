@@ -286,6 +286,29 @@ def test_accelerated_cli_parses_scope_and_routes_without_importing_scheduler():
     assert parsed.accelerator == "auto"
 
 
+def test_accelerated_cli_rejects_abbreviated_profile_without_dispatch(capsys):
+    received = []
+    result = cli.main(
+        [
+            "run-loeo-accelerated",
+            "--source-run-dir",
+            "imported",
+            "--config",
+            "imported/sources/experiment.toml",
+            "--output-root",
+            "products",
+            "--profile",
+            "paper",
+            "--prof",
+            "smoke",
+        ],
+        handlers={"run-loeo-accelerated": received.append},
+    )
+    assert result == 2
+    assert received == []
+    assert "unrecognized arguments: --prof smoke" in capsys.readouterr().err
+
+
 def test_loeo_cli_handlers_preserve_pymc_init_and_leave_non_pymc_at_default(
     monkeypatch: pytest.MonkeyPatch,
 ):

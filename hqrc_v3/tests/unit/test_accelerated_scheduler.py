@@ -523,6 +523,36 @@ def test_native_launchers_reject_raw_profile_override_before_uv_sync(
     assert not capture.exists()
 
 
+@pytest.mark.parametrize(
+    ("script", "shell"),
+    [
+        ("run_hqrc_windows.ps1", "powershell"),
+        ("run_hqrc_linux.sh", r"C:\Program Files\Git\bin\bash.exe"),
+        ("run_hqrc_macos.sh", r"C:\Program Files\Git\bin\bash.exe"),
+    ],
+)
+def test_native_launchers_forward_profile_abbreviation_to_shared_parser(tmp_path, script, shell):
+    scripts = Path(__file__).parents[3] / "scripts"
+    capture = tmp_path / "calls.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv.cmd").write_text(f'@echo %*>>"{capture}"\n')
+    uv_sh = fake_bin / "uv"
+    uv_sh.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{capture.as_posix()}"\n')
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    command = (
+        [shell, "-NoProfile", "-File", str(scripts / script), "paper", "--prof", "smoke"]
+        if shell == "powershell"
+        else [shell, str(scripts / script), "paper", "--prof", "smoke"]
+    )
+    result = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    calls = capture.read_text().splitlines()
+    assert calls[0] == "sync --project hqrc_v3 --extra accelerator --locked"
+    assert calls[1].endswith("--prof smoke")
+
+
 def test_windows_launcher_translates_approved_named_parameters(tmp_path):
     scripts = Path(__file__).parents[3] / "scripts"
     capture = tmp_path / "calls.txt"
