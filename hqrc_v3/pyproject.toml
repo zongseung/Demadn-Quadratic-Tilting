@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hqrc-v3"
+version = "0.1.0"
+description = "Hierarchical Quadratic Tilting demand correction pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "arviz>=0.22.0",
+    "lightgbm>=4.6.0",
+    "numpy>=2.2.6",
+    "pandas>=2.3.2",
+    "polars>=1.38.1",
+    "pymc>=5.25.1",
+    "pytensor>=2.31.7",
+    "scikit-learn>=1.7.1",
+    "scipy>=1.15.3",
+    "statsmodels>=0.14.5",
+    "torch>=2.8.0",
+    "xarray>=2025.6.1",
+    "xgboost>=3.2.0",
+]
+
+[project.optional-dependencies]
+sampler-acceleration = ["nutpie"]
+
+[project.scripts]
+hqrc = "hqrc_v3.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "ruff>=0.15.5",
+]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["hqrc_v3", "hqrc_v3.*"]
+namespaces = false
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = ["slow: opt-in sampler smoke tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

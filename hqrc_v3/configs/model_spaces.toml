@@ -1,0 +1,75 @@
+schema_version = 2
+models = ["xgboost", "lightgbm", "svr", "seq2seq_lstm", "transformer"]
+validation_days = 61
+
+[preprocessing]
+version = "causal-v1"
+history_hours = 168
+future_path_hours = 24
+observed_columns = ["load_mw", "temperature_c", "relative_humidity"]
+b0_future_columns = ["hour", "day_of_week", "is_weekend", "annual_sin", "annual_cos", "weekly_sin", "weekly_cos"]
+b1_only_columns = ["is_public_holiday", "official_sequence_position", "seollal_distance", "chuseok_distance", "is_substitute_or_temporary_holiday", "is_seollal", "is_chuseok"]
+classical_input_scaler = "standard-population-featurewise"
+target_scaler = "standard-population"
+sequence_weather_scaler = "standard-population-featurewise"
+sequence_calendar_scaler = "standard-population-featurewise"
+scaler_fit_partition = "estimator-fit-only"
+classical_future_path = "full"
+classical_x_population = "daily-sample-rows"
+target_population = "unique-target-hours"
+sequence_weather_population = "unique-inferred-history-hours"
+sequence_calendar_population = "unique-future-hours-shared-history-future"
+
+[xgboost]
+objective = "reg:squarederror"
+eval_metric = "rmse"
+n_estimators = 600
+learning_rate = 0.03
+max_depth = 6
+min_child_weight = 3
+subsample = 0.9
+colsample_bytree = 0.8
+reg_lambda = 1.0
+tree_method = "hist"
+early_stopping_rounds = 35
+
+[lightgbm]
+objective = "regression"
+n_estimators = 800
+learning_rate = 0.025
+num_leaves = 31
+min_child_samples = 20
+subsample = 0.9
+subsample_freq = 1
+colsample_bytree = 0.8
+reg_lambda = 1.0
+early_stopping_rounds = 35
+
+[svr]
+kernel = "rbf"
+C = 10.0
+epsilon = 0.05
+gamma = "scale"
+cache_size = 512.0
+
+[seq2seq_lstm]
+hidden_size = 64
+layers = 2
+heads = 4
+dropout = 0.1
+learning_rate = 0.001
+batch_size = 64
+epochs = 60
+patience = 8
+seeds = [11, 23, 37, 41, 53]
+
+[transformer]
+hidden_size = 64
+layers = 1
+heads = 4
+dropout = 0.1
+learning_rate = 0.001
+batch_size = 64
+epochs = 60
+patience = 8
+seeds = [11, 23, 37, 41, 53]

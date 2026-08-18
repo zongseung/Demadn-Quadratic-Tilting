@@ -1,0 +1,700 @@
+"""Task 15B immutable LOEO universe and physical-fold contracts."""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+from dataclasses import replace
+from datetime import datetime, time, timedelta
+from hashlib import sha256
+from pathlib import Path
+
+import hqrc_v3.diagnostics.loeo as loeo_module
+import polars as pl
+import pytest
+from hqrc_v3.correction_source import ValidatedCorrectionSource
+from hqrc_v3.diagnostics.ar import EventResidualContext
+from hqrc_v3.diagnostics.loeo import (
+    LOEOError,
+    load_loeo_fold,
+    load_loeo_universe,
+    publish_loeo_universe,
+)
+from hqrc_v3.events import EventOccurrence
+from hqrc_v3.provenance import file_sha256
+from hqrc_v3.residual_stage import STANDARDIZED_RESIDUAL_COLUMNS
+
+CONTEXT = EventResidualContext(
+    "lightgbm", "B1", 7, tuple(f"oof-{year}" for year in range(2020, 2024))
+)
+
+
+def _events() -> tuple[EventOccurrence, ...]:
+    return (
+        EventOccurrence(
+            "seollal-2020",
+            "seollal",
+            datetime(2020, 1, 25).date(),
+            datetime(2020, 1, 24).date(),
+            datetime(2020, 1, 27).date(),
+            0,
+        ),
+        EventOccurrence(
+            "chuseok-2020",
+            "chuseok",
+            datetime(2020, 10, 1).date(),
+            datetime(2020, 9, 30).date(),
+            datetime(2020, 10, 2).date(),
+            1,
+        ),
+        EventOccurrence(
+            "seollal-2021",
+            "seollal",
+            datetime(2021, 2, 12).date(),
+            datetime(2021, 2, 11).date(),
+            datetime(2021, 2, 14).date(),
+            1,
+        ),
+        EventOccurrence(
+            "chuseok-2021",
+            "chuseok",
+            datetime(2021, 9, 21).date(),
+            datetime(2021, 9, 20).date(),
+            datetime(2021, 9, 22).date(),
+            1,
+        ),
+        EventOccurrence(
+            "seollal-2022",
+            "seollal",
+            datetime(2022, 2, 1).date(),
+            datetime(2022, 1, 31).date(),
+            datetime(2022, 2, 2).date(),
+            1,
+        ),
+        EventOccurrence(
+            "chuseok-2022",
+            "chuseok",
+            datetime(2022, 9, 10).date(),
+            datetime(2022, 9, 9).date(),
+            datetime(2022, 9, 11).date(),
+            0,
+        ),
+        EventOccurrence(
+            "seollal-2023",
+            "seollal",
+            datetime(2023, 1, 22).date(),
+            datetime(2023, 1, 21).date(),
+            datetime(2023, 1, 24).date(),
+            0,
+        ),
+        EventOccurrence(
+            "chuseok-2023",
+            "chuseok",
+            datetime(2023, 9, 29).date(),
+            datetime(2023, 9, 28).date(),
+            datetime(2023, 9, 30).date(),
+            0,
+        ),
+        EventOccurrence(
+            "seollal-2024",
+            "seollal",
+            datetime(2024, 2, 10).date(),
+            datetime(2024, 2, 9).date(),
+            datetime(2024, 2, 12).date(),
+            0,
+        ),
+        EventOccurrence(
+            "chuseok-2024",
+            "chuseok",
+            datetime(2024, 9, 17).date(),
+            datetime(2024, 9, 16).date(),
+            datetime(2024, 9, 18).date(),
+            0,
+        ),
+    )
+
+
+def _event_rows(event: EventOccurrence, *, split_id: str, scale: float) -> list[dict[str, object]]:
+    start = datetime.combine(event.window_start, time.min)
+    end = datetime.combine(event.window_end + timedelta(days=1), time.min)
+    return [
+        {
+            "origin": timestamp - timedelta(hours=1),
+            "target_timestamp": timestamp,
+            "horizon": 1,
+            "observed_mw": 100.0 + index,
+            "predicted_mw": 90.0,
+            "residual_mw": 10.0 + index,
+            "standardized_residual": (10.0 + index) / scale,
+            "sigma_n_mw": scale,
+            "model": CONTEXT.model,
+            "feature_set": CONTEXT.feature_set,
+            "seed": CONTEXT.seed,
+            "split_id": split_id,
+            "occurrence_id": event.occurrence_id,
+            "holiday_type": event.holiday_type,
+            "tau_days": (timestamp - datetime.combine(event.central_date, time.min)).total_seconds()
+            / 86400,
+            "hour": timestamp.hour,
+            "restriction": event.restriction,
+        }
+        for index, timestamp in enumerate(
+            start + timedelta(hours=offset)
+            for offset in range(int((end - start).total_seconds() // 3600))
+        )
+    ]
+
+
+@pytest.fixture
+def source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ValidatedCorrectionSource:
+    run = tmp_path / "source"
+    (run / "inputs").mkdir(parents=True)
+    (run / "predictions").mkdir()
+    (run / "inputs/.standardized-residuals.lock").touch()
+    (run / "predictions/.baseline-publication.lock").touch()
+    events = _events()
+    standardized = (
+        pl.DataFrame(
+            [
+                row
+                for event in events[:8]
+                for row in _event_rows(
+                    event,
+                    split_id=f"oof-{event.central_date.year}",
+                    scale=20.0 + event.central_date.year - 2020,
+                )
+            ]
+        )
+        .select(STANDARDIZED_RESIDUAL_COLUMNS)
+        .with_columns(pl.col("origin", "target_timestamp").cast(pl.Datetime("ns")))
+        .sort("target_timestamp")
+    )
+    final = (
+        pl.DataFrame(
+            [
+                {
+                    **row,
+                    "observed_mw": row["observed_mw"],
+                    "predicted_mw": row["predicted_mw"],
+                    "split_id": "final-2024",
+                }
+                for event in events[8:]
+                for row in _event_rows(event, split_id="final-2024", scale=23.0)
+            ]
+        )
+        .select(
+            [
+                "origin",
+                "target_timestamp",
+                "horizon",
+                "observed_mw",
+                "predicted_mw",
+                "model",
+                "feature_set",
+                "seed",
+                "split_id",
+            ]
+        )
+        .with_columns(pl.col("origin", "target_timestamp").cast(pl.Datetime("ns")))
+    )
+    for path, frame in (
+        (run / "inputs/standardized_residuals.parquet", standardized),
+        (run / "predictions/oof.parquet", pl.DataFrame(schema=final.schema)),
+        (run / "predictions/final_2024.parquet", final),
+        (run / "predictions/oof_members.parquet", pl.DataFrame(schema=final.schema)),
+        (run / "predictions/final_2024_members.parquet", pl.DataFrame(schema=final.schema)),
+    ):
+        frame.write_parquet(path)
+    source = ValidatedCorrectionSource(
+        run_dir=run,
+        source_profile="paper",
+        events=events,
+        source_paths={},
+        source_hashes={},
+        available_contexts=(CONTEXT,),
+        residual_manifest_path=run / "inputs/standardized_residuals_manifest.json",
+        residual_path=run / "inputs/standardized_residuals.parquet",
+        baseline_manifest_path=run / "predictions/baseline_manifest.json",
+        oof_members_path=run / "predictions/oof_members.parquet",
+        oof_point_path=run / "predictions/oof.parquet",
+        final_members_path=run / "predictions/final_2024_members.parquet",
+        final_point_path=run / "predictions/final_2024.parquet",
+        residual_sha256=file_sha256(run / "inputs/standardized_residuals.parquet"),
+        oof_members_sha256=file_sha256(run / "predictions/oof_members.parquet"),
+        oof_point_sha256=file_sha256(run / "predictions/oof.parquet"),
+        final_members_sha256=file_sha256(run / "predictions/final_2024_members.parquet"),
+        final_point_sha256=file_sha256(run / "predictions/final_2024.parquet"),
+        _residual_manifest_json=b'{"profile":"paper"}',
+        _baseline_manifest_json=b"{}",
+    )
+    monkeypatch.setattr(
+        ValidatedCorrectionSource,
+        "load_standardized_context",
+        lambda _self, context, *, through: (
+            standardized.clone()
+            if context == CONTEXT and through == 2023
+            else (_ for _ in ()).throw(AssertionError("wrong context"))
+        ),
+    )
+    monkeypatch.setattr(
+        ValidatedCorrectionSource,
+        "load_final_point_context",
+        lambda _self, context: (
+            final.clone()
+            if context == CONTEXT
+            else (_ for _ in ()).throw(AssertionError("wrong context"))
+        ),
+    )
+    return source
+
+
+def test_publish_exact_universe_and_physical_folds(
+    source: ValidatedCorrectionSource, tmp_path: Path
+):
+    published = publish_loeo_universe(source, CONTEXT, output_dir=tmp_path / "loeo")
+    universe = pl.read_parquet(published.universe_path)
+    assert published.occurrence_ids == tuple(event.occurrence_id for event in _events())
+    assert universe.height == 1_296
+    assert universe["causal"].unique().to_list() == [False]
+    assert universe.select("occurrence_id").unique(maintain_order=True)[
+        "occurrence_id"
+    ].to_list() == list(published.occurrence_ids)
+    oof = source.load_standardized_context(CONTEXT, through=2023)
+    for occurrence_id in (event.occurrence_id for event in _events()[:8]):
+        assert (
+            universe.filter(pl.col("occurrence_id") == occurrence_id)[
+                "standardized_residual"
+            ].to_list()
+            == oof.filter(pl.col("occurrence_id") == occurrence_id)[
+                "standardized_residual"
+            ].to_list()
+        )
+    for held_out in published.occurrence_ids:
+        fold = load_loeo_fold(
+            source, CONTEXT, output_dir=tmp_path / "loeo", held_out_occurrence_id=held_out
+        )
+        assert fold.path.is_file() and not fold.path.is_symlink()
+        assert (
+            fold.frame.height == 1_296 - universe.filter(pl.col("occurrence_id") == held_out).height
+        )
+        assert fold.frame["occurrence_id"].unique().to_list().count(held_out) == 0
+        assert fold.occurrence_ids == tuple(
+            value for value in published.occurrence_ids if value != held_out
+        )
+
+
+@pytest.mark.parametrize("occurrence_id", ["seollal-2024", "chuseok-2024"])
+def test_2024_uses_only_oof_2023_scale(
+    source: ValidatedCorrectionSource, tmp_path: Path, occurrence_id: str
+):
+    published = publish_loeo_universe(source, CONTEXT, output_dir=tmp_path / "loeo")
+    universe = pl.read_parquet(published.universe_path)
+    actual = universe.filter(pl.col("occurrence_id") == occurrence_id).row(0, named=True)
+    assert actual["residual_mw"] == actual["observed_mw"] - actual["predicted_mw"]
+    assert actual["sigma_n_mw"] == 23.0
+    assert actual["standardized_residual"] == actual["residual_mw"] / 23.0
+
+
+def test_held_out_mutation_cannot_change_its_training_fold(
+    source: ValidatedCorrectionSource, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    output = tmp_path / "original"
+    first = publish_loeo_universe(source, CONTEXT, output_dir=output)
+    held_out = "seollal-2024"
+    before = first.fold_sha256[held_out]
+    original = source.load_final_point_context(CONTEXT)
+    changed = original.with_columns(
+        pl.when(pl.col("target_timestamp") == original["target_timestamp"].item(0))
+        .then(pl.lit(9999.0))
+        .otherwise(pl.col("observed_mw"))
+        .alias("observed_mw")
+    )
+    monkeypatch.setattr(
+        ValidatedCorrectionSource,
+        "load_final_point_context",
+        lambda _self, _context: changed.clone(),
+    )
+    second = publish_loeo_universe(source, CONTEXT, output_dir=tmp_path / "changed")
+    assert second.fold_sha256[held_out] == before
+    assert second.universe_sha256 != first.universe_sha256
+
+
+def test_held_out_oof_mutation_cannot_change_its_training_fold(
+    source: ValidatedCorrectionSource, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    first = publish_loeo_universe(source, CONTEXT, output_dir=tmp_path / "original")
+    held_out = "seollal-2023"
+    original = source.load_standardized_context(CONTEXT, through=2023)
+    changed = original.with_columns(
+        pl.when(pl.col("occurrence_id") == held_out)
+        .then(pl.col("observed_mw") + 50.0)
+        .otherwise(pl.col("observed_mw"))
+        .alias("observed_mw")
+    )
+    monkeypatch.setattr(
+        ValidatedCorrectionSource,
+        "load_standardized_context",
+        lambda _self, _context, *, through: changed.clone() if through == 2023 else None,
+    )
+    second = publish_loeo_universe(source, CONTEXT, output_dir=tmp_path / "changed")
+    assert second.fold_sha256[held_out] == first.fold_sha256[held_out]
+    assert second.universe_sha256 != first.universe_sha256
+
+
+@pytest.mark.parametrize("held_out", [event.occurrence_id for event in _events()])
+def test_every_held_out_outcome_mutation_preserves_its_training_digest(
+    source: ValidatedCorrectionSource,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    held_out: str,
+):
+    first = publish_loeo_universe(source, CONTEXT, output_dir=tmp_path / "original")
+    if held_out.endswith("2024"):
+        original = source.load_final_point_context(CONTEXT)
+        event = next(event for event in _events() if event.occurrence_id == held_out)
+        target_times = [
+            row["target_timestamp"] for row in _event_rows(event, split_id="final-2024", scale=23.0)
+        ]
+        changed = original.with_columns(
+            pl.when(pl.col("target_timestamp").is_in(target_times))
+            .then(pl.col("observed_mw") + 7.0)
+            .otherwise(pl.col("observed_mw"))
+            .alias("observed_mw")
+        )
+        monkeypatch.setattr(
+            ValidatedCorrectionSource,
+            "load_final_point_context",
+            lambda _self, _context: changed.clone(),
+        )
+    else:
+        original = source.load_standardized_context(CONTEXT, through=2023)
+        changed = original.with_columns(
+            pl.when(pl.col("occurrence_id") == held_out)
+            .then(pl.col("observed_mw") + 7.0)
+            .otherwise(pl.col("observed_mw"))
+            .alias("observed_mw")
+        )
+        monkeypatch.setattr(
+            ValidatedCorrectionSource,
+            "load_standardized_context",
+            lambda _self, _context, *, through: changed.clone(),
+        )
+    second = publish_loeo_universe(source, CONTEXT, output_dir=tmp_path / "changed")
+    assert second.fold_sha256[held_out] == first.fold_sha256[held_out]
+
+
+def test_loader_rechecks_physical_fold_and_rejects_held_out_reinsertion(
+    source: ValidatedCorrectionSource, tmp_path: Path
+):
+    published = publish_loeo_universe(source, CONTEXT, output_dir=tmp_path / "loeo")
+    held_out = "chuseok-2024"
+    path = published.fold_paths[held_out]
+    row = (
+        pl.read_parquet(published.universe_path).filter(pl.col("occurrence_id") == held_out).head(1)
+    )
+    pl.concat([pl.read_parquet(path), row], how="vertical").write_parquet(path)
+    manifest = json.loads(published.manifest_path.read_bytes())
+    manifest["folds"][held_out]["sha256"] = file_sha256(path)
+    _rehash_manifest(published, tmp_path / "loeo", manifest)
+    with pytest.raises(LOEOError, match="held-out rows"):
+        load_loeo_fold(
+            source, CONTEXT, output_dir=tmp_path / "loeo", held_out_occurrence_id=held_out
+        )
+
+
+@pytest.mark.parametrize("with_pointer", [False, True])
+def test_completed_invalid_generation_is_preserved_on_recovery(
+    source: ValidatedCorrectionSource, tmp_path: Path, with_pointer: bool
+):
+    output = tmp_path / "loeo"
+    published = publish_loeo_universe(source, CONTEXT, output_dir=output)
+    if not with_pointer:
+        (output / "current.json").unlink()
+    published.universe_path.write_bytes(b"corrupt")
+    before = {
+        path.relative_to(published.generation_dir): file_sha256(path)
+        for path in published.generation_dir.rglob("*")
+        if path.is_file()
+    }
+    with pytest.raises(LOEOError):
+        publish_loeo_universe(source, CONTEXT, output_dir=output)
+    after = {
+        path.relative_to(published.generation_dir): file_sha256(path)
+        for path in published.generation_dir.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+@pytest.mark.parametrize("mutation", ["unknown", "symlink"])
+def test_completed_namespace_invalid_generation_is_preserved(
+    source: ValidatedCorrectionSource, tmp_path: Path, mutation: str
+):
+    output = tmp_path / "loeo"
+    published = publish_loeo_universe(source, CONTEXT, output_dir=output)
+    (output / "current.json").unlink()
+    if mutation == "unknown":
+        (published.generation_dir / "unexpected").write_bytes(b"evidence")
+    else:
+        target = tmp_path / "target"
+        target.write_bytes(b"evidence")
+        (published.generation_dir / "unexpected").symlink_to(target)
+    before = {
+        path.relative_to(published.generation_dir): file_sha256(path)
+        for path in published.generation_dir.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+    with pytest.raises(LOEOError, match="preserved"):
+        publish_loeo_universe(source, CONTEXT, output_dir=output)
+    after = {
+        path.relative_to(published.generation_dir): file_sha256(path)
+        for path in published.generation_dir.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+    assert after == before
+
+
+def _tree_state(root: Path) -> dict[str, tuple[object, ...]]:
+    state: dict[str, tuple[object, ...]] = {}
+
+    def record(path: Path) -> None:
+        mode = path.lstat().st_mode
+        relative = path.relative_to(root).as_posix() if path != root else "."
+        if stat.S_ISDIR(mode):
+            state[relative] = ("directory",)
+            for child in sorted(path.iterdir(), key=lambda candidate: candidate.name):
+                record(child)
+        elif stat.S_ISREG(mode):
+            content = path.read_bytes()
+            state[relative] = ("regular", content, file_sha256(path))
+        elif stat.S_ISLNK(mode):
+            state[relative] = ("symlink", os.readlink(path))
+        elif stat.S_ISFIFO(mode):
+            state[relative] = ("fifo",)
+        else:
+            state[relative] = ("special", stat.S_IFMT(mode))
+
+    record(root)
+    return state
+
+
+def test_nested_unknown_in_incomplete_generation_is_preserved(
+    source: ValidatedCorrectionSource, tmp_path: Path
+):
+    output = tmp_path / "loeo"
+    published = publish_loeo_universe(source, CONTEXT, output_dir=output)
+    (output / "current.json").unlink()
+    (published.generation_dir / "COMPLETE").unlink()
+    (published.generation_dir / "folds/unexpected").write_bytes(b"nested evidence")
+    before = _tree_state(published.generation_dir)
+
+    with pytest.raises(LOEOError, match="preserved"):
+        publish_loeo_universe(source, CONTEXT, output_dir=output)
+
+    assert _tree_state(published.generation_dir) == before
+
+
+def test_fifo_in_incomplete_generation_is_preserved(
+    source: ValidatedCorrectionSource, tmp_path: Path
+):
+    output = tmp_path / "loeo"
+    published = publish_loeo_universe(source, CONTEXT, output_dir=output)
+    (output / "current.json").unlink()
+    (published.generation_dir / "COMPLETE").unlink()
+    fifo = published.generation_dir / "folds/seollal-2024.parquet"
+    fifo.unlink()
+    os.mkfifo(fifo)
+    before = _tree_state(published.generation_dir)
+
+    with pytest.raises(LOEOError, match="preserved"):
+        publish_loeo_universe(source, CONTEXT, output_dir=output)
+
+    assert _tree_state(published.generation_dir) == before
+
+
+def _canonical_write(path: Path, value: object) -> None:
+    path.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
+
+
+def _rehash_manifest(published, output: Path, manifest: dict[str, object]) -> None:
+    unsigned = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    manifest["manifest_sha256"] = sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    _canonical_write(published.manifest_path, manifest)
+    _canonical_write(
+        published.generation_dir / "COMPLETE",
+        {"manifest_sha256": manifest["manifest_sha256"]},
+    )
+    current = json.loads((output / "current.json").read_bytes())
+    current["manifest_sha256"] = manifest["manifest_sha256"]
+    _canonical_write(output / "current.json", current)
+
+
+def test_loader_rejects_rehashed_semantic_universe_mutation(
+    source: ValidatedCorrectionSource, tmp_path: Path
+):
+    output = tmp_path / "loeo"
+    published = publish_loeo_universe(source, CONTEXT, output_dir=output)
+    mutated = pl.read_parquet(published.universe_path).with_columns(
+        pl.when(pl.int_range(pl.len()) == 0)
+        .then(pl.col("observed_mw") + 1.0)
+        .otherwise(pl.col("observed_mw"))
+        .alias("observed_mw")
+    )
+    mutated.write_parquet(published.universe_path)
+    manifest = json.loads(published.manifest_path.read_bytes())
+    manifest["universe"]["sha256"] = file_sha256(published.universe_path)
+    _rehash_manifest(published, output, manifest)
+
+    with pytest.raises(LOEOError, match="semantic"):
+        load_loeo_universe(source, CONTEXT, output_dir=output)
+
+
+def test_loader_rejects_rehashed_semantic_fold_mutation(
+    source: ValidatedCorrectionSource, tmp_path: Path
+):
+    output = tmp_path / "loeo"
+    published = publish_loeo_universe(source, CONTEXT, output_dir=output)
+    held_out = "chuseok-2024"
+    path = published.fold_paths[held_out]
+    pl.read_parquet(path).with_columns(
+        (pl.col("observed_mw") + 1.0).alias("observed_mw")
+    ).write_parquet(path)
+    manifest = json.loads(published.manifest_path.read_bytes())
+    manifest["folds"][held_out]["sha256"] = file_sha256(path)
+    _rehash_manifest(published, output, manifest)
+    with pytest.raises(LOEOError, match="semantic"):
+        load_loeo_fold(source, CONTEXT, output_dir=output, held_out_occurrence_id=held_out)
+
+
+def test_loader_rejects_rehashed_wrong_universe_path(
+    source: ValidatedCorrectionSource, tmp_path: Path
+):
+    output = tmp_path / "loeo"
+    published = publish_loeo_universe(source, CONTEXT, output_dir=output)
+    manifest = json.loads(published.manifest_path.read_bytes())
+    manifest["universe"]["path"] = "folds/seollal-2024.parquet"
+    _rehash_manifest(published, output, manifest)
+    with pytest.raises(LOEOError, match="manifest entry"):
+        load_loeo_universe(source, CONTEXT, output_dir=output)
+
+
+def test_loader_rejects_registry_substitution(
+    source: ValidatedCorrectionSource, tmp_path: Path
+):
+    output = tmp_path / "loeo"
+    publish_loeo_universe(source, CONTEXT, output_dir=output)
+    substituted = replace(source.events[0], restriction=1)
+    object.__setattr__(source, "events", (substituted, *source.events[1:]))
+    with pytest.raises(LOEOError, match="registry|metadata"):
+        load_loeo_universe(source, CONTEXT, output_dir=output)
+
+
+def test_incompatible_or_crashed_publication_cannot_be_reused(
+    source: ValidatedCorrectionSource, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    output = tmp_path / "loeo"
+    publish_loeo_universe(source, CONTEXT, output_dir=output)
+    changed = source.load_final_point_context(CONTEXT).with_columns(
+        (pl.col("predicted_mw") + 1.0).alias("predicted_mw")
+    )
+    monkeypatch.setattr(
+        ValidatedCorrectionSource,
+        "load_final_point_context",
+        lambda _self, _context: changed.clone(),
+    )
+    with pytest.raises(LOEOError, match="semantics|incompatible"):
+        publish_loeo_universe(source, CONTEXT, output_dir=output)
+
+    crashed = tmp_path / "crashed"
+    crashed.mkdir()
+    (crashed / "generations").mkdir()
+    recovered = publish_loeo_universe(source, CONTEXT, output_dir=crashed)
+    assert recovered.universe_path.is_file()
+
+
+@pytest.mark.parametrize("boundary", ["generation-rename", "pointer-rename"])
+def test_publication_crash_boundary_retries_safely(
+    source: ValidatedCorrectionSource,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+):
+    output = tmp_path / boundary
+    original_replace = os.replace
+
+    def interrupted_replace(source_path, destination_path):
+        destination = Path(destination_path)
+        should_interrupt = (
+            boundary == "generation-rename" and destination.parent.name == "generations"
+        ) or (boundary == "pointer-rename" and destination.name == "current.json")
+        if should_interrupt:
+            raise OSError("injected interruption")
+        return original_replace(source_path, destination_path)
+
+    monkeypatch.setattr(loeo_module.os, "replace", interrupted_replace)
+    with pytest.raises(OSError, match="injected interruption"):
+        publish_loeo_universe(source, CONTEXT, output_dir=output)
+
+    monkeypatch.setattr(loeo_module.os, "replace", original_replace)
+    recovered = publish_loeo_universe(source, CONTEXT, output_dir=output)
+    assert load_loeo_universe(source, CONTEXT, output_dir=output) == recovered
+
+
+def test_fold_loader_returns_the_hash_validated_physical_read(
+    source: ValidatedCorrectionSource, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    output = tmp_path / "loeo"
+    published = publish_loeo_universe(source, CONTEXT, output_dir=output)
+    held_out = "seollal-2024"
+    path = published.fold_paths[held_out]
+    expected = pl.read_parquet(path)
+    original_read = loeo_module.pl.read_parquet
+    reads = 0
+
+    def mutate_second_read(candidate):
+        nonlocal reads
+        frame = original_read(candidate)
+        if Path(candidate) == path:
+            reads += 1
+            if reads == 2:
+                return frame.with_columns((pl.col("observed_mw") + 1.0).alias("observed_mw"))
+        return frame
+
+    monkeypatch.setattr(loeo_module.pl, "read_parquet", mutate_second_read)
+    loaded = load_loeo_fold(source, CONTEXT, output_dir=output, held_out_occurrence_id=held_out)
+    assert loaded.frame.equals(expected, null_equal=True)
+    assert reads == 1
+
+
+@pytest.mark.parametrize("mutation", ["unknown", "symlink", "partial", "context", "order"])
+def test_publication_boundaries_fail_closed(
+    source: ValidatedCorrectionSource, tmp_path: Path, mutation: str
+):
+    output = tmp_path / "loeo"
+    published = publish_loeo_universe(source, CONTEXT, output_dir=output)
+    if mutation == "unknown":
+        (output / "unknown").write_text("bad")
+    elif mutation == "symlink":
+        target = tmp_path / "copy"
+        target.write_bytes(published.universe_path.read_bytes())
+        published.universe_path.unlink()
+        published.universe_path.symlink_to(target)
+    elif mutation == "partial":
+        (output / "current.json").unlink()
+    elif mutation == "context":
+        with pytest.raises(LOEOError):
+            load_loeo_universe(
+                source, replace(CONTEXT, split_ids=CONTEXT.split_ids[:-1]), output_dir=output
+            )
+        return
+    else:
+        frame = pl.read_parquet(published.universe_path)
+        frame.reverse().write_parquet(published.universe_path)
+        manifest = json.loads(published.manifest_path.read_bytes())
+        manifest["universe"]["sha256"] = file_sha256(published.universe_path)
+        _rehash_manifest(published, output, manifest)
+    with pytest.raises(LOEOError):
+        load_loeo_universe(source, CONTEXT, output_dir=output)

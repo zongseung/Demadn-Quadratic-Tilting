@@ -1,0 +1,7 @@
+[data]
+gap_days = 0
+
+[split]
+first_train_year = 2019
+oof_years = [2020, 2021, 2022, 2023]
+final_year = 2024
