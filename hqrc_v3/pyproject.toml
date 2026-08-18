@@ -26,6 +26,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+accelerator = ["pyro-ppl>=1.9.1"]
 sampler-acceleration = ["nutpie"]
 
 [project.scripts]
