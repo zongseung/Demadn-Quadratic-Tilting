@@ -61,7 +61,8 @@ def test_every_production_import_has_a_declared_distribution() -> None:
     )
     import_distributions = {
         "sklearn": "scikit-learn",
-        **{name: name for name in _production_imports() if name != "sklearn"},
+        "pyro": "pyro-ppl",
+        **{name: name for name in _production_imports() if name not in {"pyro", "sklearn"}},
     }
 
     assert set(import_distributions.values()) <= required | optional
@@ -81,7 +82,31 @@ def test_every_production_import_has_a_declared_distribution() -> None:
         "xgboost",
     } <= required
     assert "nutpie" in optional
+    assert {"filelock", "pyro-ppl"} <= required | optional
     assert {"pytest", "ruff"} <= _dependency_names(project["dependency-groups"]["dev"])
+
+
+def test_accelerator_extra_uses_official_platform_torch_source() -> None:
+    project = _load_toml(PROJECT_ROOT / "pyproject.toml")
+
+    assert project["project"]["optional-dependencies"]["accelerator"] == ["pyro-ppl>=1.9.1"]
+    assert project["tool"]["uv"]["sources"]["torch"] == [
+        {
+            "index": "pytorch-cu130",
+            "marker": "sys_platform == 'win32' or sys_platform == 'linux'",
+        },
+        {"index": "pypi", "marker": "sys_platform == 'darwin'"},
+    ]
+    assert {
+        "name": "pytorch-cu130",
+        "url": "https://download.pytorch.org/whl/cu130",
+        "explicit": True,
+    } in project["tool"]["uv"]["index"]
+    assert {
+        "name": "pypi",
+        "url": "https://pypi.org/simple",
+        "default": True,
+    } in project["tool"]["uv"]["index"]
 
 
 def test_root_workspace_lock_contains_the_installable_child() -> None:
@@ -92,3 +117,14 @@ def test_root_workspace_lock_contains_the_installable_child() -> None:
     assert root_project["tool"]["uv"]["workspace"]["members"] == ["hqrc_v3"]
     package = next(entry for entry in lock["package"] if entry["name"] == "hqrc-v3")
     assert package["source"] == {"editable": "hqrc_v3"}
+    torch_packages = [entry for entry in lock["package"] if entry["name"] == "torch"]
+    assert {entry["source"]["registry"] for entry in torch_packages} == {
+        "https://download.pytorch.org/whl/cu130",
+        "https://pypi.org/simple",
+    }
+    assert any(
+        "macosx" in wheel["url"]
+        for entry in torch_packages
+        if entry["source"]["registry"] == "https://pypi.org/simple"
+        for wheel in entry["wheels"]
+    )

@@ -7,7 +7,9 @@ import arviz as az
 import numpy as np
 import pymc as pm
 import pytest
+import torch
 
+from hqrc_v3.accelerators import DeviceProbe, ResolvedDevice
 from hqrc_v3.bayes.model import HQRCData
 from hqrc_v3.bayes.samplers import (
     SamplingDiagnostics,
@@ -85,9 +87,7 @@ def test_paper_profile_rejects_smoke_sampler_limits_before_model_build():
         sample_hqrc(None, None, draws=30, tune=30, chains=2, paper_profile=True)
 
 
-def test_pymc_sampler_uses_fixed_stable_initialization_and_records_geometry(
-    tmp_path, monkeypatch
-):
+def test_pymc_sampler_uses_fixed_stable_initialization_and_records_geometry(tmp_path, monkeypatch):
     data = HQRCData(
         observations=np.array([0.1, 0.2, 0.0, 0.2, 0.3, 0.1, -0.1, 0.0]),
         occurrence_index=np.repeat(np.arange(2), 4),
@@ -146,8 +146,11 @@ def test_pymc_sampler_uses_fixed_stable_initialization_and_records_geometry(
 def test_sampler_records_requested_cores_and_rejects_invalid_values(tmp_path, monkeypatch):
     data = HQRCData(
         observations=np.array([0.1, 0.2]),
-        occurrence_index=np.array([0, 0]), holiday_type_index=np.array([0, 0]),
-        tau_days=np.array([0.0, 1.0 / 24.0]), hour=np.array([0, 1]), restriction=np.array([0, 0]),
+        occurrence_index=np.array([0, 0]),
+        holiday_type_index=np.array([0, 0]),
+        tau_days=np.array([0.0, 1.0 / 24.0]),
+        hour=np.array([0, 1]),
+        restriction=np.array([0, 0]),
         occurrence_ids=("a",),
     )
     approved = SimpleNamespace(
@@ -166,10 +169,17 @@ def test_sampler_records_requested_cores_and_rejects_invalid_values(tmp_path, mo
         lambda *_args: __import__("contextlib").nullcontext(),
     )
     captured = {}
-    monkeypatch.setattr(pm, "sample", lambda **kwargs: captured.update(kwargs) or az.from_dict(
-        posterior={"event_log_likelihood": np.zeros((2, 2, 1))},
-        sample_stats={"diverging": np.zeros((2, 2), dtype=np.int8)},
-    ))
+    monkeypatch.setattr(
+        pm,
+        "sample",
+        lambda **kwargs: (
+            captured.update(kwargs)
+            or az.from_dict(
+                posterior={"event_log_likelihood": np.zeros((2, 2, 1))},
+                sample_stats={"diverging": np.zeros((2, 2), dtype=np.int8)},
+            )
+        ),
+    )
     monkeypatch.setattr(
         "hqrc_v3.bayes.samplers.validate_inference_data",
         lambda *_args, **_kwargs: SamplingDiagnostics(1.0, 1.0, 1.0, 0),
@@ -186,8 +196,11 @@ def test_sampler_records_requested_cores_and_rejects_invalid_values(tmp_path, mo
 def test_sample_hqrc_records_explicit_jitter_initialization(tmp_path, monkeypatch):
     data = HQRCData(
         observations=np.array([0.1, 0.2]),
-        occurrence_index=np.array([0, 0]), holiday_type_index=np.array([0, 0]),
-        tau_days=np.array([0.0, 1.0 / 24.0]), hour=np.array([0, 1]), restriction=np.array([0, 0]),
+        occurrence_index=np.array([0, 0]),
+        holiday_type_index=np.array([0, 0]),
+        tau_days=np.array([0.0, 1.0 / 24.0]),
+        hour=np.array([0, 1]),
+        restriction=np.array([0, 0]),
         occurrence_ids=("a",),
     )
     approved = SimpleNamespace(
@@ -206,10 +219,17 @@ def test_sample_hqrc_records_explicit_jitter_initialization(tmp_path, monkeypatc
         lambda *_args: __import__("contextlib").nullcontext(),
     )
     captured = {}
-    monkeypatch.setattr(pm, "sample", lambda **kwargs: captured.update(kwargs) or az.from_dict(
-        posterior={"event_log_likelihood": np.zeros((4, 2, 1))},
-        sample_stats={"diverging": np.zeros((4, 2), dtype=np.int8)},
-    ))
+    monkeypatch.setattr(
+        pm,
+        "sample",
+        lambda **kwargs: (
+            captured.update(kwargs)
+            or az.from_dict(
+                posterior={"event_log_likelihood": np.zeros((4, 2, 1))},
+                sample_stats={"diverging": np.zeros((4, 2), dtype=np.int8)},
+            )
+        ),
+    )
     monkeypatch.setattr(
         "hqrc_v3.bayes.samplers.validate_inference_data",
         lambda *_args, **_kwargs: SamplingDiagnostics(1.0, 800.0, 700.0, 0),
@@ -235,3 +255,210 @@ def test_paper_diagnostics_fail_closed_without_divergence_statistics():
     idata = az.from_dict(posterior={"phi": np.zeros((4, 8))})
     with pytest.raises(SamplingError, match="diverging"):
         validate_inference_data(idata, paper_profile=True)
+
+
+def test_pyro_runs_four_sequential_chains_and_exposes_pymc_posterior(tmp_path, monkeypatch):
+    data = HQRCData(
+        observations=np.array([0.1, 0.2, -0.1, 0.0]),
+        occurrence_index=np.array([0, 0, 1, 1]),
+        holiday_type_index=np.array([0, 0, 1, 1]),
+        tau_days=np.array([0.0, 1 / 24, 0.0, 1 / 24]),
+        hour=np.array([0, 1, 0, 1]),
+        restriction=np.array([0, 0, 1, 1]),
+        occurrence_ids=("a", "b"),
+    )
+    approved = SimpleNamespace(
+        artifact_path=tmp_path / "approved.json",
+        artifact_digest="digest",
+        residual_sha256="residual",
+        config_sha256="config",
+        event_sha256="event",
+        context=EventResidualContext("model", "B0", 5, ("oof-2020",)),
+        a=2.0,
+        b=3.0,
+    )
+    probe = DeviceProbe(success=True, detail="float64-gradient-lkj-ar")
+    resolved = ResolvedDevice(
+        kind="cuda",
+        logical_device="cuda:0",
+        physical_device="1",
+        probe=probe,
+    )
+    monkeypatch.setattr("hqrc_v3.bayes.samplers.require_approved_calibration", lambda value: value)
+    pymc_builds = []
+    monkeypatch.setattr(
+        "hqrc_v3.bayes.samplers.build_hqrc_model",
+        lambda *_args: pymc_builds.append(True) or __import__("contextlib").nullcontext(),
+    )
+    monkeypatch.setattr("hqrc_v3.bayes.samplers.resolve_device", lambda _request: resolved)
+    model = object()
+    monkeypatch.setattr("hqrc_v3.bayes.samplers.build_pyro_hqrc_model", lambda *a, **k: model)
+    calls = []
+
+    def fake_chain(selected_model, **kwargs):
+        calls.append((selected_model, kwargs))
+        draws = kwargs["draws"]
+
+        def repeated(value):
+            return value.to(torch.float64).expand((draws, *value.shape)).clone()
+
+        samples = {
+            "mu": repeated(torch.zeros((2, 3))),
+            "delta": repeated(torch.zeros((2, 3))),
+            "beta_offset": repeated(torch.zeros((2, 3))),
+            "between_scale_0": repeated(torch.ones(3)),
+            "between_scale_1": repeated(torch.ones(3)),
+            "between_corr_cholesky_0": repeated(torch.eye(3)),
+            "between_corr_cholesky_1": repeated(torch.eye(3)),
+            "sigma_gamma": repeated(torch.ones(2)),
+            "gamma_innovation_raw": repeated(torch.zeros((2, 23))),
+            "sigma_r": repeated(torch.tensor(0.8)),
+            "u_phi": repeated(torch.tensor(0.625)),
+        }
+        return samples, np.arange(draws, dtype=np.int8) % 2
+
+    monkeypatch.setattr("hqrc_v3.bayes.samplers._run_pyro_chain", fake_chain)
+    monkeypatch.setattr(
+        "hqrc_v3.bayes.samplers.validate_inference_data",
+        lambda *_args, **_kwargs: SamplingDiagnostics(1.0, 800.0, 700.0, 4),
+    )
+    versions = {"arviz": "test-arviz", "torch": "test-torch", "pyro-ppl": "test-pyro"}
+    monkeypatch.setattr("hqrc_v3.bayes.samplers.importlib.metadata.version", versions.__getitem__)
+
+    idata = sample_hqrc(
+        data,
+        approved,
+        draws=4,
+        tune=3,
+        chains=4,
+        cores=1,
+        seed=17,
+        backend="pyro",
+        device="auto",
+    )
+
+    assert [call[1]["seed"] for call in calls] == [17, 18, 19, 20]
+    assert not pymc_builds
+    assert all(call[0] is model and call[1]["num_chains"] == 1 for call in calls)
+    assert idata.posterior.sizes["chain"] == 4
+    assert idata.posterior.sizes["draw"] == 4
+    assert set(idata.posterior) == {
+        "mu",
+        "delta",
+        "beta_offset",
+        "sigma_gamma",
+        "gamma_innovation_raw",
+        "sigma_r",
+        "u_phi",
+        "between_cov_0",
+        "between_cov_1",
+        "between_cov_0_corr",
+        "between_cov_0_stds",
+        "between_cov_1_corr",
+        "between_cov_1_stds",
+        "between_cholesky",
+        "between_scale",
+        "beta",
+        "gamma_innovation",
+        "gamma",
+        "phi",
+        "event_log_likelihood",
+    }
+    assert idata.sample_stats["diverging"].dtype.kind in {"i", "u"}
+    np.testing.assert_array_equal(
+        idata.log_likelihood["event"], idata.posterior["event_log_likelihood"]
+    )
+    assert idata.attrs["hqrc_device"] == "cuda:0"
+    assert idata.attrs["hqrc_physical_device"] == "1"
+    assert idata.attrs["hqrc_dtype"] == "float64"
+    assert idata.attrs["hqrc_device_probe"] == "float64-gradient-lkj-ar"
+    assert idata.attrs["hqrc_chain_execution"] == "sequential"
+
+    fallback = ResolvedDevice(
+        kind="cpu",
+        logical_device="cpu",
+        physical_device=None,
+        probe=probe,
+        fallback_reason="unsupported op",
+    )
+    monkeypatch.setattr("hqrc_v3.bayes.samplers.resolve_device", lambda _request: fallback)
+    fallback_idata = sample_hqrc(
+        data,
+        approved,
+        draws=4,
+        tune=3,
+        chains=4,
+        cores=1,
+        seed=17,
+        backend="pyro",
+        device="auto",
+    )
+    assert fallback_idata.attrs["hqrc_device_fallback_reason"] == "unsupported op"
+
+
+def test_default_pymc_sampler_metadata_bytes_are_unchanged(tmp_path, monkeypatch):
+    data = HQRCData(
+        observations=np.array([0.1, 0.2]),
+        occurrence_index=np.array([0, 0]),
+        holiday_type_index=np.array([0, 0]),
+        tau_days=np.array([0.0, 1 / 24]),
+        hour=np.array([0, 1]),
+        restriction=np.array([0, 0]),
+        occurrence_ids=("a",),
+    )
+    approved = SimpleNamespace(
+        artifact_path=tmp_path / "approved.json",
+        artifact_digest="digest",
+        residual_sha256="residual",
+        config_sha256="config",
+        event_sha256="event",
+        context=EventResidualContext("model", "B0", 5, ("oof-2020",)),
+        a=2.0,
+        b=3.0,
+    )
+    monkeypatch.setattr("hqrc_v3.bayes.samplers.require_approved_calibration", lambda value: value)
+    monkeypatch.setattr(
+        "hqrc_v3.bayes.samplers.build_hqrc_model",
+        lambda *_args: __import__("contextlib").nullcontext(),
+    )
+    monkeypatch.setattr(
+        pm,
+        "sample",
+        lambda **_kwargs: az.from_dict(
+            posterior={"event_log_likelihood": np.zeros((2, 2, 1))},
+            sample_stats={"diverging": np.zeros((2, 2), dtype=np.int8)},
+        ),
+    )
+    monkeypatch.setattr(
+        "hqrc_v3.bayes.samplers.validate_inference_data",
+        lambda *_args, **_kwargs: SamplingDiagnostics(1.0, 1.0, 1.0, 0),
+    )
+    monkeypatch.setattr("hqrc_v3.bayes.samplers.importlib.metadata.version", lambda _: "test")
+
+    idata = sample_hqrc(data, approved, draws=2, tune=2, chains=2)
+
+    assert idata.attrs["hqrc_sampler_json"] == (
+        '{"chains": 2, "cores": 1, "draws": 2, '
+        '"geometry": "noncentered-cyclic-hour-rw1-v1", "init": "adapt_diag", '
+        '"paper_profile": false, "seed": 11, "target_accept": 0.9, "tune": 2}'
+    )
+    assert set(idata.attrs) == {
+        "hqrc_backend",
+        "hqrc_elapsed_seconds",
+        "hqrc_pymc_version",
+        "hqrc_arviz_version",
+        "hqrc_diagnostics_json",
+        "hqrc_sampler_json",
+        "hqrc_model_json",
+        "hqrc_calibration_json",
+    }
+    assert list(idata.attrs) == [
+        "hqrc_backend",
+        "hqrc_elapsed_seconds",
+        "hqrc_pymc_version",
+        "hqrc_arviz_version",
+        "hqrc_diagnostics_json",
+        "hqrc_sampler_json",
+        "hqrc_model_json",
+        "hqrc_calibration_json",
+    ]
