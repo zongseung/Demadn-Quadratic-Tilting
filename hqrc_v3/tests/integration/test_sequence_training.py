@@ -3,10 +3,11 @@ from __future__ import annotations
 import copy
 from dataclasses import replace
 
-import hqrc_v3.baselines.sequence as sequence
 import numpy as np
 import pytest
 import torch
+
+import hqrc_v3.baselines.sequence as sequence
 from hqrc_v3.baselines.sequence import SequenceTrainingConfig, fit_seed_ensemble
 from hqrc_v3.contracts import DataContractError
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pytest
+
 from hqrc_v3.contracts import DataContractError, ForecastMatrix
 from hqrc_v3.features import feature_columns
 from hqrc_v3.oof import fit_final_baseline, generate_expanding_oof

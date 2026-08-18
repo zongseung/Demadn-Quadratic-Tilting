@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import polars as pl
 import pytest
+
 from hqrc_v3.diagnostics.ar import (
     ARCalibrationError,
     calibrate_beta_prior,

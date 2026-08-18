@@ -6,10 +6,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
-import hqrc_v3.correction_source as source_module
 import numpy as np
 import polars as pl
 import pytest
+
+import hqrc_v3.correction_source as source_module
 from hqrc_v3.correction_source import (
     CorrectionSourceError,
     validate_correction_source,

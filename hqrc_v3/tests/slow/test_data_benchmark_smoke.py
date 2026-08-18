@@ -2,6 +2,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+
 from hqrc_v3.data import audit_hourly_data, read_hourly_data
 from hqrc_v3.evaluation.data_benchmark import (
     run_data_benchmark_worker,

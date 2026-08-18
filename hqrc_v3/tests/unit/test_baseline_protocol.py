@@ -4,9 +4,10 @@ import builtins
 import json
 from dataclasses import dataclass, replace
 
-import hqrc_v3.baselines.classical as classical
 import numpy as np
 import pytest
+
+import hqrc_v3.baselines.classical as classical
 from hqrc_v3.baselines.classical import (
     HorizonRegressor,
     make_classical_baseline,

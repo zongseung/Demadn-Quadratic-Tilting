@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 import polars as pl
 import pytest
+
 from hqrc_v3.contracts import PREDICTION_COLUMNS, DataContractError, validate_prediction_frame
 from hqrc_v3.splits import AnnualFold
 

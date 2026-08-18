@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 import polars as pl
 import pytest
+
 from hqrc_v3.contracts import DataContractError
 from hqrc_v3.residuals import compute_fold_scale, standardize_event_residuals
 

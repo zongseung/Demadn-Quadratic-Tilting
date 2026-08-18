@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import numpy as np
+
 from hqrc_v3.contracts import ForecastMatrix
 from hqrc_v3.splits import AnnualFold, expanding_oof_folds, final_fold, select_fold_samples
 

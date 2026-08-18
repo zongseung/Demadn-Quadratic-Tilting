@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+
 from hqrc_v3.bayes.predictive import (
     PredictiveShapeError,
     baseline_bootstrap_draws,

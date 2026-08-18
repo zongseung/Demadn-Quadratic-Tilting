@@ -5,11 +5,12 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
-import hqrc_v3.baselines as baselines
-import hqrc_v3.baselines.classical as classical
 import numpy as np
 import pytest
 import torch
+
+import hqrc_v3.baselines as baselines
+import hqrc_v3.baselines.classical as classical
 from hqrc_v3.baselines.classical import ClassicalBaseline
 from hqrc_v3.baselines.config import (
     MODEL_NAMES,

@@ -2,6 +2,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+
 from hqrc_v3.baselines.classical import make_classical_baseline, predictions_to_frame
 from hqrc_v3.data import audit_hourly_data, read_hourly_data
 from hqrc_v3.features import attach_calendar_features, build_daily_forecast_matrix

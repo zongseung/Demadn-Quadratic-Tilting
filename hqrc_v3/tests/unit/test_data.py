@@ -5,6 +5,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
+
 from hqrc_v3.contracts import DataContractError
 from hqrc_v3.data import (
     audit_hourly_data,

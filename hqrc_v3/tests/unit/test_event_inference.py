@@ -1,4 +1,5 @@
 import numpy as np
+
 from hqrc_v3.evaluation.inference import (
     bootstrap_event_median,
     hac_dm_test,

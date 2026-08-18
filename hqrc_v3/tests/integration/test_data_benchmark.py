@@ -6,9 +6,10 @@ import os
 import sys
 from pathlib import Path
 
-import hqrc_v3.evaluation.data_benchmark_worker as data_benchmark_worker
 import polars as pl
 import pytest
+
+import hqrc_v3.evaluation.data_benchmark_worker as data_benchmark_worker
 from hqrc_v3.bayes.benchmark import SamplerWorkerError, load_sampler_benchmark
 from hqrc_v3.evaluation.data_benchmark import (
     DataBenchmarkError,

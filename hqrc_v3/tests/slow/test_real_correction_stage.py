@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import pytest
+
 from hqrc_v3.bayes.samplers import PYMC_INITIALIZATION, SAMPLER_GEOMETRY
 from hqrc_v3.correction_stage import (
     fit_causal_2024_correction,

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pytest
+
 from hqrc_v3.contracts import ForecastMatrix
 from hqrc_v3.features import feature_columns
 from hqrc_v3.oof import cache_key, generate_cached_final, generate_oof_stream

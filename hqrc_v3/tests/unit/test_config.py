@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+
 from hqrc_v3.config import ConfigError, SplitConfig, load_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]

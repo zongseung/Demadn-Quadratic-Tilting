@@ -2,6 +2,7 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
+
 from hqrc_v3.events import EventRegistryError, load_event_registry, load_holiday_calendar
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]

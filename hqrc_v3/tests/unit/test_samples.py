@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import numpy as np
+
 from hqrc_v3.features import (
     attach_calendar_features,
     build_daily_forecast_matrix,

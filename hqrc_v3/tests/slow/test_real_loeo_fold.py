@@ -11,6 +11,7 @@ import arviz as az
 import numpy as np
 import polars as pl
 import pytest
+
 from hqrc_v3._loeo_posterior import validate_h3_posterior
 from hqrc_v3.bayes.artifacts import load_hqrc_data
 from hqrc_v3.correction_source import validate_correction_source

@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 
 import polars as pl
 import pytest
+
 from hqrc_v3.events import EventOccurrence
 
 

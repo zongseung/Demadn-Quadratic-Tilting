@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from hqrc_v3.bayes.model import stationary_ar1_logp_numpy
 from scipy import stats
+
+from hqrc_v3.bayes.model import stationary_ar1_logp_numpy
 
 
 def test_stationary_ar1_logp_resets_at_segments():

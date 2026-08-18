@@ -10,9 +10,10 @@ from datetime import datetime, time, timedelta
 from hashlib import sha256
 from pathlib import Path
 
-import hqrc_v3.diagnostics.loeo as loeo_module
 import polars as pl
 import pytest
+
+import hqrc_v3.diagnostics.loeo as loeo_module
 from hqrc_v3.correction_source import ValidatedCorrectionSource
 from hqrc_v3.diagnostics.ar import EventResidualContext
 from hqrc_v3.diagnostics.loeo import (

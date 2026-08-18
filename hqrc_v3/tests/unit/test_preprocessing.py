@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
+
 from hqrc_v3.baselines.preprocessing import (
     fit_classical_preprocessor,
     fit_sequence_preprocessor,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+
 from hqrc_v3.bayes.artifacts import write_hqrc_data
 from hqrc_v3.bayes.benchmark import run_sampler_worker, write_sampler_request
 from hqrc_v3.bayes.model import HQRCData

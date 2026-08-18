@@ -6,6 +6,7 @@ import numpy as np
 import pymc as pm
 import pytensor.tensor as pt
 import pytest
+
 from hqrc_v3.bayes.model import (
     HQRCData,
     HQRCModelOptions,

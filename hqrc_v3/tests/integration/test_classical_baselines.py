@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import hqrc_v3.baselines.classical as classical
 import numpy as np
 import pytest
+
+import hqrc_v3.baselines.classical as classical
 from hqrc_v3.baselines.classical import make_classical_baseline
 from hqrc_v3.contracts import ForecastMatrix
 
