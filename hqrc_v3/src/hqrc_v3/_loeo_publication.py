@@ -84,6 +84,7 @@ def sampler_contract(
     *,
     root_seed: int,
     held_out_occurrence_id: str,
+    variant: str = "H3",
     draws: int | None,
     tune: int | None,
     chains: int | None,
@@ -91,7 +92,9 @@ def sampler_contract(
     init: str | None = None,
     target_accept: float | None = None,
 ) -> dict[str, object]:
-    derived_seed = derive_loeo_seed(root_seed, f"H3-fold-sampler:{held_out_occurrence_id}")
+    if variant not in {"H1", "H2", "H3"}:
+        raise LOEOFoldError("LOEO sampler variant must be H1, H2, or H3")
+    derived_seed = derive_loeo_seed(root_seed, f"{variant}-fold-sampler:{held_out_occurrence_id}")
     if profile == "paper":
         resolved = (
             1_000 if draws is None else draws,

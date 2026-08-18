@@ -665,6 +665,51 @@ def test_products_use_known_restriction_one_ar_reset_and_exactly_one_noise_term(
     np.testing.assert_allclose(formula_e, 0.25)
 
 
+@pytest.mark.parametrize(
+    ("variant", "expected"),
+    (
+        ("H1", lambda tau: np.full(tau.size, 1.0)),
+        ("H2", lambda tau: 1.0 + 0.5 * tau + 0.1 * tau**2),
+    ),
+)
+def test_h1_h2_products_apply_the_declared_shape_without_hour_profile(
+    approved_fold,
+    monkeypatch: pytest.MonkeyPatch,
+    variant: str,
+    expected,
+) -> None:
+    source, publication, approved = approved_fold
+    inputs = prepare_loeo_fold_inputs(
+        source,
+        publication,
+        approved,
+        held_out_occurrence_id="seollal-2024",
+    )
+    idata = _fake_idata(inputs)
+    monkeypatch.setattr(
+        loeo_products_module,
+        "draw_new_event_correction",
+        lambda _posterior, **kwargs: np.broadcast_to(
+            np.asarray([1.0, 0.5, 0.1]), (kwargs["draws"], 3)
+        ).copy(),
+    )
+    monkeypatch.setattr(
+        loeo_products_module,
+        "simulate_stationary_ar1",
+        lambda *, phi, sigma, horizon, seed: np.zeros((np.asarray(phi).size, horizon)),
+    )
+    products = generate_loeo_fold_products(
+        inputs,
+        idata,
+        variant=variant,
+        predictive_seed=913,
+        predictive_draws=8,
+    )
+    tau = inputs.held_out.frame["tau_days"].to_numpy()
+    np.testing.assert_allclose(products.hourly_predictions["q_mean_standardized"], expected(tau))
+    assert products.posterior_summary["variant"] == variant
+
+
 def test_checkpoint_recovery_complete_reuse_namespaces_and_fail_closed_products(
     approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -886,9 +931,11 @@ def test_recovery_resamples_from_verified_input_only_checkpoint(
         fit_loeo_fold(source, publication, approved, **kwargs)
     assert calls == []
     directory = next((tmp_path / "input-only").rglob("hqrc_data.current.json")).parent
-    assert {
-        entry.name for entry in directory.iterdir()
-    } == {".loeo-fold.lock", ".hqrc_data.generations", "hqrc_data.current.json"}
+    assert {entry.name for entry in directory.iterdir()} == {
+        ".loeo-fold.lock",
+        ".hqrc_data.generations",
+        "hqrc_data.current.json",
+    }
     cache_before = _tree_snapshot(directory)
 
     monkeypatch.setattr(loeo_publication_module, "publication_boundary", lambda _name: None)
@@ -1094,9 +1141,7 @@ def test_sampler_cores_are_resolved_and_bound_to_loeo_identity(approved_fold, tm
     )
     assert default_sampler["cores"] == 1
     assert multi_core_sampler["cores"] == 4
-    assert (
-        loeo_publication_module.input_identity(inputs, multi_core_sampler) != default_identity
-    )
+    assert loeo_publication_module.input_identity(inputs, multi_core_sampler) != default_identity
     with pytest.raises(LOEOFoldError, match="cores"):
         loeo_publication_module.sampler_contract(
             "smoke",

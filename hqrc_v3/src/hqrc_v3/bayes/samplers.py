@@ -149,7 +149,12 @@ def sample_hqrc(
         except ImportError as error:
             raise SamplingError("nutpie backend requested but nutpie is not installed") from error
         idata = nutpie.sample_pymc(
-            model, draws=draws, tune=tune, chains=chains, seed=seed, target_accept=resolved_target_accept
+            model,
+            draws=draws,
+            tune=tune,
+            chains=chains,
+            seed=seed,
+            target_accept=resolved_target_accept,
         )
     else:
         raise ValueError("backend must be 'pymc' or 'nutpie'")

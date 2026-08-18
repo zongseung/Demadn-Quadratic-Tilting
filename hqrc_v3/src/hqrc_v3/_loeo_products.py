@@ -1,4 +1,4 @@
-"""Deterministic held-out products for one fitted H3 LOEO posterior."""
+"""Deterministic held-out products for one fitted H1--H3 LOEO posterior."""
 
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ def generate_loeo_fold_products(
     inputs: LOEOFoldInputs,
     idata: object,
     *,
+    variant: str = "H3",
     predictive_seed: int,
     predictive_draws: int | None = None,
 ) -> LOEOFoldProducts:
@@ -37,19 +38,22 @@ def generate_loeo_fold_products(
         raise LOEOFoldError("LOEO products must be causal=false")
     if isinstance(predictive_seed, bool) or not isinstance(predictive_seed, int):
         raise LOEOFoldError("LOEO predictive seed must be an integer")
+    if variant not in {"H1", "H2", "H3"}:
+        raise LOEOFoldError("LOEO predictive variant must be H1, H2, or H3")
     posterior = posterior_mapping(idata)
     sample_count = int(posterior.sizes.get("chain", 0)) * int(posterior.sizes.get("draw", 0))
     draws = sample_count if predictive_draws is None else predictive_draws
     if isinstance(draws, bool) or not isinstance(draws, int) or draws <= 0:
         raise LOEOFoldError("LOEO predictive_draws must be a positive integer")
-    specifications = {
+    specifications: dict[str, int] = {
         "mu": 2,
         "between_cholesky": 3,
-        "gamma": 2,
         "u_phi": 0,
         "phi": 0,
         "sigma_r": 0,
     }
+    if variant == "H3":
+        specifications["gamma"] = 2
     try:
         indices = select_posterior_indices(
             posterior,
@@ -57,7 +61,6 @@ def generate_loeo_fold_products(
             draws=draws,
             seed=predictive_seed,
         )
-        gamma = posterior_values(posterior, "gamma", trailing=2, indices=indices)
         phi = posterior_values(posterior, "phi", trailing=0, indices=indices)
         sigma_r = posterior_values(posterior, "sigma_r", trailing=0, indices=indices)
         event = inputs.held_out.frame
@@ -74,12 +77,17 @@ def generate_loeo_fold_products(
         )
         tau = event["tau_days"].to_numpy().astype(float)
         hour = event["hour"].to_numpy().astype(int)
-        q = (
-            beta[:, 0, None]
-            + beta[:, 1, None] * tau[None, :]
-            + beta[:, 2, None] * tau[None, :] ** 2
-            + gamma[:, holiday, hour]
-        )
+        if variant == "H1":
+            q = np.broadcast_to(beta[:, 0, None], (draws, event.height)).copy()
+        else:
+            q = (
+                beta[:, 0, None]
+                + beta[:, 1, None] * tau[None, :]
+                + beta[:, 2, None] * tau[None, :] ** 2
+            )
+            if variant == "H3":
+                gamma = posterior_values(posterior, "gamma", trailing=2, indices=indices)
+                q = q + gamma[:, holiday, hour]
         e = simulate_stationary_ar1(
             phi=phi,
             sigma=sigma_r,
@@ -89,7 +97,7 @@ def generate_loeo_fold_products(
         baseline = event["predicted_mw"].to_numpy().astype(float)
         predictive = corrected_predictive_draws(baseline, inputs.sigma_eval, q, e)
     except (KeyError, TypeError, ValueError) as error:
-        raise LOEOFoldError("LOEO H3 held-out predictive generation failed") from error
+        raise LOEOFoldError(f"LOEO {variant} held-out predictive generation failed") from error
     q_mean = q.mean(axis=0)
     point = baseline + inputs.sigma_eval * q_mean
     observed = event["observed_mw"].to_numpy().astype(float)
@@ -133,6 +141,7 @@ def generate_loeo_fold_products(
     phi_interval = np.quantile(phi_all, [0.025, 0.975])
     posterior_summary: dict[str, Any] = {
         "schema_version": 1,
+        "variant": variant,
         "held_out_occurrence_id": inputs.held_out_occurrence_id,
         "causal": False,
         "phi": {

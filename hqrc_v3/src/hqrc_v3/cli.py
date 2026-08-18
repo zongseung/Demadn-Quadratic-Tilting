@@ -283,9 +283,10 @@ def _print_pipeline_result(result: object) -> None:
     for item in result:
         label = f"{item.context.model}/{item.context.feature_set}/seed-{item.context.seed}"
         if item.status == "COMPLETE":
+            outputs = ",".join(f"{variant}={path}" for variant, path in item.variant_output_dirs)
             print(
                 f"[HQRC] {label} COMPLETE fits={item.sampler_fit_count} "
-                f"reused={item.reused} output={item.primary_dir}"
+                f"reused={item.reused} outputs={outputs}"
             )
         else:
             print(
@@ -303,6 +304,7 @@ def run_loeo_primary_handler(arguments: argparse.Namespace) -> object:
         output_root=Path(arguments.output_root),
         models=_pipeline_models(arguments.model),
         feature_sets=_pipeline_feature_sets(arguments.feature_set),
+        variants=tuple(arguments.variants),
         root_seed=arguments.root_seed,
         profile=arguments.profile,
         draws=arguments.draws,
@@ -342,6 +344,7 @@ def run_paper_handler(arguments: argparse.Namespace) -> object:
         output_root=Path(arguments.output_root),
         models=_pipeline_models(arguments.hqrc_model),
         feature_sets=_pipeline_feature_sets(arguments.hqrc_feature_set),
+        variants=tuple(arguments.hqrc_variants),
         root_seed=arguments.root_seed,
         profile=arguments.profile,
         draws=arguments.draws,
@@ -578,8 +581,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     loeo_primary.add_argument("--config", required=True, help="experiment TOML bound to source")
     loeo_primary.add_argument("--model", choices=(*MODEL_NAMES, "all"), default="all")
+    loeo_primary.add_argument("--feature-set", choices=("B0", "B1", "all"), default="B1")
     loeo_primary.add_argument(
-        "--feature-set", choices=("B0", "B1", "all"), default="B1"
+        "--variants",
+        nargs="+",
+        choices=("H1", "H2", "H3"),
+        default=("H1", "H2", "H3"),
+        help="ordered correction variants (default: H1 H2 H3)",
     )
     loeo_primary.add_argument("--profile", choices=("smoke", "paper"), default="paper")
     _add_loeo_pipeline_options(loeo_primary)
@@ -615,6 +623,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("B0", "B1", "all"),
         default="B1",
         help="HQRC feature-set scope after the common baseline source is complete",
+    )
+    paper.add_argument(
+        "--hqrc-variants",
+        nargs="+",
+        choices=("H1", "H2", "H3"),
+        default=("H1", "H2", "H3"),
+        help="ordered correction variants (default: H1 H2 H3)",
     )
     _add_loeo_pipeline_options(paper)
 

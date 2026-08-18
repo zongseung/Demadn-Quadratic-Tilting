@@ -73,9 +73,9 @@ runtime and test lock.
 
 `run-paper` is the portable operator entry point.  It first completes the shared
 baseline source in its fixed order (all five models, B0 then B1, OOF then final
-2024 forecast, then standardized residuals).  It then completes HQRC contexts in
-the following order, with every context's LOEO universe, AR diagnostics, ten H3
-folds, and aggregate product completed before the next one starts:
+2024 forecast, then standardized residuals). It then completes HQRC contexts in
+the following order, with every context's LOEO universe, AR diagnostics, and ten
+folds each for H1, H2, and H3 completed before the next baseline starts:
 
 ```text
 XGBoost -> LightGBM -> SVR -> Seq2Seq-LSTM -> Transformer
@@ -83,6 +83,13 @@ XGBoost -> LightGBM -> SVR -> Seq2Seq-LSTM -> Transformer
 
 The default HQRC scope is B1, the holiday-aware baseline.  Use
 `--hqrc-feature-set all` only when the B0 comparison is deliberately required.
+Within each baseline context the default correction order is `H1 H2 H3`.
+`--hqrc-variants` may select a manuscript-ordered subset for a diagnostic rerun;
+the uncorrected H0 metrics are derived directly from the same held-out rows in
+each H1/H2 aggregate, so H0 never invokes NUTS. H1 and H2 reuse the same reviewed
+fold-specific AR prior as H3 but have separate random seeds and immutable output
+namespaces. H1 is a constant holiday-type correction and H2 is quadratic in
+event-relative time without the hour-of-day profile.
 The baseline source must be generated on the computer that runs the sampler:
 its immutable manifests bind input files by digest and absolute local path, so
 copying an old prepared artifact to a different path is not a valid substitute
@@ -102,7 +109,7 @@ uv run --project hqrc_v3 --locked hqrc run-paper \
   --run-dir artifacts/hqrc-v3-paper-local \
   --output-root artifacts/hqrc-v3-loeo-paper-local \
   --baseline-seed 7 --root-seed 20260813 \
-  --hqrc-model all --hqrc-feature-set B1 \
+  --hqrc-model all --hqrc-feature-set B1 --hqrc-variants H1 H2 H3 \
   --draws 5000 --tune 5000 --chains 4 --cores 4 \
   --init jitter+adapt_diag --target-accept 0.99 \
   --approve-derived-ar
@@ -114,7 +121,7 @@ prints their exact proposal digests, and stops before NUTS.  After reviewing tho
 plots, rerun the identical command with that flag; completed baseline, LOEO, and
 AR artifacts are strictly reused.  To run only the correction half after a
 baseline source already exists, use `run-loeo-primary` with `--source-run-dir`,
-`--output-root`, and the same HQRC sampler arguments.
+`--output-root`, `--variants H1 H2 H3`, and the same HQRC sampler arguments.
 
 For a paper baseline run, calculate the model-config digest and run both stages
 with all models and both feature sets:

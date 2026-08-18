@@ -1,4 +1,4 @@
-"""Portable, resumable orchestration for the manuscript H3 LOEO matrix.
+"""Portable, resumable orchestration for the manuscript H1--H3 LOEO matrix.
 
 The baseline publication is deliberately a common immutable source: its ten
 model/feature streams must all be complete before one standardized-residual
@@ -23,6 +23,7 @@ from hqrc_v3.diagnostics.loeo_ar import (
     load_approved_loeo_ar_set,
     prepare_loeo_ar_proposal_set,
 )
+from hqrc_v3.loeo_ablation import fit_loeo_ablation
 from hqrc_v3.loeo_primary import fit_loeo_primary
 
 Progress = Callable[[str], None]
@@ -42,6 +43,7 @@ class PipelineContextResult:
     proposal_set_sha256: str
     status: str
     primary_dir: Path | None = None
+    variant_output_dirs: tuple[tuple[str, Path], ...] = ()
     sampler_fit_count: int | None = None
     reused: bool | None = None
 
@@ -100,6 +102,7 @@ def run_paper_loeo_pipeline(
     output_root: Path,
     models: Iterable[str],
     feature_sets: Iterable[str],
+    variants: Iterable[str] = ("H1", "H2", "H3"),
     root_seed: int,
     profile: str,
     draws: int | None = None,
@@ -111,7 +114,7 @@ def run_paper_loeo_pipeline(
     approve_derived_ar: bool = False,
     progress: Progress | None = None,
 ) -> tuple[PipelineContextResult, ...]:
-    """Run/reuse selected H3 contexts sequentially from one validated source.
+    """Run/reuse selected H1--H3 contexts sequentially from one validated source.
 
     With ``approve_derived_ar=False`` this intentionally stops after publishing
     ACF/PACF plots and proposal JSON for every selected context.  Passing the
@@ -124,6 +127,15 @@ def run_paper_loeo_pipeline(
         raise PaperPipelineError("profile must be paper or smoke")
     if isinstance(root_seed, bool) or not isinstance(root_seed, int) or root_seed < 0:
         raise PaperPipelineError("root seed must be a non-negative integer")
+    selected_variants = tuple(variants)
+    if (
+        not selected_variants
+        or len(set(selected_variants)) != len(selected_variants)
+        or any(variant not in {"H1", "H2", "H3"} for variant in selected_variants)
+        or tuple(variant for variant in ("H1", "H2", "H3") if variant in selected_variants)
+        != selected_variants
+    ):
+        raise PaperPipelineError("variants must be a unique manuscript-ordered subset of H1/H2/H3")
     output = Path(output_root).expanduser().resolve()
     if not output.is_absolute():  # pragma: no cover - resolve guarantees this on supported hosts
         raise PaperPipelineError("output root must resolve to an absolute path")
@@ -158,7 +170,7 @@ def run_paper_loeo_pipeline(
             )
             _emit(
                 progress,
-                f"[{index}/{len(contexts)} {label}] AR proposal ready; H3 sampling skipped",
+                f"[{index}/{len(contexts)} {label}] AR proposal ready; H1--H3 sampling skipped",
             )
             continue
 
@@ -170,22 +182,54 @@ def run_paper_loeo_pipeline(
             confirm_proposal_set_sha256=proposal.proposal_set_sha256,
         )
         approved = load_approved_loeo_ar_set(source, publication, output_dir=ar_dir)
-        _emit(progress, f"[{index}/{len(contexts)} {label}] H3 NUTS LOEO (10 folds, sequential)")
-        primary = fit_loeo_primary(
-            source,
-            publication,
-            approved,
-            held_out_occurrence_ids=publication.occurrence_ids,
-            root_seed=root_seed,
-            profile=profile,
-            draws=draws,
-            tune=tune,
-            chains=chains,
-            cores=cores,
-            init=init,
-            target_accept=target_accept,
-            output_root=output,
-        )
+        variant_outputs: list[tuple[str, Path]] = []
+        fit_count = 0
+        reused = True
+        primary = None
+        for variant in selected_variants:
+            _emit(
+                progress,
+                f"[{index}/{len(contexts)} {label}] {variant} NUTS LOEO (10 folds, sequential)",
+            )
+            if variant in {"H1", "H2"}:
+                ablation = fit_loeo_ablation(
+                    source,
+                    publication,
+                    approved,
+                    variant=variant,
+                    held_out_occurrence_ids=publication.occurrence_ids,
+                    root_seed=root_seed,
+                    profile=profile,
+                    draws=draws,
+                    tune=tune,
+                    chains=chains,
+                    cores=cores,
+                    init=init,
+                    target_accept=target_accept,
+                    output_root=output,
+                )
+                variant_outputs.append((variant, ablation.output_dir))
+                fit_count += ablation.sampler_fit_count
+                reused = reused and ablation.reused
+            else:
+                primary = fit_loeo_primary(
+                    source,
+                    publication,
+                    approved,
+                    held_out_occurrence_ids=publication.occurrence_ids,
+                    root_seed=root_seed,
+                    profile=profile,
+                    draws=draws,
+                    tune=tune,
+                    chains=chains,
+                    cores=cores,
+                    init=init,
+                    target_accept=target_accept,
+                    output_root=output,
+                )
+                variant_outputs.append((variant, primary.output_dir))
+                fit_count += primary.sampler_fit_count
+                reused = reused and primary.reused
         results.append(
             PipelineContextResult(
                 context=context,
@@ -193,9 +237,10 @@ def run_paper_loeo_pipeline(
                 ar_dir=ar_dir,
                 proposal_set_sha256=proposal.proposal_set_sha256,
                 status="COMPLETE",
-                primary_dir=primary.output_dir,
-                sampler_fit_count=primary.sampler_fit_count,
-                reused=primary.reused,
+                primary_dir=None if primary is None else primary.output_dir,
+                variant_output_dirs=tuple(variant_outputs),
+                sampler_fit_count=fit_count,
+                reused=reused,
             )
         )
         _emit(progress, f"[{index}/{len(contexts)} {label}] complete")

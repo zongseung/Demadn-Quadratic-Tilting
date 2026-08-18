@@ -60,10 +60,21 @@ def _run(
             output_dir=tmp_path / model / "primary", sampler_fit_count=1, reused=False
         )
 
+    def ablation(_source, publication, approved, **kwargs):
+        model = publication.output_dir.parent.parent.parent.name
+        variant = kwargs["variant"]
+        assert approved is not None
+        assert kwargs["held_out_occurrence_ids"] == publication.occurrence_ids
+        calls.append(f"{variant.lower()}:{model}")
+        return SimpleNamespace(
+            output_dir=tmp_path / model / variant.lower(), sampler_fit_count=1, reused=False
+        )
+
     monkeypatch.setattr(pipeline, "publish_loeo_universe", universe)
     monkeypatch.setattr(pipeline, "prepare_loeo_ar_proposal_set", proposal)
     monkeypatch.setattr(pipeline, "approve_loeo_ar_proposal_set", approve)
     monkeypatch.setattr(pipeline, "load_approved_loeo_ar_set", load)
+    monkeypatch.setattr(pipeline, "fit_loeo_ablation", ablation)
     monkeypatch.setattr(pipeline, "fit_loeo_primary", primary)
     return (
         pipeline.run_paper_loeo_pipeline(
@@ -96,11 +107,15 @@ def test_pipeline_completes_each_context_before_advancing(
         "proposal:xgboost",
         "approve:xgboost",
         "load:xgboost",
+        "h1:xgboost",
+        "h2:xgboost",
         "primary:xgboost",
         "universe:lightgbm",
         "proposal:lightgbm",
         "approve:lightgbm",
         "load:lightgbm",
+        "h1:lightgbm",
+        "h2:lightgbm",
         "primary:lightgbm",
     ]
 
