@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from hqrc_v3 import cli
@@ -17,6 +19,19 @@ def test_help_succeeds(capsys):
 @pytest.mark.parametrize(
     ("command", "arguments"),
     [
+        (
+            "import-paper-source",
+            [
+                "--archive",
+                "artifacts.zip",
+                "--data",
+                "data.csv",
+                "--repository-root",
+                ".",
+                "--run-dir",
+                "imported",
+            ],
+        ),
         ("audit-data", ["--data", "input.parquet"]),
         ("tune-baselines", ["--data", "input.parquet", "--config", "experiment.toml"]),
         (
@@ -195,6 +210,52 @@ def test_generate_oof_requires_explicit_frozen_config(capsys):
 def test_concrete_audit_reports_missing_input_clearly(capsys):
     assert cli.main(["audit-data", "--data", "input.parquet"]) != 0
     assert "unable to read hourly data" in capsys.readouterr().err
+
+
+def test_import_paper_source_prints_stable_result_lines(monkeypatch, capsys, tmp_path):
+    run = (tmp_path / "run").resolve()
+    config = run / "sources/experiment.toml"
+    received = []
+
+    def import_source(*args, **kwargs):
+        received.append((args, kwargs))
+        return type("Result", (), {"run_dir": run, "config_path": config, "reused": False})()
+
+    monkeypatch.setattr(cli, "import_archived_correction_source", import_source)
+    assert (
+        cli.main(
+            [
+                "import-paper-source",
+                "--archive",
+                "archive.zip",
+                "--data",
+                "data.csv",
+                "--repository-root",
+                "repository",
+                "--run-dir",
+                "run",
+            ]
+        )
+        == 0
+    )
+
+    assert received == [
+        (
+            (),
+            {
+                "archive_path": Path("archive.zip"),
+                "data_path": Path("data.csv"),
+                "repository_root": Path("repository"),
+                "run_dir": Path("run"),
+                "profile": "paper",
+            },
+        )
+    ]
+    assert capsys.readouterr().out.splitlines() == [
+        f"run_dir={run}",
+        f"config_path={config}",
+        "reused=False",
+    ]
 
 
 def test_audit_fixed_bounds_are_provided_to_its_handler():

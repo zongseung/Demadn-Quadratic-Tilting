@@ -12,6 +12,7 @@ from typing import NoReturn
 import numpy as np
 import polars as pl
 
+from hqrc_v3.artifact_import import import_archived_correction_source
 from hqrc_v3.baselines.config import MODEL_NAMES, load_paper_baselines
 from hqrc_v3.baselines.paper import run_paper_final_stage, run_paper_oof_stage
 from hqrc_v3.bayes.samplers import SamplingError
@@ -52,6 +53,22 @@ _DEFAULT_TEMPORARY_AVAILABILITY = (
 
 class StageInputError(ValueError):
     """Raised when a command lacks the handler or inputs needed for real work."""
+
+
+def import_paper_source_handler(arguments: argparse.Namespace) -> object:
+    """Import and print one immutable archived correction source."""
+
+    result = import_archived_correction_source(
+        archive_path=Path(arguments.archive),
+        data_path=Path(arguments.data),
+        repository_root=Path(arguments.repository_root),
+        run_dir=Path(arguments.run_dir),
+        profile=arguments.profile,
+    )
+    print(f"run_dir={result.run_dir}")
+    print(f"config_path={result.config_path}")
+    print(f"reused={result.reused}")
+    return result
 
 
 def _unavailable_handler(stage: str) -> StageHandler:
@@ -435,6 +452,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hqrc", description="HQRC v3 staged forecasting pipeline")
     subcommands = parser.add_subparsers(dest="command", required=True)
 
+    imported = subcommands.add_parser(
+        "import-paper-source", help="restore and validate the archived correction source"
+    )
+    imported.add_argument("--archive", required=True)
+    imported.add_argument("--data", required=True)
+    imported.add_argument("--repository-root", required=True)
+    imported.add_argument("--run-dir", required=True)
+    imported.add_argument("--profile", choices=("smoke", "paper"), default="paper")
+
     audit = subcommands.add_parser(
         "audit-data", help="audit hourly data against the requested bounds"
     )
@@ -643,6 +669,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _default_handlers() -> dict[str, StageHandler]:
     return {
+        "import-paper-source": import_paper_source_handler,
         "audit-data": audit_data_handler,
         "tune-baselines": tune_baselines_handler,
         "generate-oof": generate_oof_handler,
