@@ -108,15 +108,19 @@ def reconstruct_pyro_deterministics(
     device = mu.device
     delta = _float64(samples["delta"], device=device)
     offset = _float64(samples["beta_offset"], device=device)
-    between_scale = _stack_sites(samples, "between_scale", dimension=-2).to(device)
+    sampled_scale = _stack_sites(samples, "between_scale", dimension=-2).to(device)
     if coefficients == 1:
-        identity = torch.ones((*between_scale.shape[:-1], 1, 1), dtype=_DTYPE, device=device)
+        identity = torch.ones((*sampled_scale.shape[:-1], 1, 1), dtype=_DTYPE, device=device)
         correlation_cholesky = identity
     else:
         correlation_cholesky = _stack_sites(samples, "between_corr_cholesky", dimension=-3).to(
             device
         )
-    between_cholesky = between_scale.unsqueeze(-1) * correlation_cholesky
+    between_cholesky = sampled_scale.unsqueeze(-1) * correlation_cholesky
+    covariance = between_cholesky @ between_cholesky.transpose(-1, -2)
+    between_scale = torch.sqrt(torch.diagonal(covariance, dim1=-2, dim2=-1))
+    correlation = covariance / (between_scale.unsqueeze(-1) * between_scale.unsqueeze(-2))
+    lower = torch.tril_indices(coefficients, coefficients, device=device)
 
     occurrence_type = torch.as_tensor(data.occurrence_holiday_type, dtype=torch.long, device=device)
     restriction = _float64(data.occurrence_restriction, device=device)
@@ -129,6 +133,16 @@ def reconstruct_pyro_deterministics(
         "between_cholesky": between_cholesky,
         "beta": beta,
     }
+    for holiday_type in range(2):
+        result.update(
+            {
+                f"between_cov_{holiday_type}": between_cholesky[
+                    ..., holiday_type, lower[0], lower[1]
+                ],
+                f"between_cov_{holiday_type}_corr": correlation[..., holiday_type, :, :],
+                f"between_cov_{holiday_type}_stds": between_scale[..., holiday_type, :],
+            }
+        )
     gamma = None
     if variant == "H3":
         sigma_gamma = _float64(samples["sigma_gamma"], device=device)
