@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from types import SimpleNamespace
 
 import arviz as az
@@ -14,6 +15,7 @@ from hqrc_v3.bayes.model import HQRCData
 from hqrc_v3.bayes.samplers import (
     SamplingDiagnostics,
     SamplingError,
+    _run_pyro_chain,
     sample_hqrc,
     validate_inference_data,
 )
@@ -257,15 +259,73 @@ def test_paper_diagnostics_fail_closed_without_divergence_statistics():
         validate_inference_data(idata, paper_profile=True)
 
 
+@pytest.mark.parametrize("cores", [2, 5])
+def test_pyro_rejects_more_than_one_core_before_model_build(cores):
+    with pytest.raises(ValueError, match="cores=1"):
+        sample_hqrc(None, None, backend="pyro", chains=4, cores=cores)
+
+
+def test_run_pyro_chain_constructs_one_chain_mcmc_and_integer_divergences(monkeypatch):
+    captured = {}
+    model = object()
+
+    class FakeNUTS:
+        def __init__(self, selected_model, *, target_accept_prob):
+            captured["nuts"] = (selected_model, target_accept_prob)
+
+    class FakeMCMC:
+        def __init__(self, kernel, **kwargs):
+            captured["mcmc"] = (kernel, kwargs)
+
+        def run(self):
+            captured["ran"] = True
+
+        def diagnostics(self):
+            return {"divergences": {"chain 0": [1, 3]}}
+
+        def get_samples(self, *, group_by_chain):
+            captured["group_by_chain"] = group_by_chain
+            return {"mu": "samples"}
+
+    fake_pyro = SimpleNamespace(set_rng_seed=lambda seed: captured.setdefault("seed", seed))
+    fake_infer = SimpleNamespace(MCMC=FakeMCMC, NUTS=FakeNUTS)
+    monkeypatch.setitem(sys.modules, "pyro", fake_pyro)
+    monkeypatch.setitem(sys.modules, "pyro.infer", fake_infer)
+
+    samples, divergences = _run_pyro_chain(
+        model,
+        draws=4,
+        tune=3,
+        seed=17,
+        target_accept=0.9,
+        num_chains=1,
+    )
+
+    kernel, mcmc_kwargs = captured["mcmc"]
+    assert isinstance(kernel, FakeNUTS)
+    assert captured["seed"] == 17
+    assert captured["nuts"] == (model, 0.9)
+    assert mcmc_kwargs == {
+        "num_samples": 4,
+        "warmup_steps": 3,
+        "num_chains": 1,
+        "disable_progbar": True,
+    }
+    assert captured["ran"] is True
+    assert captured["group_by_chain"] is False
+    assert samples == {"mu": "samples"}
+    np.testing.assert_array_equal(divergences, np.array([0, 1, 0, 1], dtype=np.int8))
+
+
 def test_pyro_runs_four_sequential_chains_and_exposes_pymc_posterior(tmp_path, monkeypatch):
     data = HQRCData(
-        observations=np.array([0.1, 0.2, -0.1, 0.0]),
-        occurrence_index=np.array([0, 0, 1, 1]),
-        holiday_type_index=np.array([0, 0, 1, 1]),
-        tau_days=np.array([0.0, 1 / 24, 0.0, 1 / 24]),
-        hour=np.array([0, 1, 0, 1]),
-        restriction=np.array([0, 0, 1, 1]),
-        occurrence_ids=("a", "b"),
+        observations=np.linspace(-0.2, 0.2, 18),
+        occurrence_index=np.repeat(np.arange(9), 2),
+        holiday_type_index=np.repeat(np.arange(9) % 2, 2),
+        tau_days=np.tile(np.array([0.0, 1 / 24]), 9),
+        hour=np.tile(np.array([0, 1]), 9),
+        restriction=np.repeat(np.arange(9) % 2, 2),
+        occurrence_ids=tuple(f"event-{index}" for index in range(9)),
     )
     approved = SimpleNamespace(
         artifact_path=tmp_path / "approved.json",
@@ -305,7 +365,7 @@ def test_pyro_runs_four_sequential_chains_and_exposes_pymc_posterior(tmp_path, m
         samples = {
             "mu": repeated(torch.zeros((2, 3))),
             "delta": repeated(torch.zeros((2, 3))),
-            "beta_offset": repeated(torch.zeros((2, 3))),
+            "beta_offset": repeated(torch.zeros((9, 3))),
             "between_scale_0": repeated(torch.ones(3)),
             "between_scale_1": repeated(torch.ones(3)),
             "between_corr_cholesky_0": repeated(torch.eye(3)),
@@ -342,6 +402,13 @@ def test_pyro_runs_four_sequential_chains_and_exposes_pymc_posterior(tmp_path, m
     assert all(call[0] is model and call[1]["num_chains"] == 1 for call in calls)
     assert idata.posterior.sizes["chain"] == 4
     assert idata.posterior.sizes["draw"] == 4
+    assert idata.posterior["beta_offset"].shape == (4, 4, 9, 3)
+    assert idata.posterior["event_log_likelihood"].shape == (4, 4, 9)
+    assert idata.posterior["event_log_likelihood"].dims == (
+        "chain",
+        "draw",
+        "event_log_likelihood_dim_0",
+    )
     assert set(idata.posterior) == {
         "mu",
         "delta",
@@ -373,6 +440,7 @@ def test_pyro_runs_four_sequential_chains_and_exposes_pymc_posterior(tmp_path, m
     assert idata.attrs["hqrc_dtype"] == "float64"
     assert idata.attrs["hqrc_device_probe"] == "float64-gradient-lkj-ar"
     assert idata.attrs["hqrc_chain_execution"] == "sequential"
+    assert json.loads(idata.attrs["hqrc_sampler_json"])["cores"] == 1
 
     fallback = ResolvedDevice(
         kind="cpu",

@@ -30,28 +30,55 @@ class ResolvedDevice:
 
 
 def probe_hqrc_device(device: ResolvedDevice, *, torch_module=None) -> DeviceProbe:
-    """Exercise float64 gradients, LKJ sampling, and AR arithmetic on a device."""
+    """Exercise NUTS-required float64 LKJ and stationary AR(1) gradients."""
 
     torch = torch_module or importlib.import_module("torch")
     try:
-        value = torch.tensor(
-            [0.25, -0.1],
+        cholesky = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.2, 0.9797958971132712, 0.0],
+                [-0.1, 0.15, 0.9836157786453001],
+            ],
             dtype=torch.float64,
             device=device.logical_device,
             requires_grad=True,
         )
         concentration = torch.tensor(2.0, dtype=torch.float64, device=device.logical_device)
-        cholesky = torch.distributions.LKJCholesky(3, concentration).sample()
-        residual = torch.tensor([0.1, -0.2, 0.3], dtype=torch.float64, device=device.logical_device)
-        phi = torch.tensor(0.25, dtype=torch.float64, device=device.logical_device)
-        sigma = torch.tensor(0.8, dtype=torch.float64, device=device.logical_device)
+        lkj_logp = torch.distributions.LKJCholesky(3, concentration).log_prob(cholesky)
+        residual = torch.tensor(
+            [0.1, -0.2, 0.3, -0.1],
+            dtype=torch.float64,
+            device=device.logical_device,
+            requires_grad=True,
+        )
+        phi = torch.tensor(
+            0.25,
+            dtype=torch.float64,
+            device=device.logical_device,
+            requires_grad=True,
+        )
+        sigma = torch.tensor(
+            0.8,
+            dtype=torch.float64,
+            device=device.logical_device,
+            requires_grad=True,
+        )
         stationary = sigma / (1.0 - phi.square()).sqrt()
-        innovation = residual[1:] - phi * residual[:-1]
-        ar_term = (residual[0] / stationary).square() + (innovation / sigma).square().sum()
-        objective = value.square().sum() + cholesky.square().sum() + ar_term
+        normal = torch.distributions.Normal
+        ar_logp = None
+        for event in (residual[:2], residual[2:]):
+            event_logp = normal(0.0, stationary).log_prob(event[0])
+            event_logp = event_logp + normal(phi * event[:-1], sigma).log_prob(event[1:]).sum()
+            ar_logp = event_logp if ar_logp is None else ar_logp + event_logp
+        assert ar_logp is not None
+        objective = lkj_logp + ar_logp
         objective.backward()
-        if value.grad is None or not bool(torch.isfinite(objective).all()):
-            raise RuntimeError("non-finite float64 HQRC device probe")
+        gradients = (cholesky.grad, residual.grad, phi.grad, sigma.grad)
+        if not bool(torch.isfinite(objective).all()) or any(
+            gradient is None or not bool(torch.isfinite(gradient).all()) for gradient in gradients
+        ):
+            raise RuntimeError("missing or non-finite float64 HQRC device-probe gradient")
     except Exception as error:
         return DeviceProbe(False, str(error))
     return DeviceProbe(True, "float64-gradient-lkj-ar")
@@ -97,10 +124,29 @@ def _probed_cpu(torch, *, fallback_reason: str | None = None) -> ResolvedDevice:
     return _cpu(fallback_reason=fallback_reason, probe=probe)
 
 
+def _resolve_isolated_cuda(request: str, torch, physical: str) -> ResolvedDevice:
+    if request not in {"auto", "cuda", "cuda:0"}:
+        raise DeviceResolutionError("an isolated CUDA child must use logical cuda:0")
+    if not _available(torch, "cuda"):
+        raise DeviceResolutionError("isolated CUDA child: CUDA is not available")
+    if torch.cuda.device_count() != 1:
+        raise DeviceResolutionError("HQRC_PHYSICAL_DEVICE requires exactly one visible CUDA device")
+    candidate = ResolvedDevice(
+        kind="cuda",
+        logical_device="cuda:0",
+        physical_device=physical,
+        probe=DeviceProbe(False, "not-run"),
+    )
+    probe = probe_hqrc_device(candidate, torch_module=torch)
+    if not probe.success:
+        raise DeviceResolutionError(f"cuda HQRC probe failed: {probe.detail}")
+    return ResolvedDevice("cuda", "cuda:0", physical, probe)
+
+
 def resolve_device(
     request: str, *, torch_module=None, platform_name: str | None = None
 ) -> ResolvedDevice:
-    """Resolve an HQRC worker device without importing Torch for explicit CPU use."""
+    """Resolve and capability-probe one HQRC worker device lazily."""
 
     cuda_match = re.fullmatch(r"cuda:(0|[1-9][0-9]*)", request)
     if request not in {"auto", "cpu", "cuda", "mps"} and cuda_match is None:
@@ -109,6 +155,9 @@ def resolve_device(
         torch = torch_module or importlib.import_module("torch")
     except Exception as error:
         raise DeviceResolutionError(f"{request} is not available: {error}") from error
+    physical = os.environ.get("HQRC_PHYSICAL_DEVICE")
+    if physical is not None:
+        return _resolve_isolated_cuda(request, torch, physical)
     if request == "cpu":
         return _probed_cpu(torch)
 

@@ -216,6 +216,8 @@ def sample_hqrc(
         for value in (draws, tune, chains, cores)
     ):
         raise ValueError("draws, tune, chains, and cores must be positive integers")
+    if backend == "pyro" and cores != 1:
+        raise ValueError("pyro sequential chains require cores=1")
     if cores > chains:
         raise ValueError("cores must not exceed chains")
     if isinstance(seed, bool) or not isinstance(seed, int):
@@ -353,7 +355,7 @@ def sample_hqrc(
         "draws": draws,
         "tune": tune,
         "chains": chains,
-        "cores": cores,
+        "cores": 1,
         "seed": seed,
         "target_accept": resolved_target_accept,
         "paper_profile": paper_profile,
