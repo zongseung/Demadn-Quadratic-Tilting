@@ -76,6 +76,17 @@ def test_require_within_rejects_escape(tmp_path):
         require_within(tmp_path / "root", tmp_path / "escape")
 
 
+def test_require_within_rejects_parent_traversal_before_a_junction(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    target = root / "target"
+    target.mkdir()
+    junction = _make_platform_link(root / "junction", target)
+
+    with pytest.raises(PublicationFSError, match="parent traversal"):
+        require_within(root, root / "missing" / ".." / junction.name)
+
+
 def test_windows_fsync_file_opens_a_regular_file_writable(tmp_path, monkeypatch):
     artifact = tmp_path / "artifact.bin"
     artifact.write_bytes(b"content")

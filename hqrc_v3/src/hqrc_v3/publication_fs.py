@@ -25,6 +25,8 @@ def _is_link_or_junction(path: Path) -> bool:
 
 def _reject_link_components(path: Path) -> None:
     path = Path(path)
+    if ".." in path.parts:
+        raise PublicationFSError(f"publication path contains parent traversal: {path}")
     current = Path(path.anchor) if path.anchor else Path()
     for part in path.parts:
         if part == path.anchor:

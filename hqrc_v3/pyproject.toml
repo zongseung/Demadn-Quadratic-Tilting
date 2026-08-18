@@ -7,7 +7,7 @@ name = "hqrc-v3"
 version = "0.1.0"
 description = "Hierarchical Quadratic Tilting demand correction pipeline"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "arviz>=0.22.0",
     "filelock>=3.18.0",

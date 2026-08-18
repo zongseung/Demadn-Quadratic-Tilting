@@ -41,7 +41,7 @@ def test_child_project_declares_an_exact_installable_src_package() -> None:
 
     assert project["build-system"]["build-backend"] == "setuptools.build_meta"
     assert project["build-system"]["requires"]
-    assert project["project"]["requires-python"] == ">=3.11"
+    assert project["project"]["requires-python"] == ">=3.12"
     assert project["project"]["scripts"] == {"hqrc": "hqrc_v3.cli:main"}
     assert project["tool"]["setuptools"]["packages"]["find"] == {
         "where": ["src"],
