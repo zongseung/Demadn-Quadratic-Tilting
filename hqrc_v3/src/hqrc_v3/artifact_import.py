@@ -24,8 +24,11 @@ from hqrc_v3.publication_fs import (
 
 _ARCHIVE_PREFIX = PurePosixPath("artifacts/hqrc-v3-paper-20260811")
 _EXTRACTED_NAMESPACES = frozenset({"predictions", "inputs", "prediction-stream-cache"})
-_IGNORED_RUN_NAMESPACES = frozenset(
-    {"ar_diagnostics", "corrections", "diagnostics", "quarantine", "reports"}
+_IGNORED_RUN_NAMESPACES = frozenset({"ar_diagnostics", "corrections", "quarantine"})
+_IGNORED_ARCHIVE_PREFIXES = (
+    PurePosixPath("artifacts/baseline_fit2023_eval2024"),
+    PurePosixPath("artifacts/hqrc-v3-causal-2024-report-20260813"),
+    PurePosixPath("artifacts/hqt_fit2023_eval2024"),
 )
 _SOURCE_OUTPUTS = {"data": "power_demand_final.csv"}
 
@@ -140,41 +143,98 @@ class _ArchivePlan:
     manifest: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class _ArchiveMember:
+    path: PurePosixPath
+    info: ZipInfo
+    is_directory: bool
+
+
+def _relative_to(path: PurePosixPath, prefix: PurePosixPath) -> PurePosixPath | None:
+    try:
+        return path.relative_to(prefix)
+    except ValueError:
+        return None
+
+
+def _archive_members(bundle: ZipFile) -> tuple[_ArchiveMember, ...]:
+    members: list[_ArchiveMember] = []
+    exact: dict[str, bool] = {}
+    folded: dict[str, str] = {}
+    for info in bundle.infolist():
+        path = _safe_member_path(info)
+        name = path.as_posix()
+        is_directory = info.is_dir()
+        if name in exact:
+            description = "duplicate" if exact[name] == is_directory else "conflicting"
+            raise ArchiveImportError(f"{description} archive member: {name}")
+        alias = folded.get(name.casefold())
+        if alias is not None:
+            raise ArchiveImportError(f"case-equivalent archive member: {name} aliases {alias}")
+        exact[name] = is_directory
+        folded[name.casefold()] = name
+        members.append(_ArchiveMember(path, info, is_directory))
+
+    files = {member.path.as_posix().casefold() for member in members if not member.is_directory}
+    for member in members:
+        if any(parent.as_posix().casefold() in files for parent in member.path.parents[:-1]):
+            raise ArchiveImportError(f"conflicting archive member: {member.path.as_posix()}")
+    return tuple(members)
+
+
+def _member_disposition(member: _ArchiveMember) -> str:
+    path, is_directory = member.path, member.is_directory
+    if path == PurePosixPath("__MACOSX"):
+        if not is_directory:
+            raise ArchiveImportError("unexpected archive namespace: __MACOSX")
+        return "ignore"
+    if _relative_to(path, PurePosixPath("__MACOSX")) is not None:
+        return "ignore"
+    if path == PurePosixPath("artifacts"):
+        if not is_directory:
+            raise ArchiveImportError("unexpected archive namespace: artifacts")
+        return "ignore"
+    if path == PurePosixPath("artifacts/.DS_Store"):
+        if is_directory:
+            raise ArchiveImportError("unexpected archive namespace: artifacts/.DS_Store")
+        return "ignore"
+    for prefix in _IGNORED_ARCHIVE_PREFIXES:
+        relative = _relative_to(path, prefix)
+        if relative is not None:
+            if relative == PurePosixPath(".") and not is_directory:
+                raise ArchiveImportError(f"unexpected archive namespace: {path.as_posix()}")
+            return "ignore"
+
+    relative = _relative_to(path, _ARCHIVE_PREFIX)
+    if relative is None:
+        raise ArchiveImportError(f"unexpected archive namespace: {path.as_posix()}")
+    if relative == PurePosixPath("."):
+        if not is_directory:
+            raise ArchiveImportError(f"unexpected archive namespace: {path.as_posix()}")
+        return "ignore"
+    namespace = relative.parts[0]
+    if namespace not in _EXTRACTED_NAMESPACES | _IGNORED_RUN_NAMESPACES:
+        raise ArchiveImportError(f"unexpected archive namespace: {namespace}")
+    if relative == PurePosixPath(namespace) and not is_directory:
+        raise ArchiveImportError(f"unexpected archive namespace: {namespace}")
+    return "extract" if namespace in _EXTRACTED_NAMESPACES else "ignore"
+
+
 def _archive_plan(archive: Path) -> _ArchivePlan:
     files: dict[str, ZipInfo] = {}
     directories: set[str] = set()
     hashes: dict[str, str] = {}
     try:
         with ZipFile(archive) as bundle:
-            for info in bundle.infolist():
-                member = _safe_member_path(info)
-                try:
-                    relative = member.relative_to(_ARCHIVE_PREFIX)
-                except ValueError:
+            for member in _archive_members(bundle):
+                if _member_disposition(member) == "ignore":
                     continue
-                if relative == PurePosixPath("."):
-                    continue
-                namespace = relative.parts[0]
-                if namespace in _IGNORED_RUN_NAMESPACES:
-                    continue
-                if namespace not in _EXTRACTED_NAMESPACES:
-                    raise ArchiveImportError(f"unexpected archive namespace: {namespace}")
+                relative = member.path.relative_to(_ARCHIVE_PREFIX)
                 relative_name = relative.as_posix().rstrip("/")
-                if not relative_name:
-                    continue
-                if info.is_dir():
+                if member.is_directory:
                     directories.add(relative_name)
                     continue
-                if relative_name in files:
-                    raise ArchiveImportError(f"duplicate archive member: {relative_name}")
-                files[relative_name] = info
-
-            for relative_name in (*files, *directories):
-                path = PurePosixPath(relative_name)
-                if relative_name in files and relative_name in directories:
-                    raise ArchiveImportError(f"conflicting archive member: {relative_name}")
-                if any(parent.as_posix() in files for parent in path.parents[:-1]):
-                    raise ArchiveImportError(f"conflicting archive member: {relative_name}")
+                files[relative_name] = member.info
 
             manifest_name = "inputs/standardized_residuals_manifest.json"
             if manifest_name not in files:
@@ -344,12 +404,12 @@ def _resolved_inputs(
         repository = require_local_entry(Path(repository_root), kind="directory").resolve(
             strict=True
         )
-        run = Path(run_dir).resolve(strict=False)
+        raw_run = Path(run_dir)
+        run = require_within(raw_run.parent, raw_run)
         if run == repository or repository.is_relative_to(run):
             raise ArchiveImportError("destination overlaps repository source")
         if archive.is_relative_to(run) or data.is_relative_to(run):
             raise ArchiveImportError("destination overlaps file source")
-        require_within(run.parent, run)
     except ArchiveImportError:
         raise
     except (OSError, PublicationFSError) as error:

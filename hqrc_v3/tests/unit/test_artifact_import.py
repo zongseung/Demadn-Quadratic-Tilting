@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import subprocess
 from dataclasses import dataclass
@@ -135,6 +136,19 @@ def import_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ImportFix
     }
     archive = tmp_path / "controlled-artifacts.zip"
     with ZipFile(archive, "w") as bundle:
+        for directory in (
+            "__MACOSX/",
+            "artifacts/",
+            "artifacts/baseline_fit2023_eval2024/",
+            "artifacts/hqrc-v3-causal-2024-report-20260813/",
+            "artifacts/hqt_fit2023_eval2024/",
+            PREFIX,
+            PREFIX + "inputs/",
+            PREFIX + "predictions/",
+            PREFIX + "prediction-stream-cache/",
+            PREFIX + "corrections/",
+        ):
+            bundle.writestr(directory, b"")
         for relative, content in parquet_bytes.items():
             bundle.writestr(PREFIX + relative, content)
         bundle.writestr(
@@ -143,7 +157,10 @@ def import_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ImportFix
         )
         bundle.writestr(PREFIX + "corrections/causal-2024/result.nc", b"ignored")
         bundle.writestr("__MACOSX/._artifacts", b"ignored")
-        bundle.writestr("artifacts/unrelated-run/predictions/oof.parquet", b"ignored")
+        bundle.writestr("artifacts/.DS_Store", b"ignored")
+        bundle.writestr("artifacts/baseline_fit2023_eval2024/result.bin", b"ignored")
+        bundle.writestr("artifacts/hqrc-v3-causal-2024-report-20260813/report.bin", b"ignored")
+        bundle.writestr("artifacts/hqt_fit2023_eval2024/result.bin", b"ignored")
 
     return ImportFixture(
         archive,
@@ -168,6 +185,13 @@ def _validating_spy(calls: list[tuple[Path, Path, str]]):
         return object()
 
     return validate
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
 
 
 def test_import_rejects_traversal_before_destination_creation(tmp_path: Path):
@@ -206,6 +230,28 @@ def test_import_rejects_unsafe_or_unexpected_members_before_staging(tmp_path: Pa
     assert not list(tmp_path.glob(".run.import-staging*"))
 
 
+@pytest.mark.parametrize(
+    "member",
+    [
+        "outside/file.txt",
+        "artifacts/unrelated-run/file.txt",
+        PREFIX + "diagnostics/file.txt",
+        PREFIX + "reports/file.txt",
+    ],
+)
+def test_import_rejects_every_unapproved_namespace_before_staging(tmp_path: Path, member: str):
+    archive = tmp_path / "artifacts.zip"
+    with ZipFile(archive, "w") as bundle:
+        bundle.writestr(member, b"x")
+
+    with pytest.raises(ArchiveImportError, match="unexpected archive namespace"):
+        import_archived_correction_source(
+            archive, tmp_path / "data.csv", tmp_path, tmp_path / "run"
+        )
+
+    assert not list(tmp_path.glob(".run.import-staging*"))
+
+
 def test_import_rejects_link_member_before_staging(tmp_path: Path):
     archive = tmp_path / "artifacts.zip"
     member = ZipInfo(PREFIX + "inputs/link")
@@ -229,6 +275,53 @@ def test_import_rejects_conflicting_member_paths_before_staging(tmp_path: Path):
         bundle.writestr(PREFIX + "inputs/conflict/child", b"child")
 
     with pytest.raises(ArchiveImportError, match="conflicting archive member"):
+        import_archived_correction_source(
+            archive, tmp_path / "data.csv", tmp_path, tmp_path / "run"
+        )
+
+    assert not list(tmp_path.glob(".run.import-staging*"))
+
+
+def test_import_rejects_duplicate_directories_before_staging(tmp_path: Path):
+    archive = tmp_path / "artifacts.zip"
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        with ZipFile(archive, "w") as bundle:
+            bundle.writestr("artifacts/", b"")
+            bundle.writestr("artifacts/", b"")
+
+    with pytest.raises(ArchiveImportError, match="duplicate archive member"):
+        import_archived_correction_source(
+            archive, tmp_path / "data.csv", tmp_path, tmp_path / "run"
+        )
+
+    assert not list(tmp_path.glob(".run.import-staging*"))
+
+
+def test_import_rejects_ignored_namespace_ancestor_conflict_before_staging(
+    tmp_path: Path,
+):
+    archive = tmp_path / "artifacts.zip"
+    with ZipFile(archive, "w") as bundle:
+        bundle.writestr(PREFIX + "corrections/conflict", b"file")
+        bundle.writestr(PREFIX + "corrections/conflict/child", b"child")
+
+    with pytest.raises(ArchiveImportError, match="conflicting archive member"):
+        import_archived_correction_source(
+            archive, tmp_path / "data.csv", tmp_path, tmp_path / "run"
+        )
+
+    assert not list(tmp_path.glob(".run.import-staging*"))
+
+
+def test_import_rejects_casefold_aliases_in_ignored_namespace_before_staging(
+    tmp_path: Path,
+):
+    archive = tmp_path / "artifacts.zip"
+    with ZipFile(archive, "w") as bundle:
+        bundle.writestr("artifacts/baseline_fit2023_eval2024/Result.bin", b"one")
+        bundle.writestr("artifacts/baseline_fit2023_eval2024/result.bin", b"two")
+
+    with pytest.raises(ArchiveImportError, match="case-equivalent archive member"):
         import_archived_correction_source(
             archive, tmp_path / "data.csv", tmp_path, tmp_path / "run"
         )
@@ -260,6 +353,92 @@ def test_import_rejects_source_hash_mismatch_before_staging(
 
     assert not import_fixture.run_dir.exists()
     assert not list(import_fixture.run_dir.parent.glob(".run.import-staging*"))
+
+
+def test_import_rejects_and_preserves_symlink_destination(
+    import_fixture: ImportFixture, monkeypatch: pytest.MonkeyPatch
+):
+    target = import_fixture.run_dir.parent / "redirect-target"
+    target.mkdir()
+    link = import_fixture.run_dir.parent / "redirect-run"
+    _symlink_or_skip(link, target)
+    monkeypatch.setattr(artifact_import, "validate_correction_source", lambda **_: object())
+
+    with pytest.raises(ArchiveImportError, match="import path is missing or unsafe"):
+        import_archived_correction_source(**{**import_fixture.arguments(), "run_dir": link})
+
+    assert link.is_symlink()
+    assert not any(target.iterdir())
+
+
+def test_import_rejects_and_preserves_dangling_destination_link(
+    import_fixture: ImportFixture, monkeypatch: pytest.MonkeyPatch
+):
+    target = import_fixture.run_dir.parent / "missing-target"
+    link = import_fixture.run_dir.parent / "dangling-run"
+    _symlink_or_skip(link, target)
+    monkeypatch.setattr(artifact_import, "validate_correction_source", lambda **_: object())
+
+    with pytest.raises(ArchiveImportError, match="import path is missing or unsafe"):
+        import_archived_correction_source(**{**import_fixture.arguments(), "run_dir": link})
+
+    assert link.is_symlink()
+    assert not target.exists()
+
+
+def test_import_rejects_linked_destination_parent(
+    import_fixture: ImportFixture, monkeypatch: pytest.MonkeyPatch
+):
+    target = import_fixture.run_dir.parent / "actual-parent"
+    target.mkdir()
+    linked_parent = import_fixture.run_dir.parent / "linked-parent"
+    _symlink_or_skip(linked_parent, target)
+    monkeypatch.setattr(artifact_import, "validate_correction_source", lambda **_: object())
+
+    with pytest.raises(ArchiveImportError, match="import path is missing or unsafe"):
+        import_archived_correction_source(
+            **{**import_fixture.arguments(), "run_dir": linked_parent / "run"}
+        )
+
+    assert linked_parent.is_symlink()
+    assert not (target / "run").exists()
+
+
+def test_import_rejects_raw_destination_parent_traversal(
+    import_fixture: ImportFixture, monkeypatch: pytest.MonkeyPatch
+):
+    raw_run = import_fixture.run_dir.parent / "unused" / ".." / "escaped-run"
+    monkeypatch.setattr(artifact_import, "validate_correction_source", lambda **_: object())
+
+    with pytest.raises(ArchiveImportError, match="import path is missing or unsafe"):
+        import_archived_correction_source(**{**import_fixture.arguments(), "run_dir": raw_run})
+
+    assert not (import_fixture.run_dir.parent / "escaped-run").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction fallback")
+def test_import_rejects_junction_destination_parent_without_symlink_privilege(
+    import_fixture: ImportFixture, monkeypatch: pytest.MonkeyPatch
+):
+    target = import_fixture.run_dir.parent / "junction-target"
+    target.mkdir()
+    junction = import_fixture.run_dir.parent / "junction-parent"
+    subprocess.run(
+        ["cmd.exe", "/c", "mklink", "/J", str(junction), str(target)],
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.setattr(artifact_import, "validate_correction_source", lambda **_: object())
+    try:
+        assert junction.is_junction()
+        with pytest.raises(ArchiveImportError, match="import path is missing or unsafe"):
+            import_archived_correction_source(
+                **{**import_fixture.arguments(), "run_dir": junction / "run"}
+            )
+        assert junction.is_junction()
+        assert not (target / "run").exists()
+    finally:
+        junction.rmdir()
 
 
 def test_import_preserves_failed_staging_evidence(
