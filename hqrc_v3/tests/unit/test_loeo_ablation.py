@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import polars as pl
 import pytest
 
 import hqrc_v3._loeo_publication as fold_contract
+import hqrc_v3.loeo_ablation as ablation_module
 from hqrc_v3.loeo_ablation import _aggregate_products
 
 
@@ -76,3 +78,46 @@ def test_variant_sampler_seeds_are_separate_and_h3_is_backward_compatible() -> N
     default_h3 = fold_contract.sampler_contract(**common)["seed"]
     assert len(set(seeds.values())) == 3
     assert seeds["H3"] == default_h3
+
+
+def test_ablation_forwards_backend_and_device_to_each_fold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    occurrence_ids = _occurrence_ids()
+    publication = SimpleNamespace(
+        occurrence_ids=occurrence_ids,
+        context=SimpleNamespace(model="xgboost", feature_set="B1", seed=7),
+    )
+    received: list[dict[str, object]] = []
+
+    class FoldReached(RuntimeError):
+        pass
+
+    def fit_fold(*_args, **kwargs):
+        received.append(kwargs)
+        raise FoldReached
+
+    monkeypatch.setattr(ablation_module, "validate_loeo_fold_sources", lambda *_args: None)
+    monkeypatch.setattr(ablation_module, "_fit_fold", fit_fold)
+
+    with pytest.raises(FoldReached):
+        ablation_module.fit_loeo_ablation(
+            SimpleNamespace(),
+            publication,
+            SimpleNamespace(),
+            variant="H1",
+            held_out_occurrence_ids=occurrence_ids,
+            root_seed=71,
+            profile="smoke",
+            draws=4,
+            tune=3,
+            chains=4,
+            cores=1,
+            backend="pyro",
+            device="cuda:0",
+            output_root=tmp_path.resolve(),
+        )
+
+    assert received[0]["held_out"] == occurrence_ids[0]
+    assert received[0]["backend"] == "pyro"
+    assert received[0]["device"] == "cuda:0"

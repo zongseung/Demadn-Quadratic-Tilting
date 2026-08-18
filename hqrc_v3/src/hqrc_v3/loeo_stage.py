@@ -24,7 +24,7 @@ from hqrc_v3._loeo_types import (
     LOEOFoldResult,
 )
 from hqrc_v3.bayes.model import HQRCData
-from hqrc_v3.bayes.samplers import sample_hqrc
+from hqrc_v3.bayes.samplers import PYMC_INITIALIZATION, sample_hqrc
 from hqrc_v3.correction_source import ValidatedCorrectionSource
 from hqrc_v3.diagnostics.ar import ApprovedARCalibration, validate_event_residual_context
 from hqrc_v3.diagnostics.loeo import (
@@ -256,6 +256,8 @@ def fit_loeo_fold(
     cores: int | None = None,
     init: str | None = None,
     target_accept: float | None = None,
+    backend: str = "pymc",
+    device: str = "cpu",
     output_root: Path,
 ) -> LOEOFoldResult:
     """Fit or strictly reuse exactly one immutable H3 partial-pooling LOEO fold."""
@@ -276,6 +278,8 @@ def fit_loeo_fold(
         cores=cores,
         init=init,
         target_accept=target_accept,
+        backend=backend,
+        device=device,
     )
     if profile == "paper" and inputs.source.source_profile != "paper":
         raise LOEOFoldError("paper sampler requires a paper-profile correction source")
@@ -313,9 +317,14 @@ def fit_loeo_fold(
                     chains=int(sampler["chains"]),
                     cores=int(sampler["cores"]),
                     seed=int(sampler["seed"]),
-                    init=str(sampler["init"]),
+                    init=(
+                        str(sampler["init"])
+                        if sampler["backend"] == "pymc"
+                        else PYMC_INITIALIZATION
+                    ),
                     target_accept=float(sampler["target_accept"]),
-                    backend="pymc",
+                    backend=str(sampler["backend"]),
+                    device=str(sampler.get("logical_device", "cpu")),
                     paper_profile=profile == "paper",
                 )
                 idata.attrs["hqrc_causal"] = "false"
@@ -359,9 +368,12 @@ def fit_loeo_fold(
                 chains=int(sampler["chains"]),
                 cores=int(sampler["cores"]),
                 seed=int(sampler["seed"]),
-                init=str(sampler["init"]),
+                init=(
+                    str(sampler["init"]) if sampler["backend"] == "pymc" else PYMC_INITIALIZATION
+                ),
                 target_accept=float(sampler["target_accept"]),
-                backend="pymc",
+                backend=str(sampler["backend"]),
+                device=str(sampler.get("logical_device", "cpu")),
                 paper_profile=profile == "paper",
             )
             idata.attrs["hqrc_causal"] = "false"
@@ -425,6 +437,8 @@ def load_loeo_fold_result(
     cores: int | None = None,
     init: str | None = None,
     target_accept: float | None = None,
+    backend: str = "pymc",
+    device: str = "cpu",
     output_root: Path,
 ) -> LOEOFoldResult:
     """Load and semantically revalidate one completed result without fitting."""
@@ -445,6 +459,8 @@ def load_loeo_fold_result(
         cores=cores,
         init=init,
         target_accept=target_accept,
+        backend=backend,
+        device=device,
     )
     identity = publication_io.input_identity(inputs, sampler)
     namespace = publication_io.namespace(Path(output_root), inputs, sampler, identity)
@@ -473,6 +489,8 @@ def load_loeo_fold_material(
     cores: int | None = None,
     init: str | None = None,
     target_accept: float | None = None,
+    backend: str = "pymc",
+    device: str = "cpu",
     output_root: Path,
 ) -> LOEOFoldMaterial:
     """Securely load one completed fold's products and in-memory posterior."""
@@ -493,6 +511,8 @@ def load_loeo_fold_material(
         cores=cores,
         init=init,
         target_accept=target_accept,
+        backend=backend,
+        device=device,
     )
     if profile == "paper" and inputs.source.source_profile != "paper":
         raise LOEOFoldError("paper sampler requires a paper-profile correction source")

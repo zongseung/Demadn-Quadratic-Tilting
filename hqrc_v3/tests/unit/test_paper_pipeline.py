@@ -55,6 +55,8 @@ def _run(
         model = publication.output_dir.parent.parent.parent.name
         assert approved is not None
         assert kwargs["held_out_occurrence_ids"] == publication.occurrence_ids
+        assert kwargs["backend"] == "pyro"
+        assert kwargs["device"] == "cuda:0"
         calls.append(f"primary:{model}")
         return SimpleNamespace(
             output_dir=tmp_path / model / "primary", sampler_fit_count=1, reused=False
@@ -65,6 +67,8 @@ def _run(
         variant = kwargs["variant"]
         assert approved is not None
         assert kwargs["held_out_occurrence_ids"] == publication.occurrence_ids
+        assert kwargs["backend"] == "pyro"
+        assert kwargs["device"] == "cuda:0"
         calls.append(f"{variant.lower()}:{model}")
         return SimpleNamespace(
             output_dir=tmp_path / model / variant.lower(), sampler_fit_count=1, reused=False
@@ -88,7 +92,9 @@ def _run(
             draws=1_000,
             tune=1_000,
             chains=4,
-            cores=4,
+            cores=1,
+            backend="pyro",
+            device="cuda:0",
             approve_derived_ar=approve_derived_ar,
         ),
         calls,

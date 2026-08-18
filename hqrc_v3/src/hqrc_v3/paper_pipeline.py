@@ -111,6 +111,8 @@ def run_paper_loeo_pipeline(
     cores: int | None = None,
     init: str | None = None,
     target_accept: float | None = None,
+    backend: str = "pymc",
+    device: str = "cpu",
     approve_derived_ar: bool = False,
     progress: Progress | None = None,
 ) -> tuple[PipelineContextResult, ...]:
@@ -206,6 +208,8 @@ def run_paper_loeo_pipeline(
                     cores=cores,
                     init=init,
                     target_accept=target_accept,
+                    backend=backend,
+                    device=device,
                     output_root=output,
                 )
                 variant_outputs.append((variant, ablation.output_dir))
@@ -225,6 +229,8 @@ def run_paper_loeo_pipeline(
                     cores=cores,
                     init=init,
                     target_accept=target_accept,
+                    backend=backend,
+                    device=device,
                     output_root=output,
                 )
                 variant_outputs.append((variant, primary.output_dir))

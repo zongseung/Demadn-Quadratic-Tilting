@@ -29,6 +29,7 @@ from hqrc_v3._loeo_types import (
     LOEOFoldProducts,
     LOEOFoldResult,
 )
+from hqrc_v3.accelerators import resolve_device
 from hqrc_v3.bayes.artifacts import load_hqrc_data, write_hqrc_data
 from hqrc_v3.bayes.model import CYCLIC_HOUR_PARAMETERIZATION, HQRCData
 from hqrc_v3.bayes.samplers import (
@@ -102,9 +103,13 @@ def sampler_contract(
     cores: int | None = None,
     init: str | None = None,
     target_accept: float | None = None,
+    backend: str = "pymc",
+    device: str = "cpu",
 ) -> dict[str, object]:
     if variant not in {"H1", "H2", "H3"}:
         raise LOEOFoldError("LOEO sampler variant must be H1, H2, or H3")
+    if backend not in {"pymc", "nutpie", "pyro"}:
+        raise LOEOFoldError("LOEO sampler backend must be pymc, nutpie, or pyro")
     derived_seed = derive_loeo_seed(root_seed, f"{variant}-fold-sampler:{held_out_occurrence_id}")
     if profile == "paper":
         resolved = (
@@ -133,9 +138,16 @@ def sampler_contract(
         raise LOEOFoldError("cores must be a positive integer")
     if resolved_cores > resolved[2]:
         raise LOEOFoldError("cores must not exceed chains")
-    resolved_init = PYMC_INITIALIZATION if init is None else init
-    if resolved_init not in {"adapt_diag", "jitter+adapt_diag"}:
+    if backend == "pyro" and (resolved[2] != 4 or resolved_cores != 1):
+        raise LOEOFoldError("pyro requires 4 sequential chains and cores=1")
+    requested_init = PYMC_INITIALIZATION if init is None else init
+    if requested_init not in {"adapt_diag", "jitter+adapt_diag"}:
         raise LOEOFoldError("LOEO sampler init is not approved")
+    resolved_init = (
+        requested_init
+        if backend == "pymc"
+        else ("nutpie-default" if backend == "nutpie" else "pyro-default")
+    )
     resolved_target_accept = 0.99 if profile == "paper" else 0.9
     if target_accept is not None and (
         isinstance(target_accept, bool)
@@ -144,8 +156,8 @@ def sampler_contract(
         or float(target_accept) != resolved_target_accept
     ):
         raise LOEOFoldError("LOEO target_accept differs from the approved profile setting")
-    return {
-        "backend": "pymc",
+    contract: dict[str, object] = {
+        "backend": backend,
         "root_seed": root_seed,
         "seed": derived_seed,
         "draws": resolved[0],
@@ -157,6 +169,16 @@ def sampler_contract(
         "init": resolved_init,
         "geometry": SAMPLER_GEOMETRY,
     }
+    if backend == "pyro":
+        resolved_device = resolve_device(device)
+        contract.update(
+            {
+                "resolved_device_kind": resolved_device.kind,
+                "logical_device": resolved_device.logical_device,
+                "physical_device": resolved_device.physical_device,
+            }
+        )
+    return contract
 
 
 def _context_payload(context: object) -> dict[str, object]:
@@ -318,7 +340,55 @@ def _posterior_metadata_matches(
         "init": sampler["init"],
         "geometry": sampler["geometry"],
     }
-    if recorded_sampler != expected_sampler:
+    if sampler["backend"] == "pyro":
+        expected_sampler.update(
+            {
+                "resolved_device_kind": sampler["resolved_device_kind"],
+                "logical_device": sampler["logical_device"],
+                "physical_device": sampler["physical_device"],
+                "dtype": "float64",
+                "chain_execution": "sequential",
+            }
+        )
+        runtime_keys = {"capability_probe", "fallback_reason"}
+        if not isinstance(recorded_sampler, dict) or set(recorded_sampler) != {
+            *expected_sampler,
+            *runtime_keys,
+        }:
+            raise LOEOFoldError("LOEO posterior Pyro sampler metadata differs")
+        if any(recorded_sampler.get(key) != value for key, value in expected_sampler.items()):
+            raise LOEOFoldError("LOEO posterior Pyro sampler device metadata differs")
+        probe = recorded_sampler["capability_probe"]
+        fallback_reason = recorded_sampler["fallback_reason"]
+        if (
+            not isinstance(probe, dict)
+            or set(probe) != {"success", "detail"}
+            or probe.get("success") is not True
+            or not isinstance(probe.get("detail"), str)
+            or not probe["detail"]
+            or (
+                fallback_reason is not None
+                and (not isinstance(fallback_reason, str) or not fallback_reason)
+            )
+        ):
+            raise LOEOFoldError("LOEO posterior Pyro runtime metadata is malformed")
+        version_attrs = ("hqrc_arviz_version", "hqrc_torch_version", "hqrc_pyro_version")
+        if any(
+            not isinstance(idata.attrs.get(name), str) or not idata.attrs[name]
+            for name in version_attrs
+        ):
+            raise LOEOFoldError("LOEO posterior Pyro version metadata is malformed")
+        expected_runtime = {
+            "hqrc_device": sampler["logical_device"],
+            "hqrc_physical_device": sampler["physical_device"] or "",
+            "hqrc_dtype": "float64",
+            "hqrc_device_probe": probe["detail"],
+            "hqrc_device_fallback_reason": fallback_reason or "",
+            "hqrc_chain_execution": "sequential",
+        }
+        if any(idata.attrs.get(key) != value for key, value in expected_runtime.items()):
+            raise LOEOFoldError("LOEO posterior Pyro runtime device metadata differs")
+    elif recorded_sampler != expected_sampler:
         raise LOEOFoldError("LOEO posterior sampler contract differs")
     if idata.attrs.get("hqrc_causal") != "false":
         raise LOEOFoldError("LOEO posterior causal label differs")
@@ -886,9 +956,7 @@ def _hqrc_generation_names(
                 raise LOEOFoldError("LOEO HQRCData pointer path is unsafe")
             names.append(path.name)
         source = (
-            generation_fd.descriptor
-            if generation_fd.backend == "posix"
-            else generation_fd.path
+            generation_fd.descriptor if generation_fd.backend == "posix" else generation_fd.path
         )
         if names[0] == names[1] or set(os.listdir(source)) != set(names):
             raise LOEOFoldError("LOEO HQRCData generation namespace differs")
@@ -904,9 +972,7 @@ def _load_hqrc_checkpoint(publication: LOEOPublicationHandle):
     pointer, npz_name, metadata_name = _hqrc_generation_names(publication)
     generation_fd = _open_child(publication.directory, ".hqrc_data.generations")
     try:
-        with tempfile.TemporaryDirectory(
-            prefix="hqrc-v3-task15d-load-"
-        ) as root:
+        with tempfile.TemporaryDirectory(prefix="hqrc-v3-task15d-load-") as root:
             directory = Path(root)
             child = directory / ".hqrc_data.generations"
             child.mkdir()
@@ -982,8 +1048,7 @@ def _existing_downstream_matches(
                 raise LOEOFoldError("partial LOEO downstream product is unreadable") from error
         return isinstance(expected, pl.DataFrame) and _frames_equal(actual, expected)
     return (
-        _relative_json(publication.directory, filename, "partial LOEO downstream JSON")
-        == expected
+        _relative_json(publication.directory, filename, "partial LOEO downstream JSON") == expected
     )
 
 

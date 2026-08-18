@@ -37,6 +37,8 @@ def _selected_folds(
     cores: int | None,
     init: str | None,
     target_accept: float | None,
+    backend: str,
+    device: str,
     output_root: Path,
 ) -> tuple[str, ...]:
     if not isinstance(source, ValidatedCorrectionSource):
@@ -84,6 +86,8 @@ def _selected_folds(
             cores=cores,
             init=init,
             target_accept=target_accept,
+            backend=backend,
+            device=device,
         )
     except (TypeError, ValueError, LOEOFoldError) as error:
         raise LOEOPrimaryError("LOEO primary sampler contract is invalid") from error
@@ -127,9 +131,7 @@ def _matrix_identity(
         identity = dict(material.identity)
         held = material.inputs.held_out_occurrence_id
         sampler = dict(material.sampler)
-        sampler_without_fold_seed = {
-            key: value for key, value in sampler.items() if key != "seed"
-        }
+        sampler_without_fold_seed = {key: value for key, value in sampler.items() if key != "seed"}
         first_without_fold_seed = {
             key: value for key, value in first_sampler.items() if key != "seed"
         }
@@ -208,6 +210,8 @@ def fit_loeo_primary(
     cores: int | None = None,
     init: str | None = None,
     target_accept: float | None = None,
+    backend: str = "pymc",
+    device: str = "cpu",
     output_root: Path,
 ) -> LOEOPrimaryResult:
     """Fit/reuse selected reviewed folds and publish one immutable H3 aggregate."""
@@ -225,6 +229,8 @@ def fit_loeo_primary(
         cores=cores,
         init=init,
         target_accept=target_accept,
+        backend=backend,
+        device=device,
         output_root=output_root,
     )
     fold_fit_counts: dict[str, int] = {}
@@ -244,6 +250,8 @@ def fit_loeo_primary(
                 cores=cores,
                 init=init,
                 target_accept=target_accept,
+                backend=backend,
+                device=device,
                 output_root=output_root,
             )
             fold_fit_counts[held_out] = fitted.sampler_fit_count
@@ -261,6 +269,8 @@ def fit_loeo_primary(
                     cores=cores,
                     init=init,
                     target_accept=target_accept,
+                    backend=backend,
+                    device=device,
                     output_root=output_root,
                 )
             )

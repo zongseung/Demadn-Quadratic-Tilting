@@ -187,6 +187,118 @@ def test_commands_route_to_injected_handler(command, arguments):
     assert received[0].command == command
 
 
+@pytest.mark.parametrize(
+    ("command", "arguments"),
+    [
+        (
+            "run-loeo-primary",
+            [
+                "--source-run-dir",
+                "run",
+                "--config",
+                "experiment.toml",
+                "--output-root",
+                "products",
+            ],
+        ),
+        (
+            "run-paper",
+            [
+                "--data",
+                "input.parquet",
+                "--config",
+                "experiment.toml",
+                "--frozen-model-config",
+                "model.toml",
+                "--frozen-model-hash",
+                "abc",
+                "--event-registry",
+                "events.csv",
+                "--holiday-calendar",
+                "holiday-calendar.csv",
+                "--temporary-holiday-availability",
+                "temporary-holidays.csv",
+                "--run-dir",
+                "run",
+                "--output-root",
+                "products",
+            ],
+        ),
+    ],
+)
+def test_loeo_commands_parse_backend_and_device_without_resolving_them(command, arguments):
+    received = []
+
+    assert (
+        cli.main(
+            [command, *arguments, "--backend", "pyro", "--device", "cuda:0"],
+            handlers={command: received.append},
+        )
+        == 0
+    )
+    assert received[0].backend == "pyro"
+    assert received[0].device == "cuda:0"
+
+
+def test_loeo_cli_handlers_forward_backend_and_device(monkeypatch: pytest.MonkeyPatch):
+    calls = []
+    monkeypatch.setattr(cli, "run_paper_loeo_pipeline", lambda **kwargs: calls.append(kwargs) or ())
+    monkeypatch.setattr(cli, "generate_oof_handler", lambda _arguments: None)
+    monkeypatch.setattr(cli, "fit_final_baselines_handler", lambda _arguments: None)
+    monkeypatch.setattr(cli, "prepare_residuals_handler", lambda _arguments: None)
+    parser = cli.build_parser()
+    primary = parser.parse_args(
+        [
+            "run-loeo-primary",
+            "--source-run-dir",
+            "run",
+            "--config",
+            "experiment.toml",
+            "--output-root",
+            "products",
+            "--backend",
+            "pyro",
+            "--device",
+            "cuda:0",
+        ]
+    )
+    paper = parser.parse_args(
+        [
+            "run-paper",
+            "--data",
+            "input.parquet",
+            "--config",
+            "experiment.toml",
+            "--frozen-model-config",
+            "model.toml",
+            "--frozen-model-hash",
+            "abc",
+            "--event-registry",
+            "events.csv",
+            "--holiday-calendar",
+            "holiday-calendar.csv",
+            "--temporary-holiday-availability",
+            "temporary-holidays.csv",
+            "--run-dir",
+            "run",
+            "--output-root",
+            "products",
+            "--backend",
+            "pyro",
+            "--device",
+            "cuda:0",
+        ]
+    )
+
+    cli.run_loeo_primary_handler(primary)
+    cli.run_paper_handler(paper)
+
+    assert [(call["backend"], call["device"]) for call in calls] == [
+        ("pyro", "cuda:0"),
+        ("pyro", "cuda:0"),
+    ]
+
+
 def test_generate_oof_requires_explicit_frozen_config(capsys):
     result = cli.main(
         [

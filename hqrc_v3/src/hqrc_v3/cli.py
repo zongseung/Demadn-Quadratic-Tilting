@@ -330,6 +330,8 @@ def run_loeo_primary_handler(arguments: argparse.Namespace) -> object:
         cores=arguments.cores,
         init=arguments.init,
         target_accept=arguments.target_accept,
+        backend=arguments.backend,
+        device=arguments.device,
         approve_derived_ar=arguments.approve_derived_ar,
         progress=print,
     )
@@ -370,6 +372,8 @@ def run_paper_handler(arguments: argparse.Namespace) -> object:
         cores=arguments.cores,
         init=arguments.init,
         target_accept=arguments.target_accept,
+        backend=arguments.backend,
+        device=arguments.device,
         approve_derived_ar=arguments.approve_derived_ar,
         progress=print,
     )
@@ -425,7 +429,18 @@ def _add_loeo_pipeline_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--draws", type=int, help="retained draws per chain")
     parser.add_argument("--tune", type=int, help="warm-up draws per chain")
     parser.add_argument("--chains", type=int, help="number of NUTS chains")
-    parser.add_argument("--cores", type=int, help="parallel PyMC chain worker count")
+    parser.add_argument("--cores", type=int, help="chain worker count (Pyro requires 1)")
+    parser.add_argument(
+        "--backend",
+        choices=("pymc", "nutpie", "pyro"),
+        default="pymc",
+        help="NUTS backend (default: pymc)",
+    )
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        help="Pyro device request such as cpu, auto, cuda, cuda:N, or mps",
+    )
     parser.add_argument(
         "--init",
         choices=("adapt_diag", "jitter+adapt_diag"),

@@ -18,7 +18,7 @@ from scipy import stats
 import hqrc_v3._loeo_publication as fold_contract
 from hqrc_v3._loeo_contract import MODEL_OPTIONS, derive_loeo_seed, sha_json
 from hqrc_v3._loeo_products import generate_loeo_fold_products
-from hqrc_v3.bayes.samplers import sample_hqrc
+from hqrc_v3.bayes.samplers import PYMC_INITIALIZATION, sample_hqrc
 from hqrc_v3.correction_source import ValidatedCorrectionSource
 from hqrc_v3.diagnostics.loeo import LOEOPublication
 from hqrc_v3.diagnostics.loeo_ar import ApprovedLOEOARSet
@@ -226,6 +226,8 @@ def _fit_fold(
     cores: int | None,
     init: str | None,
     target_accept: float | None,
+    backend: str,
+    device: str,
     output_root: Path,
 ) -> tuple[Path, int, bool]:
     inputs = prepare_loeo_fold_inputs(
@@ -242,6 +244,8 @@ def _fit_fold(
         cores=cores,
         init=init,
         target_accept=target_accept,
+        backend=backend,
+        device=device,
     )
     if profile == "paper" and source.source_profile != "paper":
         raise LOEOAblationError("paper ablation requires a paper-profile residual source")
@@ -279,9 +283,10 @@ def _fit_fold(
         chains=int(sampler["chains"]),
         cores=int(sampler["cores"]),
         seed=int(sampler["seed"]),
-        init=str(sampler["init"]),
+        init=(str(sampler["init"]) if sampler["backend"] == "pymc" else PYMC_INITIALIZATION),
         target_accept=float(sampler["target_accept"]),
-        backend="pymc",
+        backend=str(sampler["backend"]),
+        device=str(sampler.get("logical_device", "cpu")),
         paper_profile=profile == "paper",
     )
     idata.attrs["hqrc_causal"] = "false"
@@ -445,6 +450,8 @@ def fit_loeo_ablation(
     cores: int | None = None,
     init: str | None = None,
     target_accept: float | None = None,
+    backend: str = "pymc",
+    device: str = "cpu",
     output_root: Path,
 ) -> LOEOAblationResult:
     """Fit/reuse all selected H1 or H2 folds and publish table-ready metrics."""
@@ -475,6 +482,8 @@ def fit_loeo_ablation(
             cores=cores,
             init=init,
             target_accept=target_accept,
+            backend=backend,
+            device=device,
             output_root=Path(output_root),
         )
         fold_dirs.append(directory)

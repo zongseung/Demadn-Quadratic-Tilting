@@ -9,6 +9,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import arviz as az
 import numpy as np
@@ -156,7 +157,15 @@ def _posterior_dataset(inputs, *, chains: int = 2, draws: int = 4) -> xr.Dataset
     return dataset.assign_coords({name: np.arange(size) for name, size in dataset.sizes.items()})
 
 
-def _fake_idata(inputs, *, chains: int = 2, draws: int = 4, sampler=None) -> az.InferenceData:
+def _fake_idata(
+    inputs,
+    *,
+    chains: int = 2,
+    draws: int = 4,
+    sampler=None,
+    backend: str = "pymc",
+    extra_attrs: dict[str, object] | None = None,
+) -> az.InferenceData:
     idata = az.InferenceData(
         posterior=_posterior_dataset(inputs, chains=chains, draws=draws),
         sample_stats=xr.Dataset(
@@ -169,7 +178,7 @@ def _fake_idata(inputs, *, chains: int = 2, draws: int = 4, sampler=None) -> az.
     if sampler is not None:
         idata.attrs.update(
             {
-                "hqrc_backend": "pymc",
+                "hqrc_backend": backend,
                 "hqrc_calibration_json": json.dumps(
                     {
                         "artifact_path": str(inputs.approved.artifact_path),
@@ -206,6 +215,7 @@ def _fake_idata(inputs, *, chains: int = 2, draws: int = 4, sampler=None) -> az.
                 "hqrc_sampler_json": json.dumps(sampler, sort_keys=True),
             }
         )
+        idata.attrs.update(extra_attrs or {})
     return idata
 
 
@@ -391,9 +401,7 @@ def _smoke_fit_kwargs(output_root: Path, *, seed: int = 71) -> dict[str, object]
 @pytest.fixture
 def approved_fold(source: ValidatedCorrectionSource, tmp_path: Path, monkeypatch):
     if os.name == "nt":
-        monkeypatch.setattr(
-            loeo_diagnostics_module, "_fsync_directory", portable_fsync_directory
-        )
+        monkeypatch.setattr(loeo_diagnostics_module, "_fsync_directory", portable_fsync_directory)
         monkeypatch.setattr(loeo_diagnostics_module, "_fsync_file", portable_fsync_file)
         monkeypatch.setattr(loeo_ar_module, "_fsync_directory", portable_fsync_directory)
         monkeypatch.setattr(ar_diagnostics_module, "exclusive_lock", _persistent_windows_lock)
@@ -425,6 +433,291 @@ def test_public_api_is_typed_and_seed_derivation_is_stable() -> None:
     assert derive_loeo_seed(41, "sampler:seollal-2024") != derive_loeo_seed(
         41, "sampler:chuseok-2024"
     )
+
+
+def test_default_sampler_contract_is_frozen_and_pyro_binds_physical_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    common = {
+        "profile": "smoke",
+        "root_seed": 71,
+        "held_out_occurrence_id": "seollal-2024",
+        "draws": 4,
+        "tune": 3,
+        "chains": 4,
+    }
+    assert loeo_publication_module.sampler_contract(**common) == {
+        "backend": "pymc",
+        "root_seed": 71,
+        "seed": derive_loeo_seed(71, "H3-fold-sampler:seollal-2024"),
+        "draws": 4,
+        "tune": 3,
+        "chains": 4,
+        "cores": 1,
+        "target_accept": 0.9,
+        "profile": "smoke",
+        "init": "adapt_diag",
+        "geometry": "noncentered-cyclic-hour-rw1-v1",
+    }
+    physical_devices = iter(("0", "1"))
+    monkeypatch.setattr(
+        loeo_publication_module,
+        "resolve_device",
+        lambda _request: SimpleNamespace(
+            kind="cuda",
+            logical_device="cuda:0",
+            physical_device=next(physical_devices),
+        ),
+        raising=False,
+    )
+
+    gpu_zero = loeo_publication_module.sampler_contract(**common, backend="pyro", device="auto")
+    gpu_one = loeo_publication_module.sampler_contract(**common, backend="pyro", device="auto")
+
+    assert gpu_zero["backend"] == gpu_one["backend"] == "pyro"
+    assert gpu_zero["resolved_device_kind"] == gpu_one["resolved_device_kind"] == "cuda"
+    assert gpu_zero["logical_device"] == gpu_one["logical_device"] == "cuda:0"
+    assert gpu_zero["physical_device"] == "0"
+    assert gpu_one["physical_device"] == "1"
+    assert gpu_zero != gpu_one
+    assert "capability_probe" not in gpu_zero
+    assert "fallback_reason" not in gpu_zero
+
+
+def test_pyro_fit_reload_validates_runtime_device_metadata_without_rewriting_evidence(
+    approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    monkeypatch.setattr(
+        loeo_publication_module,
+        "resolve_device",
+        lambda _request: SimpleNamespace(
+            kind="cuda",
+            logical_device="cuda:0",
+            physical_device="1",
+        ),
+        raising=False,
+    )
+    sample_calls: list[dict[str, object]] = []
+
+    def fake_sample(data, calibration, **kwargs):
+        del calibration
+        held_out = (set(publication.occurrence_ids) - set(data.occurrence_ids)).pop()
+        inputs = prepare_loeo_fold_inputs(
+            source,
+            publication,
+            approved,
+            held_out_occurrence_id=held_out,
+        )
+        sample_calls.append(kwargs)
+        return _fake_idata(
+            inputs,
+            chains=kwargs["chains"],
+            draws=kwargs["draws"],
+            backend="pyro",
+            sampler={
+                "draws": kwargs["draws"],
+                "tune": kwargs["tune"],
+                "chains": kwargs["chains"],
+                "cores": 1,
+                "seed": kwargs["seed"],
+                "target_accept": 0.9,
+                "paper_profile": False,
+                "init": "pyro-default",
+                "geometry": "noncentered-cyclic-hour-rw1-v1",
+                "resolved_device_kind": "cuda",
+                "logical_device": "cuda:0",
+                "physical_device": "1",
+                "dtype": "float64",
+                "chain_execution": "sequential",
+                "capability_probe": {
+                    "success": True,
+                    "detail": "float64-gradient-lkj-ar",
+                },
+                "fallback_reason": None,
+            },
+            extra_attrs={
+                "hqrc_arviz_version": "0.21.0",
+                "hqrc_torch_version": "2.7.1",
+                "hqrc_pyro_version": "1.9.1",
+                "hqrc_device": "cuda:0",
+                "hqrc_physical_device": "1",
+                "hqrc_dtype": "float64",
+                "hqrc_device_probe": "float64-gradient-lkj-ar",
+                "hqrc_device_fallback_reason": "",
+                "hqrc_chain_execution": "sequential",
+            },
+        )
+
+    monkeypatch.setattr(loeo_stage_module, "sample_hqrc", fake_sample)
+    monkeypatch.setattr(
+        loeo_publication_module,
+        "validate_inference_data",
+        lambda *_args, **_kwargs: SamplingDiagnostics(1.0, 800.0, 700.0, 0),
+    )
+    kwargs = {
+        **_smoke_fit_kwargs(tmp_path / "pyro-device", seed=913),
+        "chains": 4,
+        "backend": "pyro",
+        "device": "auto",
+    }
+    fitted = fit_loeo_fold(source, publication, approved, **kwargs)
+    assert sample_calls == [
+        {
+            "variant": "H3",
+            "pooling": "partial",
+            "options": HQRCModelOptions(
+                covariance="full", include_restriction=True, innovation="normal_ar1"
+            ),
+            "draws": 4,
+            "tune": 3,
+            "chains": 4,
+            "cores": 1,
+            "seed": derive_loeo_seed(913, "H3-fold-sampler:seollal-2024"),
+            "init": "adapt_diag",
+            "target_accept": 0.9,
+            "backend": "pyro",
+            "device": "cuda:0",
+            "paper_profile": False,
+        }
+    ]
+
+    idata = az.from_netcdf(fitted.posterior_path).load()
+    try:
+        idata.attrs["hqrc_physical_device"] = "0"
+        replacement = tmp_path / "runtime-device-mismatch.nc"
+        az.to_netcdf(idata, replacement)
+    finally:
+        idata.close()
+    os.replace(replacement, fitted.posterior_path)
+    checkpoint = json.loads((fitted.output_dir / "posterior.checkpoint.json").read_bytes())
+    checkpoint["posterior_sha256"] = file_sha256(fitted.posterior_path)
+    _attacker_rewrite_json(fitted.output_dir / "posterior.checkpoint.json", checkpoint)
+    manifest = json.loads(fitted.manifest_path.read_bytes())
+    manifest["outputs"]["posterior"]["sha256"] = file_sha256(fitted.posterior_path)
+    manifest["outputs"]["posterior_checkpoint"]["sha256"] = file_sha256(
+        fitted.output_dir / "posterior.checkpoint.json"
+    )
+    unsigned = {
+        key: manifest[key]
+        for key in ("schema_version", "state", "causal", "identity", "outputs", "rows")
+    }
+    manifest["manifest_digest"] = loeo_contract_module.sha_json(unsigned)
+    _attacker_rewrite_json(fitted.manifest_path, manifest)
+    _attacker_rewrite_json(
+        fitted.output_dir / "COMPLETE",
+        {
+            "manifest_sha256": file_sha256(fitted.manifest_path),
+            "state": "COMPLETE",
+            "causal": False,
+        },
+    )
+    before = _tree_snapshot(fitted.output_dir)
+
+    with pytest.raises(LOEOFoldError, match="device"):
+        load_loeo_fold_result(source, publication, approved, **kwargs)
+
+    assert _tree_snapshot(fitted.output_dir) == before
+
+
+def test_pyro_reload_fails_closed_on_malformed_runtime_probe_fallback_and_versions(
+    approved_fold, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    inputs = prepare_loeo_fold_inputs(
+        source,
+        publication,
+        approved,
+        held_out_occurrence_id="seollal-2024",
+    )
+    monkeypatch.setattr(
+        loeo_publication_module,
+        "resolve_device",
+        lambda _request: SimpleNamespace(kind="cuda", logical_device="cuda:0", physical_device="1"),
+        raising=False,
+    )
+    sampler = loeo_publication_module.sampler_contract(
+        "smoke",
+        root_seed=919,
+        held_out_occurrence_id="seollal-2024",
+        draws=4,
+        tune=3,
+        chains=4,
+        backend="pyro",
+        device="auto",
+    )
+    recorded = {
+        "draws": 4,
+        "tune": 3,
+        "chains": 4,
+        "cores": 1,
+        "seed": sampler["seed"],
+        "target_accept": 0.9,
+        "paper_profile": False,
+        "init": "pyro-default",
+        "geometry": "noncentered-cyclic-hour-rw1-v1",
+        "resolved_device_kind": "cuda",
+        "logical_device": "cuda:0",
+        "physical_device": "1",
+        "dtype": "float64",
+        "chain_execution": "sequential",
+        "capability_probe": {"success": True, "detail": "float64-gradient-lkj-ar"},
+        "fallback_reason": None,
+    }
+    runtime = {
+        "hqrc_arviz_version": "0.21.0",
+        "hqrc_torch_version": "2.7.1",
+        "hqrc_pyro_version": "1.9.1",
+        "hqrc_device": "cuda:0",
+        "hqrc_physical_device": "1",
+        "hqrc_dtype": "float64",
+        "hqrc_device_probe": "float64-gradient-lkj-ar",
+        "hqrc_device_fallback_reason": "",
+        "hqrc_chain_execution": "sequential",
+        "hqrc_causal": "false",
+    }
+    mutations = {
+        "hqrc_torch_version": "",
+        "hqrc_pyro_version": 1,
+        "hqrc_device": "cuda:1",
+        "hqrc_physical_device": "0",
+        "hqrc_dtype": "float32",
+        "hqrc_device_probe": "",
+        "hqrc_device_fallback_reason": 7,
+        "hqrc_chain_execution": "parallel",
+    }
+    for name, value in mutations.items():
+        idata = _fake_idata(
+            inputs,
+            chains=4,
+            draws=4,
+            sampler=recorded,
+            backend="pyro",
+            extra_attrs={**runtime, name: value},
+        )
+        try:
+            with pytest.raises(LOEOFoldError, match="metadata|device|sampler"):
+                loeo_publication_module._posterior_metadata_matches(idata, inputs, sampler)
+        finally:
+            idata.close()
+
+    malformed_probe = {
+        **recorded,
+        "capability_probe": {"success": False, "detail": "unsupported op"},
+    }
+    idata = _fake_idata(
+        inputs,
+        chains=4,
+        draws=4,
+        sampler=malformed_probe,
+        backend="pyro",
+        extra_attrs=runtime,
+    )
+    try:
+        with pytest.raises(LOEOFoldError, match="metadata|device|sampler"):
+            loeo_publication_module._posterior_metadata_matches(idata, inputs, sampler)
+    finally:
+        idata.close()
 
 
 def test_safe_event_loader_and_preparation_bind_one_physical_fold(
@@ -1421,9 +1714,12 @@ def test_windows_backend_fold_publication_writes_loads_validates_and_reuses(tmp_
             publication, "manifest.json", payload, boundary="manifest-prewrite"
         )
         loeo_publication_module.guard_namespace(publication)
-        assert loeo_publication_module._relative_json(
-            publication.directory, "manifest.json", "manifest"
-        ) == payload
+        assert (
+            loeo_publication_module._relative_json(
+                publication.directory, "manifest.json", "manifest"
+            )
+            == payload
+        )
         directory_identity = publication.directory.identity
         artifact_identity = (publication.path / "manifest.json").stat().st_ino
 
@@ -1431,9 +1727,12 @@ def test_windows_backend_fold_publication_writes_loads_validates_and_reuses(tmp_
         loeo_publication_module.guard_namespace(publication)
         assert publication.directory.identity == directory_identity
         assert loeo_publication_module.publication_has(publication, "manifest.json")
-        assert loeo_publication_module._relative_json(
-            publication.directory, "manifest.json", "manifest"
-        ) == payload
+        assert (
+            loeo_publication_module._relative_json(
+                publication.directory, "manifest.json", "manifest"
+            )
+            == payload
+        )
         assert (publication.path / "manifest.json").stat().st_ino == artifact_identity
     assert _publication_temporaries(namespace.path) == []
 
@@ -1444,9 +1743,7 @@ def test_windows_relative_file_identity_failure_closes_descriptor(tmp_path, monk
     directory_path.mkdir(parents=True)
     artifact = directory_path / "artifact.bin"
     artifact.write_bytes(b"content")
-    directory = loeo_publication_module.trusted_directory(
-        root, directory_path, backend="windows"
-    )
+    directory = loeo_publication_module.trusted_directory(root, directory_path, backend="windows")
     original_open = os.open
     original_fstat = os.fstat
     opened: list[int] = []
@@ -1482,9 +1779,7 @@ def test_windows_relative_file_identity_failure_closes_descriptor(tmp_path, monk
         directory.close()
 
 
-def test_namespace_root_identity_failure_closes_every_acquired_directory(
-    tmp_path, monkeypatch
-):
+def test_namespace_root_identity_failure_closes_every_acquired_directory(tmp_path, monkeypatch):
     namespace = loeo_publication_module.secure_namespace(
         (tmp_path / "results").resolve(), ("fold",)
     )

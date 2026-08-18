@@ -338,12 +338,20 @@ def test_fake_ten_fold_matrix_calls_only_reviewed_kernel_and_aggregates_exactly(
     materials = {held: _fake_material(approved_fold, held, tmp_path) for held in selected}
     calls = _install_fake_matrix_kernel(monkeypatch, materials)
     result = fit_loeo_primary(
-        source, publication, approved, **_fit_kwargs(tmp_path / "matrix", selected)
+        source,
+        publication,
+        approved,
+        **{
+            **_fit_kwargs(tmp_path / "matrix", selected),
+            "backend": "nutpie",
+            "device": "cuda:0",
+        },
     )
     assert tuple(call["held_out_occurrence_id"] for call in calls) == selected
     assert all(call["sampler_seed"] == 71 for call in calls)
     assert all(call["profile"] == "smoke" for call in calls)
     assert all(call["draws"] == 4 and call["tune"] == 3 and call["chains"] == 2 for call in calls)
+    assert all(call["backend"] == "nutpie" and call["device"] == "cuda:0" for call in calls)
     hourly = pl.read_parquet(result.hourly_predictions_path)
     per_event = pl.read_parquet(result.per_event_metrics_path)
     aggregate = pl.read_parquet(result.aggregate_metrics_path)
