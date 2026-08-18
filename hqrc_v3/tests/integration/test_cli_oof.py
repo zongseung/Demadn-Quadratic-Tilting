@@ -240,28 +240,35 @@ def test_loeo_commands_parse_backend_and_device_without_resolving_them(command, 
     assert received[0].device == "cuda:0"
 
 
-def test_loeo_cli_handlers_forward_backend_and_device(monkeypatch: pytest.MonkeyPatch):
+def test_loeo_cli_handlers_preserve_pymc_init_and_leave_non_pymc_at_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
     calls = []
     monkeypatch.setattr(cli, "run_paper_loeo_pipeline", lambda **kwargs: calls.append(kwargs) or ())
     monkeypatch.setattr(cli, "generate_oof_handler", lambda _arguments: None)
     monkeypatch.setattr(cli, "fit_final_baselines_handler", lambda _arguments: None)
     monkeypatch.setattr(cli, "prepare_residuals_handler", lambda _arguments: None)
     parser = cli.build_parser()
+    primary_arguments = [
+        "run-loeo-primary",
+        "--source-run-dir",
+        "run",
+        "--config",
+        "experiment.toml",
+        "--output-root",
+        "products",
+    ]
     primary = parser.parse_args(
         [
-            "run-loeo-primary",
-            "--source-run-dir",
-            "run",
-            "--config",
-            "experiment.toml",
-            "--output-root",
-            "products",
+            *primary_arguments,
             "--backend",
             "pyro",
             "--device",
             "cuda:0",
         ]
     )
+    nutpie = parser.parse_args([*primary_arguments, "--backend", "nutpie"])
+    pymc = parser.parse_args(primary_arguments)
     paper = parser.parse_args(
         [
             "run-paper",
@@ -292,10 +299,14 @@ def test_loeo_cli_handlers_forward_backend_and_device(monkeypatch: pytest.Monkey
 
     cli.run_loeo_primary_handler(primary)
     cli.run_paper_handler(paper)
+    cli.run_loeo_primary_handler(nutpie)
+    cli.run_loeo_primary_handler(pymc)
 
-    assert [(call["backend"], call["device"]) for call in calls] == [
-        ("pyro", "cuda:0"),
-        ("pyro", "cuda:0"),
+    assert [(call["backend"], call["device"], call["init"]) for call in calls] == [
+        ("pyro", "cuda:0", None),
+        ("pyro", "cuda:0", None),
+        ("nutpie", "cpu", None),
+        ("pymc", "cpu", "jitter+adapt_diag"),
     ]
 
 

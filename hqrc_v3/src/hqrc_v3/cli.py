@@ -294,6 +294,12 @@ def _pipeline_feature_sets(value: str) -> tuple[str, ...]:
     return ("B0", "B1") if value == "all" else (value,)
 
 
+def _loeo_cli_init(arguments: argparse.Namespace) -> str | None:
+    if arguments.backend == "pymc" and arguments.init is None:
+        return "jitter+adapt_diag"
+    return arguments.init
+
+
 def _print_pipeline_result(result: object) -> None:
     """Emit one compact, machine-independent completion line per HQRC context."""
 
@@ -328,7 +334,7 @@ def run_loeo_primary_handler(arguments: argparse.Namespace) -> object:
         tune=arguments.tune,
         chains=arguments.chains,
         cores=arguments.cores,
-        init=arguments.init,
+        init=_loeo_cli_init(arguments),
         target_accept=arguments.target_accept,
         backend=arguments.backend,
         device=arguments.device,
@@ -370,7 +376,7 @@ def run_paper_handler(arguments: argparse.Namespace) -> object:
         tune=arguments.tune,
         chains=arguments.chains,
         cores=arguments.cores,
-        init=arguments.init,
+        init=_loeo_cli_init(arguments),
         target_accept=arguments.target_accept,
         backend=arguments.backend,
         device=arguments.device,
@@ -444,8 +450,7 @@ def _add_loeo_pipeline_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--init",
         choices=("adapt_diag", "jitter+adapt_diag"),
-        default="jitter+adapt_diag",
-        help="explicit NUTS initialization contract",
+        help="explicit NUTS initialization (PyMC CLI default: jitter+adapt_diag)",
     )
     parser.add_argument(
         "--target-accept",

@@ -18,6 +18,7 @@ from scipy import stats
 import hqrc_v3._loeo_publication as fold_contract
 from hqrc_v3._loeo_contract import MODEL_OPTIONS, derive_loeo_seed, sha_json
 from hqrc_v3._loeo_products import generate_loeo_fold_products
+from hqrc_v3._loeo_types import LOEOFoldError
 from hqrc_v3.bayes.samplers import PYMC_INITIALIZATION, sample_hqrc
 from hqrc_v3.correction_source import ValidatedCorrectionSource
 from hqrc_v3.diagnostics.loeo import LOEOPublication
@@ -211,6 +212,18 @@ def _fold_identity(
     }
 
 
+def _validate_posterior_metadata(idata, inputs, sampler, *, variant: AblationVariant) -> None:
+    try:
+        fold_contract.validate_posterior_provenance(
+            idata,
+            inputs,
+            sampler,
+            variant=variant,
+        )
+    except LOEOFoldError as error:
+        raise LOEOAblationError("ablation posterior metadata differs") from error
+
+
 def _fit_fold(
     source: ValidatedCorrectionSource,
     publication: LOEOPublication,
@@ -270,6 +283,14 @@ def _fit_fold(
     )
     if directory.exists():
         _validate_complete(directory, identity=identity, files=_FOLD_FILES)
+        try:
+            idata = az.from_netcdf(directory / "posterior.nc")
+        except (OSError, ValueError) as error:
+            raise LOEOAblationError("ablation posterior metadata is unreadable") from error
+        try:
+            _validate_posterior_metadata(idata, inputs, sampler, variant=variant)
+        finally:
+            idata.close()
         return directory, 0, True
 
     idata = sample_hqrc(
@@ -289,29 +310,32 @@ def _fit_fold(
         device=str(sampler.get("logical_device", "cpu")),
         paper_profile=profile == "paper",
     )
-    idata.attrs["hqrc_causal"] = "false"
-    products = generate_loeo_fold_products(
-        inputs,
-        idata,
-        variant=variant,
-        predictive_seed=int(identity["predictive_seed"]),
-        predictive_draws=int(sampler["draws"]) * int(sampler["chains"]),
-    )
-
-    def write(temporary: Path) -> None:
-        az.to_netcdf(idata, temporary / "posterior.nc")
-        products.hourly_predictions.with_columns(pl.lit(variant).alias("variant")).write_parquet(
-            temporary / "hourly_predictions.parquet"
+    try:
+        idata.attrs["hqrc_causal"] = "false"
+        _validate_posterior_metadata(idata, inputs, sampler, variant=variant)
+        products = generate_loeo_fold_products(
+            inputs,
+            idata,
+            variant=variant,
+            predictive_seed=int(identity["predictive_seed"]),
+            predictive_draws=int(sampler["draws"]) * int(sampler["chains"]),
         )
-        products.metrics.with_columns(pl.lit(variant).alias("variant")).write_parquet(
-            temporary / "metrics.parquet"
-        )
-        _write_json(temporary / "posterior_summary.json", products.posterior_summary)
 
-    _publish_directory(directory, identity=identity, files=_FOLD_FILES, writer=write)
-    close = getattr(idata, "close", None)
-    if callable(close):
-        close()
+        def write(temporary: Path) -> None:
+            az.to_netcdf(idata, temporary / "posterior.nc")
+            products.hourly_predictions.with_columns(
+                pl.lit(variant).alias("variant")
+            ).write_parquet(temporary / "hourly_predictions.parquet")
+            products.metrics.with_columns(pl.lit(variant).alias("variant")).write_parquet(
+                temporary / "metrics.parquet"
+            )
+            _write_json(temporary / "posterior_summary.json", products.posterior_summary)
+
+        _publish_directory(directory, identity=identity, files=_FOLD_FILES, writer=write)
+    finally:
+        close = getattr(idata, "close", None)
+        if callable(close):
+            close()
     return directory, 1, False
 
 

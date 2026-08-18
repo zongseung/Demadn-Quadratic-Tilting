@@ -20,7 +20,7 @@ import numpy as np
 import polars as pl
 
 from hqrc_v3._loeo_contract import MODEL_OPTIONS, canonical_json, derive_loeo_seed, sha_json
-from hqrc_v3._loeo_posterior import validate_h3_posterior
+from hqrc_v3._loeo_posterior import posterior_mapping, validate_h3_posterior
 from hqrc_v3._loeo_products import generate_loeo_fold_products
 from hqrc_v3._loeo_types import (
     LOEOFoldError,
@@ -143,6 +143,8 @@ def sampler_contract(
     requested_init = PYMC_INITIALIZATION if init is None else init
     if requested_init not in {"adapt_diag", "jitter+adapt_diag"}:
         raise LOEOFoldError("LOEO sampler init is not approved")
+    if backend != "pymc" and requested_init != PYMC_INITIALIZATION:
+        raise LOEOFoldError("non-PyMC LOEO samplers do not support an init override")
     resolved_init = (
         requested_init
         if backend == "pymc"
@@ -297,6 +299,43 @@ def _posterior_metadata_matches(
     idata: object, inputs: LOEOFoldInputs, sampler: Mapping[str, object]
 ) -> None:
     posterior = validate_h3_posterior(idata, inputs)
+    _validate_posterior_provenance(
+        idata,
+        inputs,
+        sampler,
+        variant="H3",
+        posterior=posterior,
+    )
+
+
+def validate_posterior_provenance(
+    idata: object,
+    inputs: LOEOFoldInputs,
+    sampler: Mapping[str, object],
+    *,
+    variant: str,
+) -> None:
+    """Validate variant-aware sampler/runtime metadata without H3-only schema rules."""
+
+    if variant not in {"H1", "H2", "H3"}:
+        raise LOEOFoldError("LOEO posterior variant is invalid")
+    _validate_posterior_provenance(
+        idata,
+        inputs,
+        sampler,
+        variant=variant,
+        posterior=posterior_mapping(idata),
+    )
+
+
+def _validate_posterior_provenance(
+    idata: object,
+    inputs: LOEOFoldInputs,
+    sampler: Mapping[str, object],
+    *,
+    variant: str,
+    posterior: Mapping[str, object],
+) -> None:
     if (
         int(posterior.sizes["chain"]) != sampler["chains"]
         or int(posterior.sizes["draw"]) != sampler["draws"]
@@ -321,12 +360,12 @@ def _posterior_metadata_matches(
     if calibration != expected_calibration:
         raise LOEOFoldError("LOEO posterior approved fold context differs")
     if model != {
-        "variant": "H3",
+        "variant": variant,
         "pooling": "partial",
         "options": asdict(MODEL_OPTIONS),
         "cyclic_hour_parameterization": CYCLIC_HOUR_PARAMETERIZATION,
     }:
-        raise LOEOFoldError("LOEO posterior H3 model contract differs")
+        raise LOEOFoldError(f"LOEO posterior {variant} model contract differs")
     if idata.attrs.get("hqrc_backend") != sampler["backend"]:
         raise LOEOFoldError("LOEO posterior sampler backend differs")
     expected_sampler = {
@@ -1433,6 +1472,7 @@ __all__ = [
     "secure_namespace",
     "validate_complete",
     "validate_input_checkpoint",
+    "validate_posterior_provenance",
     "validate_downstream_prefix",
     "write_posterior_checkpoint",
     "write_products",

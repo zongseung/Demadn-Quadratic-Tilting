@@ -164,6 +164,7 @@ def _fake_idata(
     draws: int = 4,
     sampler=None,
     backend: str = "pymc",
+    variant: str = "H3",
     extra_attrs: dict[str, object] | None = None,
 ) -> az.InferenceData:
     idata = az.InferenceData(
@@ -199,7 +200,7 @@ def _fake_idata(
                 ),
                 "hqrc_model_json": json.dumps(
                     {
-                        "variant": "H3",
+                        "variant": variant,
                         "pooling": "partial",
                         "options": asdict(
                             HQRCModelOptions(
@@ -482,6 +483,39 @@ def test_default_sampler_contract_is_frozen_and_pyro_binds_physical_device(
     assert gpu_zero != gpu_one
     assert "capability_probe" not in gpu_zero
     assert "fallback_reason" not in gpu_zero
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected_init"),
+    [("nutpie", "nutpie-default"), ("pyro", "pyro-default")],
+)
+def test_non_pymc_sampler_contract_uses_default_sentinel_and_rejects_jitter_override(
+    backend: str,
+    expected_init: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        loeo_publication_module,
+        "resolve_device",
+        lambda _request: SimpleNamespace(kind="cpu", logical_device="cpu", physical_device=None),
+    )
+    common = {
+        "profile": "smoke",
+        "root_seed": 71,
+        "held_out_occurrence_id": "seollal-2024",
+        "draws": 4,
+        "tune": 3,
+        "chains": 4,
+        "backend": backend,
+    }
+
+    assert loeo_publication_module.sampler_contract(**common)["init"] == expected_init
+    assert (
+        loeo_publication_module.sampler_contract(**common, init="adapt_diag")["init"]
+        == expected_init
+    )
+    with pytest.raises(LOEOFoldError, match="init"):
+        loeo_publication_module.sampler_contract(**common, init="jitter+adapt_diag")
 
 
 def test_pyro_fit_reload_validates_runtime_device_metadata_without_rewriting_evidence(

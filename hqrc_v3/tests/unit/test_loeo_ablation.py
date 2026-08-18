@@ -2,17 +2,31 @@
 
 from __future__ import annotations
 
+import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import arviz as az
 import numpy as np
 import polars as pl
 import pytest
+from test_loeo_stage import _fake_idata, _tree_snapshot
+from test_loeo_stage import approved_fold as approved_fold_fixture
+from test_loeo_stage import base_source as base_source_fixture
+from test_loeo_stage import source as source_fixture
 
 import hqrc_v3._loeo_publication as fold_contract
 import hqrc_v3.loeo_ablation as ablation_module
+from hqrc_v3._loeo_types import LOEOFoldError
 from hqrc_v3.loeo_ablation import _aggregate_products
+from hqrc_v3.loeo_stage import prepare_loeo_fold_inputs
+from hqrc_v3.provenance import file_sha256
+
+approved_fold = approved_fold_fixture
+base_source = base_source_fixture
+source = source_fixture
 
 
 def _occurrence_ids() -> tuple[str, ...]:
@@ -121,3 +135,120 @@ def test_ablation_forwards_backend_and_device_to_each_fold(
     assert received[0]["held_out"] == occurrence_ids[0]
     assert received[0]["backend"] == "pyro"
     assert received[0]["device"] == "cuda:0"
+
+
+@pytest.mark.parametrize("variant", ["H1", "H2"])
+def test_ablation_rejects_fresh_and_reused_posterior_metadata_without_rewriting_evidence(
+    variant: str,
+    approved_fold,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, publication, approved = approved_fold
+    held_out = "seollal-2024"
+    inputs = prepare_loeo_fold_inputs(
+        source,
+        publication,
+        approved,
+        held_out_occurrence_id=held_out,
+    )
+    monkeypatch.setattr(
+        fold_contract,
+        "resolve_device",
+        lambda _request: SimpleNamespace(kind="cuda", logical_device="cuda:0", physical_device="1"),
+    )
+    valid_runtime = False
+
+    def fake_sample(_data, _calibration, **kwargs):
+        sampler = {
+            "draws": kwargs["draws"],
+            "tune": kwargs["tune"],
+            "chains": kwargs["chains"],
+            "cores": 1,
+            "seed": kwargs["seed"],
+            "target_accept": 0.9,
+            "paper_profile": False,
+            "init": "pyro-default",
+            "geometry": "noncentered-cyclic-hour-rw1-v1",
+            "resolved_device_kind": "cuda",
+            "logical_device": "cuda:0",
+            "physical_device": "1",
+            "dtype": "float64",
+            "chain_execution": "sequential",
+            "capability_probe": {
+                "success": True,
+                "detail": "float64-gradient-lkj-ar",
+            },
+            "fallback_reason": None,
+        }
+        return _fake_idata(
+            inputs,
+            chains=kwargs["chains"],
+            draws=kwargs["draws"],
+            sampler=sampler,
+            backend="pyro",
+            variant=variant,
+            extra_attrs={
+                "hqrc_arviz_version": "0.21.0",
+                "hqrc_torch_version": "2.7.1",
+                "hqrc_pyro_version": "1.9.1",
+                "hqrc_device": "cuda:0",
+                "hqrc_physical_device": "1" if valid_runtime else "0",
+                "hqrc_dtype": "float64",
+                "hqrc_device_probe": "float64-gradient-lkj-ar",
+                "hqrc_device_fallback_reason": "",
+                "hqrc_chain_execution": "sequential",
+            },
+        )
+
+    monkeypatch.setattr(ablation_module, "sample_hqrc", fake_sample)
+    output_root = tmp_path / f"ablation-{variant.lower()}"
+    kwargs = {
+        "held_out": held_out,
+        "variant": variant,
+        "root_seed": 71,
+        "profile": "smoke",
+        "draws": 4,
+        "tune": 3,
+        "chains": 4,
+        "cores": 1,
+        "init": None,
+        "target_accept": None,
+        "backend": "pyro",
+        "device": "auto",
+        "output_root": output_root,
+    }
+
+    with pytest.raises((LOEOFoldError, ablation_module.LOEOAblationError), match="metadata|device"):
+        ablation_module._fit_fold(source, publication, approved, **kwargs)
+    assert list(output_root.rglob("posterior.nc")) == []
+
+    valid_runtime = True
+    directory, fitted, reused = ablation_module._fit_fold(source, publication, approved, **kwargs)
+    assert (fitted, reused) == (1, False)
+    idata = az.from_netcdf(directory / "posterior.nc").load()
+    try:
+        idata.attrs["hqrc_physical_device"] = "0"
+        replacement = tmp_path / f"{variant.lower()}-metadata-mismatch.nc"
+        az.to_netcdf(idata, replacement)
+    finally:
+        idata.close()
+    os.replace(replacement, directory / "posterior.nc")
+    manifest = json.loads((directory / "manifest.json").read_bytes())
+    manifest["outputs"]["posterior.nc"]["sha256"] = file_sha256(directory / "posterior.nc")
+    unsigned = {key: value for key, value in manifest.items() if key != "manifest_digest"}
+    manifest["manifest_digest"] = fold_contract.sha_json(unsigned)
+    ablation_module._write_json(directory / "manifest.json", manifest)
+    ablation_module._write_json(
+        directory / "COMPLETE",
+        {
+            "manifest_sha256": file_sha256(directory / "manifest.json"),
+            "state": "COMPLETE",
+        },
+    )
+    before = _tree_snapshot(directory)
+
+    with pytest.raises((LOEOFoldError, ablation_module.LOEOAblationError), match="metadata|device"):
+        ablation_module._fit_fold(source, publication, approved, **kwargs)
+
+    assert _tree_snapshot(directory) == before
