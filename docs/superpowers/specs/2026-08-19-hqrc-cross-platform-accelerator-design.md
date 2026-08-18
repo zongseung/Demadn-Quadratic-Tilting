@@ -48,7 +48,7 @@ Relevant upstream contracts:
 The change has five focused components:
 
 1. a hash-checked importer for the archived correction source;
-2. one small cross-platform file-lock adapter;
+2. one cross-platform publication I/O and file-lock adapter;
 3. a Pyro translation of the exact paper H1--H3 model and sampler;
 4. a device resolver and model-level scheduler;
 5. three thin operator launchers around one shared CLI.
@@ -102,17 +102,37 @@ The import succeeds only when `validate_correction_source` proves that the
 final baseline publication is reused with `fit_count == 0`. A second identical
 import is hash-stable and reports reuse.
 
-## 5. Cross-Platform Locking
+## 5. Cross-Platform Publication I/O and Locking
 
-Direct `fcntl` imports currently prevent package collection on Windows. One
-`hqrc_v3.locking` context manager replaces direct OS-specific calls in the
-publication and diagnostic modules touched by the pipeline.
+Direct `fcntl` imports prevent package collection on Windows. The LOEO and
+posterior publishers also rely on POSIX-only `dir_fd`, `O_DIRECTORY`, and
+`O_NOFOLLOW` operations. Replacing only the lock call would therefore leave the
+pipeline unusable on native Windows.
 
-The adapter uses a conservative exclusive inter-process lock on all platforms.
-The pipeline does not need concurrent shared readers for correctness, so a
-shared-lock abstraction is not introduced. Lock paths and critical-section
-boundaries remain unchanged. Tests exercise contention and release in spawned
-processes on Windows and POSIX.
+One `hqrc_v3.publication_fs` module owns the platform boundary. Its contract
+covers exclusive inter-process locking, trusted-directory validation, regular
+file validation, atomic byte publication, atomic replacement, and safe removal
+of known temporary entries. Existing publication modules consume this narrow
+contract instead of calling platform-only functions directly.
+
+On macOS and Linux, the adapter retains the existing descriptor-relative,
+no-follow checks and `fcntl` locking. On Windows it uses resolved local paths,
+rejects symlinks and junction/reparse-point components, confirms the resolved
+path remains below the trusted root before and after each critical operation,
+holds a cross-process exclusive lock, writes temporary files in the destination
+directory, and publishes with `os.replace`.
+
+The Windows fallback is intended for a trusted local workspace, not an
+adversarial directory being concurrently rewritten by another account. This
+limit is explicit because Python on Windows does not expose the same complete
+descriptor-relative API. Hash checks, immutable identities, atomic publication,
+partial-result preservation, and resume behavior are identical on both paths.
+
+The pipeline does not require concurrent shared readers for correctness, so the
+portable interface uses conservative exclusive locks. Tests run the same
+publication contract against forced POSIX and Windows backends, including
+contention, release, traversal, symlink/junction rejection, atomic replacement,
+and failure preservation.
 
 ## 6. Shared Pyro H1--H3 Model
 

@@ -1,5 +1,8 @@
 # HQRC H1--H3 Dual-GPU Implementation Plan
 
+> Superseded by
+> `docs/superpowers/plans/2026-08-19-hqrc-cross-platform-accelerator-implementation.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Import the archived immutable correction source, add a provenance-safe NumPyro GPU sampler, and run every non-XGBoost B0/B1 H1--H3 LOEO context with one model per GPU.
