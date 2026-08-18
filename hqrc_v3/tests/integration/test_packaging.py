@@ -88,6 +88,7 @@ def test_root_workspace_lock_contains_the_installable_child() -> None:
     root_project = _load_toml(REPOSITORY_ROOT / "pyproject.toml")
     lock = _load_toml(REPOSITORY_ROOT / "uv.lock")
 
+    assert root_project["project"]["requires-python"] == ">=3.12"
     assert root_project["tool"]["uv"]["workspace"]["members"] == ["hqrc_v3"]
     package = next(entry for entry in lock["package"] if entry["name"] == "hqrc-v3")
     assert package["source"] == {"editable": "hqrc_v3"}

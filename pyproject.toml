@@ -3,7 +3,7 @@ name = "demand-quadratic-tilting"
 version = "0.2.0"
 description = "Korean holiday demand correction via Hierarchical Quadratic Tilting (HQT)"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "arviz>=0.22.0",
     "ipykernel>=6.30.1",
