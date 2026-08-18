@@ -227,3 +227,67 @@ deleted with its explicit absolute path. It is not recoverable. No user files we
 3. Windows test setup still needs test-local substitution of Task 1 portable fsync and
    persistent lock-evidence behavior for older diagnostics/LOEO-AR fixture modules; changing
    those production modules would exceed Task 2 ownership.
+
+## Fix Round 1
+
+### Status and implementation
+
+DONE. Immutable generation entries are no longer automatic-cleanup targets after any
+publication attempt; cleanup is limited to identity-owned randomized staging entries and the
+temporary current pointer. `publication_fs.entry_sha256` now opens the entry, compares the
+opened handle with the post-open no-follow path identity, hashes through the handle, and
+revalidates both the trusted directory and entry identity after reading. LOEO file,
+namespace, and HQRC generation handle acquisition paths now close every acquired resource on
+identity and pointer-validation failures.
+
+### TDD evidence
+
+RED commands and results:
+
+```powershell
+uv run --project hqrc_v3 --locked pytest hqrc_v3/tests/unit/test_publication_fs.py::test_windows_hash_rejects_post_open_identity_swap_and_closes_descriptor -q
+```
+
+Collection failed because `entry_sha256` did not exist.
+
+```powershell
+uv run --project hqrc_v3 --locked pytest hqrc_v3/tests/unit/test_hqrc_artifacts.py::test_published_generation_evidence_survives_pointer_failure hqrc_v3/tests/unit/test_hqrc_artifacts.py::test_failed_generation_replace_preserves_preexisting_regular_target -q
+```
+
+Result: `3 failed`; published generation entries and a pre-existing regular final target were
+deleted by failure cleanup.
+
+```powershell
+uv run --project hqrc_v3 --locked pytest hqrc_v3/tests/unit/test_loeo_stage.py::test_windows_relative_file_identity_failure_closes_descriptor hqrc_v3/tests/unit/test_loeo_stage.py::test_namespace_root_identity_failure_closes_every_acquired_directory hqrc_v3/tests/unit/test_loeo_stage.py::test_unsafe_hqrc_pointer_validation_closes_generation_directory -q
+```
+
+The Windows identity-failure descriptor test failed because the descriptor remained open.
+The unsafe-pointer test initially exposed its fixture's non-canonical JSON before reaching the
+intended leak boundary, and the first root test could not observe `close()` on the descriptorless
+Windows backend. After correcting those tests with canonical JSON and trackable handles, both
+were mutation-checked against the exact pre-fix control flow and failed on their intended
+unclosed-resource assertions. Restoring the fix produced `3 passed in 2.12s` for all three
+LOEO resource-close regressions.
+
+Focused GREEN results:
+
+- `test_publication_fs.py`: `9 passed in 0.78s`.
+- `test_hqrc_artifacts.py`: `23 passed in 6.89s`.
+- The three new LOEO resource-close regressions passed individually/focused.
+
+Final compact regression command covered all publication filesystem and HQRC artifact tests,
+the three resource-close regressions, the forced-Windows fold round trip, foreign final-target
+preservation, HQRC boundary preservation, and the primary COMPLETE sentinel. Result:
+`39 passed in 47.41s`.
+
+### Static verification
+
+- Owned-file `ruff check`: `All checks passed!`.
+- Production-file `compileall -q`: exit 0.
+- `git diff --check`: exit 0; only Git's existing LF-to-CRLF working-copy notices.
+
+### Fix-round concerns
+
+The original report's two environmental concerns remain unchanged: the 30-minute combined
+suite was not rerun, and full Windows collection is still blocked by the two out-of-scope
+`resource` imports owned by Task 7. No additional concern was introduced by this fix round.

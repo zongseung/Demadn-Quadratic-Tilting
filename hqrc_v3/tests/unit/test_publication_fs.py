@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import hqrc_v3.publication_fs as publication_fs
 from hqrc_v3.publication_fs import (
     PublicationFSError,
     atomic_write_bytes,
+    entry_sha256,
     exclusive_lock,
     require_local_entry,
     require_within,
@@ -146,3 +148,45 @@ def test_windows_backend_preserves_existing_target_on_replace_failure(tmp_path, 
     with pytest.raises(PublicationFSError):
         atomic_write_bytes(directory, "result.json", b"new")
     assert (directory.path / "result.json").read_bytes() == b"old"
+
+
+def test_windows_hash_rejects_post_open_identity_swap_and_closes_descriptor(
+    tmp_path, monkeypatch
+):
+    directory = _trusted_windows_directory(tmp_path)
+    artifact = directory.path / "artifact.bin"
+    artifact.write_bytes(b"content")
+    original_open = os.open
+    original_fstat = os.fstat
+    opened: list[int] = []
+
+    def tracked_open(path, flags, *args, **kwargs):
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if Path(path) == artifact:
+            opened.append(descriptor)
+        return descriptor
+
+    def swapped_fstat(descriptor):
+        identity = original_fstat(descriptor)
+        if descriptor not in opened:
+            return identity
+        values = list(identity)
+        values[1] += 1
+        values[0] = stat.S_IFREG | 0o600
+        return os.stat_result(values)
+
+    monkeypatch.setattr(publication_fs.os, "open", tracked_open)
+    monkeypatch.setattr(publication_fs.os, "fstat", swapped_fstat)
+    try:
+        with pytest.raises(PublicationFSError, match="identity changed"):
+            entry_sha256(directory, artifact.name)
+        assert len(opened) == 1
+        with pytest.raises(OSError):
+            original_fstat(opened[0])
+    finally:
+        for descriptor in opened:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        directory.close()

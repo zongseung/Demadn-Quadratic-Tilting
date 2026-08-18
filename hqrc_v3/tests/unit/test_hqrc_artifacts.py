@@ -203,6 +203,84 @@ def test_generation_pointer_failure_is_crash_consistent(
         assert pointer_path.read_bytes() != previous_pointer
 
 
+@pytest.mark.parametrize(
+    "boundary", ["generation-npz-published", "generation-metadata-published"]
+)
+def test_published_generation_evidence_survives_pointer_failure(
+    tmp_path, monkeypatch, boundary
+):
+    destination = tmp_path / "hqrc.npz"
+    write_hqrc_data(destination, _data(), settings={"generation": "a"})
+    namespace = destination.with_name(".hqrc.generations")
+    original_names = {path.name for path in namespace.iterdir()}
+    published_snapshot = {}
+
+    def fail_after_publish(name):
+        if name != boundary:
+            return
+        for path in namespace.iterdir():
+            if path.name not in original_names and not path.name.startswith("."):
+                identity = path.stat(follow_symlinks=False)
+                published_snapshot[path.name] = (
+                    identity.st_dev,
+                    identity.st_ino,
+                    path.read_bytes(),
+                )
+        raise RuntimeError(f"injected failure at {name}")
+
+    monkeypatch.setattr(artifacts_module, "_publication_boundary", fail_after_publish)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        write_hqrc_data(destination, _second_data(), settings={"generation": "b"})
+
+    assert published_snapshot
+    assert {
+        name: (
+            (namespace / name).stat(follow_symlinks=False).st_dev,
+            (namespace / name).stat(follow_symlinks=False).st_ino,
+            (namespace / name).read_bytes(),
+        )
+        for name in published_snapshot
+    } == published_snapshot
+
+
+def test_failed_generation_replace_preserves_preexisting_regular_target(
+    tmp_path, monkeypatch
+):
+    destination = tmp_path / "hqrc.npz"
+    namespace = destination.with_name(".hqrc.generations")
+    planted = {}
+    real_replace = artifacts_module.replace_entry
+
+    def plant_generation_target(name):
+        if name != "before-generation-npz-publish":
+            return
+        temporary = next(namespace.glob(".*.npz.tmp"))
+        generation = temporary.name.split(".")[1]
+        target = namespace / f"{generation}.npz"
+        target.write_bytes(b"pre-existing evidence")
+        identity = target.stat(follow_symlinks=False)
+        planted[target.name] = (identity.st_dev, identity.st_ino, target.read_bytes())
+
+    def fail_generation_replace(directory, source, target):
+        if target in planted:
+            raise artifacts_module.PublicationFSError("injected replace failure")
+        return real_replace(directory, source, target)
+
+    monkeypatch.setattr(artifacts_module, "_publication_boundary", plant_generation_target)
+    monkeypatch.setattr(artifacts_module, "replace_entry", fail_generation_replace)
+    with pytest.raises(HQRCArtifactError, match="cannot be published"):
+        write_hqrc_data(destination, _data(), settings={})
+
+    assert {
+        name: (
+            (namespace / name).stat(follow_symlinks=False).st_dev,
+            (namespace / name).stat(follow_symlinks=False).st_ino,
+            (namespace / name).read_bytes(),
+        )
+        for name in planted
+    } == planted
+
+
 def test_generation_pointer_rejects_path_traversal_even_with_recomputed_digest(tmp_path):
     destination = tmp_path / "hqrc.npz"
     write_hqrc_data(destination, _data(), settings={"generation": "a"})

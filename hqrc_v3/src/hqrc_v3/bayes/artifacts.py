@@ -20,9 +20,9 @@ from hqrc_v3.publication_fs import (
     PublicationFSError,
     TrustedDirectory,
     atomic_write_bytes,
+    entry_sha256,
     guard_trusted_directory,
     replace_entry,
-    require_local_entry,
     trusted_directory,
     unlink_entry,
 )
@@ -172,10 +172,6 @@ def _revalidate_generation_namespace(directory: TrustedDirectory) -> None:
         raise HQRCArtifactError("HQRC generation namespace identity changed") from error
 
 
-def _relative_open_flags(base: int) -> int:
-    return base | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-
-
 def _write_relative_json(directory: TrustedDirectory, name: str, value: dict[str, Any]) -> None:
     try:
         atomic_write_bytes(directory, name, _canonical(value) + b"\n")
@@ -185,29 +181,9 @@ def _write_relative_json(directory: TrustedDirectory, name: str, value: dict[str
 
 def _relative_sha256(directory: TrustedDirectory, name: str) -> str:
     try:
-        guard_trusted_directory(directory)
-        if directory.backend == "posix":
-            descriptor = os.open(
-                name,
-                _relative_open_flags(os.O_RDONLY),
-                dir_fd=directory.descriptor,
-            )
-        else:
-            descriptor = os.open(
-                require_local_entry(directory.path / name, kind="file"), os.O_RDONLY
-            )
-    except (OSError, PublicationFSError) as error:
+        return entry_sha256(directory, name)
+    except PublicationFSError as error:
         raise HQRCArtifactError("HQRC generation file cannot be opened safely") from error
-    try:
-        digest = sha256()
-        with os.fdopen(descriptor, "rb") as source:
-            descriptor = -1
-            for block in iter(lambda: source.read(1024 * 1024), b""):
-                digest.update(block)
-        return digest.hexdigest()
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
 
 
 def _replace_relative(directory: TrustedDirectory, source: str, destination: str) -> None:
@@ -250,9 +226,7 @@ def write_hqrc_data(
     directory: TrustedDirectory | None = None
     parent_directory: TrustedDirectory | None = None
     temporary_names: set[str] = set()
-    generation_names: set[str] = set()
     temporary_pointer: Path | None = None
-    pointer_published = False
     try:
         directory = _open_generation_namespace(destination)
         generation_directory = directory.path
@@ -294,11 +268,9 @@ def write_hqrc_data(
         _write_relative_json(directory, temporary_metadata_name, payload)
 
         _publication_boundary("before-generation-npz-publish")
-        generation_names.add(generation_npz_name)
         _replace_relative(directory, temporary_npz_name, generation_npz_name)
         temporary_names.discard(temporary_npz_name)
         _publication_boundary("generation-npz-published")
-        generation_names.add(generation_metadata_name)
         _replace_relative(
             directory, temporary_metadata_name, generation_metadata_name
         )
@@ -332,7 +304,6 @@ def write_hqrc_data(
         except PublicationFSError as error:
             raise HQRCArtifactError("HQRC current pointer cannot be published") from error
         temporary_pointer = None
-        pointer_published = True
         _publication_boundary("pointer-swapped")
         _fsync_directory(destination.parent)
         _publication_boundary("parent-directory-synced")
@@ -340,13 +311,10 @@ def write_hqrc_data(
         active_error = sys.exc_info()[0] is not None
         try:
             if directory is not None:
-                cleanup_names = set(temporary_names)
-                if not pointer_published:
-                    cleanup_names.update(generation_names)
                 try:
-                    if cleanup_names:
+                    if temporary_names:
                         try:
-                            _cleanup_relative(directory, cleanup_names)
+                            _cleanup_relative(directory, temporary_names)
                         except HQRCArtifactError:
                             if not active_error:
                                 raise

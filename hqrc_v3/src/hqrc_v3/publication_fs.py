@@ -9,6 +9,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Literal
 
@@ -187,6 +188,48 @@ def _relative_identity(directory: TrustedDirectory, name: str) -> os.stat_result
         return (directory.path / safe).stat(follow_symlinks=False)
     except OSError as error:
         raise PublicationFSError(f"cannot inspect publication entry: {safe}") from error
+
+
+def entry_sha256(directory: TrustedDirectory, name: str) -> str:
+    """Hash one regular entry while retaining its path and directory identity."""
+
+    safe = _entry_name(name)
+    descriptor = -1
+    try:
+        guard_trusted_directory(directory)
+        if directory.backend == "posix":
+            assert directory.descriptor is not None
+            descriptor = os.open(
+                safe,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory.descriptor,
+            )
+        else:
+            path = require_local_entry(directory.path / safe, kind="file")
+            descriptor = os.open(path, os.O_RDONLY)
+        identity = os.fstat(descriptor)
+        current = _relative_identity(directory, safe)
+        if not stat.S_ISREG(identity.st_mode) or not stat.S_ISREG(current.st_mode):
+            raise PublicationFSError(f"publication entry is not a regular file: {safe}")
+        if (identity.st_dev, identity.st_ino) != (current.st_dev, current.st_ino):
+            raise PublicationFSError(f"publication entry identity changed: {safe}")
+        digest = sha256()
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        guard_trusted_directory(directory)
+        current = _relative_identity(directory, safe)
+        if (identity.st_dev, identity.st_ino) != (current.st_dev, current.st_ino):
+            raise PublicationFSError(f"publication entry identity changed: {safe}")
+        return digest.hexdigest()
+    except PublicationFSError:
+        raise
+    except OSError as error:
+        raise PublicationFSError(f"cannot hash publication entry: {safe}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def replace_entry(directory: TrustedDirectory, source_name: str, target_name: str) -> Path:

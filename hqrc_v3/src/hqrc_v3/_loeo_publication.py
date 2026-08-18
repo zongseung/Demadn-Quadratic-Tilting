@@ -336,6 +336,7 @@ def _safe_name(name: str) -> str:
 
 def _relative_file_fd(directory: TrustedDirectory, name: str) -> int:
     guard_trusted_directory(directory)
+    descriptor = -1
     try:
         safe = _safe_name(name)
         if directory.backend == "posix":
@@ -354,7 +355,13 @@ def _relative_file_fd(directory: TrustedDirectory, name: str) -> int:
             if (current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino):
                 raise LOEOFoldError("LOEO publication file identity changed")
     except (OSError, PublicationFSError) as error:
+        if descriptor >= 0:
+            os.close(descriptor)
         raise LOEOFoldError("LOEO publication file is missing or unsafe") from error
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
     if not stat.S_ISREG(identity.st_mode):
         os.close(descriptor)
         raise LOEOFoldError("LOEO publication file is missing or unsafe")
@@ -669,20 +676,25 @@ class LOEOPublicationHandle:
 def _open_namespace_final(
     namespace: LOEONamespace, *, backend: str | None = None
 ) -> TrustedDirectory:
+    directory: TrustedDirectory | None = None
+    root: TrustedDirectory | None = None
     try:
         directory = trusted_directory(namespace.root, namespace.path, backend=backend)
         root = trusted_directory(namespace.root, namespace.root, backend=directory.backend)
-        try:
-            if root.identity != namespace.root_identity:
-                raise LOEOFoldError("LOEO fold trusted output root changed")
-        finally:
-            root.close()
+        if root.identity != namespace.root_identity:
+            raise LOEOFoldError("LOEO fold trusted output root changed")
         if directory.identity != namespace.final_identity:
-            directory.close()
             raise LOEOFoldError("LOEO fold namespace identity changed")
-        return directory
+        result = directory
+        directory = None
+        return result
     except PublicationFSError as error:
         raise LOEOFoldError("LOEO fold namespace is missing or unsafe") from error
+    finally:
+        if root is not None:
+            root.close()
+        if directory is not None:
+            directory.close()
 
 
 def _namespace_for_existing_directory(directory: Path) -> LOEONamespace:
@@ -859,20 +871,20 @@ def _hqrc_generation_names(
         publication.directory, "hqrc_data.current.json", "LOEO HQRCData pointer"
     )
     generation_fd = _open_child(publication.directory, ".hqrc_data.generations")
-    names: list[str] = []
-    for key in ("npz", "metadata"):
-        relative = pointer.get(key)
-        if (
-            not isinstance(relative, str)
-            or Path(relative).is_absolute()
-            or ".." in Path(relative).parts
-        ):
-            raise LOEOFoldError("LOEO HQRCData pointer path is unsafe")
-        path = Path(relative)
-        if path.parent != Path(".hqrc_data.generations"):
-            raise LOEOFoldError("LOEO HQRCData pointer path is unsafe")
-        names.append(path.name)
     try:
+        names: list[str] = []
+        for key in ("npz", "metadata"):
+            relative = pointer.get(key)
+            if (
+                not isinstance(relative, str)
+                or Path(relative).is_absolute()
+                or ".." in Path(relative).parts
+            ):
+                raise LOEOFoldError("LOEO HQRCData pointer path is unsafe")
+            path = Path(relative)
+            if path.parent != Path(".hqrc_data.generations"):
+                raise LOEOFoldError("LOEO HQRCData pointer path is unsafe")
+            names.append(path.name)
         source = (
             generation_fd.descriptor
             if generation_fd.backend == "posix"
@@ -883,9 +895,9 @@ def _hqrc_generation_names(
         for name in names:
             descriptor = _relative_file_fd(generation_fd, name)
             os.close(descriptor)
+        return pointer, names[0], names[1]
     finally:
         generation_fd.close()
-    return pointer, names[0], names[1]
 
 
 def _load_hqrc_checkpoint(publication: LOEOPublicationHandle):

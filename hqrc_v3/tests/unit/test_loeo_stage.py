@@ -1438,6 +1438,132 @@ def test_windows_backend_fold_publication_writes_loads_validates_and_reuses(tmp_
     assert _publication_temporaries(namespace.path) == []
 
 
+def test_windows_relative_file_identity_failure_closes_descriptor(tmp_path, monkeypatch):
+    root = (tmp_path / "root").resolve()
+    directory_path = root / "fold"
+    directory_path.mkdir(parents=True)
+    artifact = directory_path / "artifact.bin"
+    artifact.write_bytes(b"content")
+    directory = loeo_publication_module.trusted_directory(
+        root, directory_path, backend="windows"
+    )
+    original_open = os.open
+    original_fstat = os.fstat
+    opened: list[int] = []
+
+    def tracked_open(path, flags, *args, **kwargs):
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if Path(path) == artifact:
+            opened.append(descriptor)
+        return descriptor
+
+    def swapped_fstat(descriptor):
+        identity = original_fstat(descriptor)
+        if descriptor not in opened:
+            return identity
+        values = list(identity)
+        values[1] += 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(loeo_publication_module.os, "open", tracked_open)
+    monkeypatch.setattr(loeo_publication_module.os, "fstat", swapped_fstat)
+    try:
+        with pytest.raises(LOEOFoldError, match="identity changed"):
+            loeo_publication_module._relative_file_fd(directory, artifact.name)
+        assert len(opened) == 1
+        with pytest.raises(OSError):
+            original_fstat(opened[0])
+    finally:
+        for descriptor in opened:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        directory.close()
+
+
+def test_namespace_root_identity_failure_closes_every_acquired_directory(
+    tmp_path, monkeypatch
+):
+    namespace = loeo_publication_module.secure_namespace(
+        (tmp_path / "results").resolve(), ("fold",)
+    )
+    actual_root_identity = namespace.root_identity
+    namespace = replace(
+        namespace,
+        root_identity=(namespace.root_identity[0], namespace.root_identity[1] + 1),
+    )
+    opened = []
+
+    class TrackedDirectory:
+        def __init__(self, identity, backend="windows"):
+            self.identity = identity
+            self.backend = backend
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    def tracked_directory(*args, **kwargs):
+        identity = namespace.final_identity if not opened else actual_root_identity
+        directory = TrackedDirectory(identity)
+        opened.append(directory)
+        return directory
+
+    monkeypatch.setattr(loeo_publication_module, "trusted_directory", tracked_directory)
+    try:
+        with pytest.raises(LOEOFoldError, match="trusted output root changed"):
+            loeo_publication_module._open_namespace_final(namespace)
+        assert len(opened) == 2
+        assert all(directory.closed for directory in opened)
+    finally:
+        for directory in opened:
+            directory.close()
+
+
+def test_unsafe_hqrc_pointer_validation_closes_generation_directory(tmp_path, monkeypatch):
+    namespace = loeo_publication_module.secure_namespace(
+        (tmp_path / "results").resolve(), ("fold",)
+    )
+    child_directories = []
+    real_open_child = loeo_publication_module._open_child
+
+    class TrackedChild:
+        def __init__(self, directory):
+            self.directory = directory
+            self.closed = False
+
+        def __getattr__(self, name):
+            return getattr(self.directory, name)
+
+        def close(self):
+            self.closed = True
+            self.directory.close()
+
+    def tracked_open_child(*args, **kwargs):
+        directory = TrackedChild(real_open_child(*args, **kwargs))
+        child_directories.append(directory)
+        return directory
+
+    with loeo_publication_module.fold_lock(namespace) as publication:
+        (publication.path / ".hqrc_data.generations").mkdir()
+        (publication.path / "hqrc_data.current.json").write_bytes(
+            loeo_publication_module.canonical_json(
+                {"npz": "../escape.npz", "metadata": "../escape.json"}
+            )
+            + b"\n"
+        )
+        monkeypatch.setattr(loeo_publication_module, "_open_child", tracked_open_child)
+        try:
+            with pytest.raises(LOEOFoldError, match="pointer path is unsafe"):
+                loeo_publication_module._hqrc_generation_names(publication)
+            assert len(child_directories) == 1
+            assert child_directories[0].closed
+        finally:
+            for directory in child_directories:
+                directory.close()
+
+
 @pytest.mark.parametrize(
     ("boundary", "kind", "expected_sampler_calls"),
     [
