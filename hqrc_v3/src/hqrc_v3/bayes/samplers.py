@@ -7,7 +7,6 @@ import json
 import math
 import multiprocessing
 import time
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -197,6 +196,39 @@ def _initialize_pyro_chain_worker() -> None:
     torch.set_num_interop_threads(1)
 
 
+_PYRO_CHAIN_WORKER_INITIALIZED = False
+
+
+def _run_initialized_pyro_chain_worker(request: _PyroChainRequest) -> _PyroChainResult:
+    global _PYRO_CHAIN_WORKER_INITIALIZED
+    if not _PYRO_CHAIN_WORKER_INITIALIZED:
+        _initialize_pyro_chain_worker()
+        _PYRO_CHAIN_WORKER_INITIALIZED = True
+    return _run_pyro_chain_worker(request)
+
+
+def _run_parallel_pyro_chains(
+    requests: tuple[_PyroChainRequest, ...],
+) -> tuple[_PyroChainResult, ...]:
+    context = multiprocessing.get_context("spawn")
+    pool = context.Pool(processes=4)
+    try:
+        results = tuple(
+            pool.imap_unordered(
+                _run_initialized_pyro_chain_worker,
+                requests,
+                chunksize=1,
+            )
+        )
+    except BaseException:
+        pool.terminate()
+        pool.join()
+        raise
+    pool.close()
+    pool.join()
+    return results
+
+
 def _run_pyro_chain_worker(request: _PyroChainRequest) -> _PyroChainResult:
     calibration = load_approved_calibration(
         request.approved_ar_path,
@@ -244,6 +276,8 @@ def _sample_pyro(
     cores: int,
 ) -> tuple[az.InferenceData, ResolvedDevice]:
     resolved = resolve_device(device)
+    if cores == 4 and resolved.kind != "cpu":
+        raise SamplingError("parallel Pyro chains require a resolved CPU device")
     chain_results: tuple[_PyroChainResult, ...]
     if cores == 1:
         model = build_pyro_hqrc_model(
@@ -286,13 +320,7 @@ def _sample_pyro(
             )
             for chain in range(4)
         )
-        context = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(
-            max_workers=4,
-            mp_context=context,
-            initializer=_initialize_pyro_chain_worker,
-        ) as pool:
-            chain_results = tuple(pool.map(_run_pyro_chain_worker, requests))
+        chain_results = _run_parallel_pyro_chains(requests)
         if {result.chain for result in chain_results} != set(range(4)):
             raise SamplingError("parallel Pyro chains returned invalid chain indexes")
         chain_results = tuple(sorted(chain_results, key=lambda result: result.chain))

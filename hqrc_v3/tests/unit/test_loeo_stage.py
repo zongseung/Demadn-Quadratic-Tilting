@@ -486,6 +486,40 @@ def test_default_sampler_contract_is_frozen_and_pyro_binds_physical_device(
 
 
 @pytest.mark.parametrize(
+    ("device_request", "kind", "logical_device"),
+    [("cuda:0", "cuda", "cuda:0"), ("mps", "mps", "mps"), ("auto", "cuda", "cuda:0")],
+)
+def test_parallel_pyro_contract_rejects_non_cpu_resolved_device(
+    device_request: str,
+    kind: str,
+    logical_device: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        loeo_publication_module,
+        "resolve_device",
+        lambda _request: SimpleNamespace(
+            kind=kind,
+            logical_device=logical_device,
+            physical_device="0" if kind == "cuda" else None,
+        ),
+    )
+
+    with pytest.raises(LOEOFoldError, match="CPU"):
+        loeo_publication_module.sampler_contract(
+            profile="smoke",
+            root_seed=71,
+            held_out_occurrence_id="seollal-2024",
+            draws=4,
+            tune=4,
+            chains=4,
+            cores=4,
+            backend="pyro",
+            device=device_request,
+        )
+
+
+@pytest.mark.parametrize(
     ("backend", "expected_init"),
     [("nutpie", "nutpie-default"), ("pyro", "pyro-default")],
 )

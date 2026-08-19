@@ -266,6 +266,41 @@ def test_pyro_rejects_unsupported_core_topology_before_model_build(cores):
         sample_hqrc(None, None, backend="pyro", chains=4, cores=cores)
 
 
+@pytest.mark.parametrize(
+    ("device_request", "kind", "logical_device", "physical_device"),
+    [
+        ("cuda:0", "cuda", "cuda:0", "0"),
+        ("mps", "mps", "mps", None),
+        ("auto", "cuda", "cuda:0", "1"),
+    ],
+)
+def test_parallel_pyro_rejects_non_cpu_resolved_device(
+    device_request, kind, logical_device, physical_device, monkeypatch
+):
+    resolved = ResolvedDevice(
+        kind=kind,
+        logical_device=logical_device,
+        physical_device=physical_device,
+        probe=DeviceProbe(success=True, detail="test-probe"),
+    )
+    monkeypatch.setattr(sampler_module, "resolve_device", lambda _request: resolved)
+
+    with pytest.raises(SamplingError, match="CPU"):
+        sampler_module._sample_pyro(
+            None,
+            None,
+            variant="H1",
+            pooling="partial",
+            options=None,
+            draws=4,
+            tune=4,
+            seed=17,
+            target_accept=0.9,
+            device=device_request,
+            cores=4,
+        )
+
+
 def test_pyro_runs_four_chains_through_spawn_pool_and_preserves_chain_order(tmp_path, monkeypatch):
     data = HQRCData(
         observations=np.linspace(-0.2, 0.2, 18),
@@ -310,19 +345,11 @@ def test_pyro_runs_four_chains_through_spawn_pool_and_preserves_chain_order(tmp_
     captured = {}
 
     class FakeSpawnPool:
-        def __init__(self, **kwargs):
-            captured["executor"] = kwargs
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def map(self, worker, requests):
+        def imap_unordered(self, worker, requests, chunksize):
             captured["worker"] = worker
             captured["requests"] = tuple(requests)
-            return tuple(
+            captured["chunksize"] = chunksize
+            return iter(
                 SimpleNamespace(
                     chain=request.chain,
                     posterior={
@@ -333,10 +360,28 @@ def test_pyro_runs_four_chains_through_spawn_pool_and_preserves_chain_order(tmp_
                     },
                     divergences=np.zeros(request.draws, dtype=np.int8),
                 )
-                for request in captured["requests"]
+                for request in reversed(captured["requests"])
             )
 
-    monkeypatch.setattr(sampler_module, "ProcessPoolExecutor", FakeSpawnPool, raising=False)
+        def close(self):
+            captured["closed"] = True
+
+        def terminate(self):
+            captured["terminated"] = True
+
+        def join(self):
+            captured["joined"] = True
+
+    class FakeSpawnContext:
+        def Pool(self, **kwargs):
+            captured["pool"] = kwargs
+            return FakeSpawnPool()
+
+    def fake_get_context(method):
+        captured["start_method"] = method
+        return FakeSpawnContext()
+
+    monkeypatch.setattr(sampler_module.multiprocessing, "get_context", fake_get_context)
 
     idata = sample_hqrc(
         data,
@@ -350,9 +395,12 @@ def test_pyro_runs_four_chains_through_spawn_pool_and_preserves_chain_order(tmp_
         device="cpu",
     )
 
-    assert captured["executor"]["max_workers"] == 4
-    assert captured["executor"]["mp_context"].get_start_method() == "spawn"
-    assert captured["executor"]["initializer"] is sampler_module._initialize_pyro_chain_worker
+    assert captured["start_method"] == "spawn"
+    assert captured["pool"] == {"processes": 4}
+    assert captured["worker"] is sampler_module._run_initialized_pyro_chain_worker
+    assert captured["chunksize"] == 1
+    assert captured["closed"] is captured["joined"] is True
+    assert "terminated" not in captured
     requests = captured["requests"]
     assert [request.chain for request in requests] == [0, 1, 2, 3]
     assert [request.seed for request in requests] == [17, 18, 19, 20]
@@ -366,6 +414,54 @@ def test_pyro_runs_four_chains_through_spawn_pool_and_preserves_chain_order(tmp_
     assert sampler["cores"] == 4
     assert sampler["chain_execution"] == "parallel"
     assert idata.attrs["hqrc_chain_execution"] == "parallel"
+
+
+def test_parallel_pyro_pool_terminates_and_joins_on_first_child_failure(monkeypatch):
+    captured = {}
+    original = RuntimeError("chain 1 failed")
+
+    class FailingPool:
+        def imap_unordered(self, worker, requests, chunksize):
+            del worker, chunksize
+            requests = tuple(requests)
+
+            def results():
+                yield SimpleNamespace(chain=requests[-1].chain)
+                raise original
+
+            return results()
+
+        def close(self):
+            captured["closed"] = True
+
+        def terminate(self):
+            captured["terminated"] = True
+
+        def join(self):
+            captured["joined"] = True
+
+    class FakeSpawnContext:
+        def Pool(self, **kwargs):
+            captured["pool"] = kwargs
+            return FailingPool()
+
+    monkeypatch.setattr(
+        sampler_module.multiprocessing,
+        "get_context",
+        lambda method: FakeSpawnContext() if method == "spawn" else pytest.fail(method),
+    )
+
+    with pytest.raises(RuntimeError, match="chain 1 failed") as raised:
+        sampler_module._run_parallel_pyro_chains(
+            tuple(SimpleNamespace(chain=chain) for chain in range(4))
+        )
+
+    assert raised.value is original
+    assert captured == {
+        "pool": {"processes": 4},
+        "terminated": True,
+        "joined": True,
+    }
 
 
 @pytest.mark.slow

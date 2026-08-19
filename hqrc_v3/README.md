@@ -89,6 +89,11 @@ paper run, use the four-model smoke and require peak committed memory below
 posteriors, so use a new output root. Platform defaults remain CUDA on Windows
 and Linux, and `auto` on macOS.
 
+The measured 2026-08-20 smoke on the 31.77 GiB target host reached 31.20 GiB
+committed memory and failed that gate. Do not start the four-model/four-chain
+paper run on this host. See the
+[resource-gate report](../docs/superpowers/reports/2026-08-20-hqrc-four-model-four-chain-smoke.md).
+
 Run the following commands from the repository root or linked worktree. The
 launchers perform a locked accelerator dependency sync before each action.
 The setup shown below uses the current checkout when it contains

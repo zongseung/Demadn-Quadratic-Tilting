@@ -173,6 +173,8 @@ def sampler_contract(
     }
     if backend == "pyro":
         resolved_device = resolve_device(device)
+        if resolved_cores == 4 and resolved_device.kind != "cpu":
+            raise LOEOFoldError("parallel Pyro chains require a resolved CPU device")
         contract.update(
             {
                 "resolved_device_kind": resolved_device.kind,
