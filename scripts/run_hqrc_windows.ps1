@@ -14,6 +14,8 @@ param(
     [string[]]$FeatureSets,
     [string[]]$Variants,
     [switch]$ApproveDerivedAR,
+    [ValidateSet("auto", "cuda", "mps", "cpu")]
+    [string]$Accelerator = "cuda",
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ForwardArgs
 )
@@ -40,7 +42,7 @@ if ($Action -eq "import") {
     uv run --project hqrc_v3 --extra accelerator --locked hqrc import-paper-source @CliArgs
 } else {
     $Profile = if ($Action -eq "smoke") { "smoke" } else { "paper" }
-    $CliArgs = @("--profile", $Profile, "--accelerator", "cuda")
+    $CliArgs = @("--profile", $Profile, "--accelerator", $Accelerator)
     if ($Action -eq "smoke") {
         $CliArgs += @(
             "--draws", "4", "--tune", "4", "--chains", "4", "--cores", "1",

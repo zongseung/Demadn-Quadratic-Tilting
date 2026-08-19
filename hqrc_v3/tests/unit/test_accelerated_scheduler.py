@@ -551,6 +551,55 @@ def test_native_launchers_sync_locked_and_only_forward_to_shared_cli(
         ("run_hqrc_macos.sh", r"C:\Program Files\Git\bin\bash.exe"),
     ],
 )
+@pytest.mark.parametrize("action", ("proposal", "smoke", "paper", "resume"))
+def test_native_launchers_forward_explicit_cpu_accelerator_once(
+    tmp_path, script, shell, action
+):
+    """A hard-coded platform accelerator must not override an explicit CPU request."""
+    if not Path(shell).exists() and shell != "powershell":
+        pytest.skip(f"native test shell is unavailable: {shell}")
+    scripts = Path(__file__).parents[3] / "scripts"
+    capture = tmp_path / "calls.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv.cmd").write_text(f'@echo %*>>"{capture}"\n')
+    uv_sh = fake_bin / "uv"
+    uv_sh.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{capture.as_posix()}"\n')
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    command = (
+        [
+            shell,
+            "-NoProfile",
+            "-File",
+            str(scripts / script),
+            action,
+            "-Accelerator",
+            "cpu",
+            "--source-run-dir",
+            "imported",
+        ]
+        if shell == "powershell"
+        else [shell, str(scripts / script), action, "--source-run-dir", "imported"]
+    )
+    if shell != "powershell":
+        env["HQRC_ACCELERATOR"] = "cpu"
+    result = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    calls = capture.read_text().splitlines()
+    assert calls[0] == "sync --project hqrc_v3 --extra accelerator --locked"
+    assert calls[1].count("--accelerator cpu") == 1
+    assert calls[1].count("--accelerator") == 1
+
+
+@pytest.mark.parametrize(
+    ("script", "shell"),
+    [
+        ("run_hqrc_windows.ps1", "powershell"),
+        ("run_hqrc_linux.sh", r"C:\Program Files\Git\bin\bash.exe"),
+        ("run_hqrc_macos.sh", r"C:\Program Files\Git\bin\bash.exe"),
+    ],
+)
 @pytest.mark.parametrize("override", (("--profile", "smoke"), ("--profile=smoke",)))
 def test_native_launchers_reject_raw_profile_override_before_uv_sync(
     tmp_path, script, shell, override

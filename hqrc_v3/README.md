@@ -79,6 +79,11 @@ runs `lightgbm` then `seq2seq_lstm`, while physical GPU 1 runs `svr` then
 `transformer`. The two model workers run concurrently, but every model fit
 runs its four NUTS chains sequentially inside its worker.
 
+CPU selection uses bounded model-level parallelism while preserving those
+sequential Pyro chains inside each worker. For example, 24 logical CPUs and
+the four paper models produce four workers with six threads each. Platform
+defaults remain CUDA on Windows and Linux, and `auto` on macOS.
+
 Run the following commands from the repository root or linked worktree. The
 launchers perform a locked accelerator dependency sync before each action.
 The setup shown below uses the current checkout when it contains
@@ -127,6 +132,21 @@ scripts\run_hqrc_windows.ps1 resume `
   -Devices 0,1 -ApproveDerivedAR
 ```
 
+Use explicit CPU selection for paper and resume without changing the AR or
+artifact contracts:
+
+```powershell
+scripts\run_hqrc_windows.ps1 paper -Accelerator cpu `
+  -SourceRunDir artifacts/hqrc-v3-paper-imported-20260819 `
+  -Config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml `
+  -OutputRoot artifacts/hqrc-v3-loeo-accelerated-20260819 -ApproveDerivedAR
+
+scripts\run_hqrc_windows.ps1 resume -Accelerator cpu `
+  -SourceRunDir artifacts/hqrc-v3-paper-imported-20260819 `
+  -Config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml `
+  -OutputRoot artifacts/hqrc-v3-loeo-accelerated-20260819 -ApproveDerivedAR
+```
+
 ### Linux Bash
 
 Linux uses the same fixed CUDA queues and physical device order:
@@ -164,12 +184,28 @@ scripts/run_hqrc_linux.sh resume \
   --devices 0 1 --approve-derived-ar
 ```
 
+For CPU paper runs and resumptions, set `HQRC_ACCELERATOR=cpu` on the launcher
+invocation:
+
+```bash
+HQRC_ACCELERATOR=cpu scripts/run_hqrc_linux.sh paper \
+  --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
+  --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
+  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 --approve-derived-ar
+
+HQRC_ACCELERATOR=cpu scripts/run_hqrc_linux.sh resume \
+  --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
+  --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
+  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 --approve-derived-ar
+```
+
 ### macOS Bash
 
 The macOS launcher uses `--accelerator auto`. On Apple Silicon, `auto` selects
 MPS only after the HQRC float64/LKJ/AR gradient capability probe succeeds. If
 MPS is unavailable or fails that probe, the scheduler selects CPU and records
-the fallback reason. MPS and CPU execute the four models sequentially.
+the fallback reason. MPS executes the four models sequentially; explicit CPU
+selection uses bounded model-level parallelism.
 
 ```bash
 SOURCE_ROOT="$(if [ -f artifacts.zip ]; then pwd -P; else cd ../.. && pwd -P; fi)"
@@ -201,6 +237,21 @@ scripts/run_hqrc_macos.sh resume \
   --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
   --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 \
   --approve-derived-ar
+```
+
+For CPU paper runs and resumptions, set `HQRC_ACCELERATOR=cpu` on the launcher
+invocation:
+
+```bash
+HQRC_ACCELERATOR=cpu scripts/run_hqrc_macos.sh paper \
+  --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
+  --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
+  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 --approve-derived-ar
+
+HQRC_ACCELERATOR=cpu scripts/run_hqrc_macos.sh resume \
+  --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
+  --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
+  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 --approve-derived-ar
 ```
 
 The AR boundary is mandatory on every platform: `import`, `proposal`, and an
