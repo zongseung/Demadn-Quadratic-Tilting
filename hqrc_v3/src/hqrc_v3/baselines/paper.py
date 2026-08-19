@@ -225,9 +225,10 @@ def _feature_schema(matrix: ForecastMatrix, feature_set: FeatureSet) -> dict[str
     if not isinstance(matrix, ForecastMatrix):
         raise TypeError(f"{feature_set} matrix must be a ForecastMatrix")
     validate_forecast_feature_columns(matrix)
-    if matrix.history_columns != history_columns(
-        feature_set
-    ) or matrix.future_columns != feature_columns(feature_set):
+    if (
+        matrix.history_columns != history_columns(feature_set)
+        or matrix.future_columns != feature_columns(feature_set)
+    ):
         raise DataContractError(f"{feature_set} matrix does not match its frozen feature schema")
     return {
         "history": list(matrix.history_columns),
@@ -257,7 +258,9 @@ def _matrix_contracts(
             or not np.array_equal(matrix.target_times, reference_times)
             or not np.array_equal(matrix.target, reference_target)
         ):
-            raise DataContractError("B0 and B1 matrix coverage keys or observed values differ")
+            raise DataContractError(
+                "B0 and B1 matrix coverage keys or observed values differ"
+            )
         normalized[feature_set] = matrix
     return normalized, schemas
 
@@ -273,7 +276,9 @@ def _cache_hashes(
     execution_overrides: Mapping[str, int],
 ) -> dict[str, str]:
     combined_config = hashlib.sha256(
-        (hashes["experiment_sha256"] + ":" + hashes["model_config_sha256"]).encode()
+        (
+            hashes["experiment_sha256"] + ":" + hashes["model_config_sha256"]
+        ).encode()
     ).hexdigest()
     return {
         "config": combined_config,
@@ -282,10 +287,14 @@ def _cache_hashes(
         "experiment_sha256": hashes["experiment_sha256"],
         "model_config_sha256": hashes["model_config_sha256"],
         "holiday_calendar_sha256": hashes["holiday_calendar_sha256"],
-        "temporary_holiday_availability_sha256": hashes["temporary_holiday_availability_sha256"],
+        "temporary_holiday_availability_sha256": hashes[
+            "temporary_holiday_availability_sha256"
+        ],
         "feature_schema_sha256": _schema_digest(schema),
         "execution_profile_sha256": hashlib.sha256(
-            json.dumps(execution_overrides, sort_keys=True, separators=(",", ":")).encode()
+            json.dumps(
+                execution_overrides, sort_keys=True, separators=(",", ":")
+            ).encode()
         ).hexdigest(),
     }
 
@@ -354,7 +363,9 @@ def _ensemble_frame(
     )
     if not averaged["member_count"].eq(len(expected_seeds)).all():
         raise DataContractError("neural member predictions are incomplete")
-    return _validated_groups(averaged.select(PREDICTION_COLUMNS), description="neural ensemble")
+    return _validated_groups(
+        averaged.select(PREDICTION_COLUMNS), description="neural ensemble"
+    )
 
 
 def _stream_records(
@@ -412,10 +423,14 @@ def _load_manifest(path: Path, identity: Mapping[str, object]) -> dict[str, Any]
                 actual_hashes = raw[name]
                 for hash_name in PAPER_HASH_KEYS:
                     if actual_hashes.get(hash_name) != expected.get(hash_name):
-                        raise ArtifactMismatch(f"{hash_name} differs from the baseline manifest")
+                        raise ArtifactMismatch(
+                            f"{hash_name} differs from the baseline manifest"
+                        )
             label = "feature schema" if name == "feature_schemas" else name
             raise ArtifactMismatch(f"{label} differs from the baseline manifest")
-    if not isinstance(raw.get("stages"), dict) or not set(raw["stages"]).issubset({"oof", "final"}):
+    if not isinstance(raw.get("stages"), dict) or not set(raw["stages"]).issubset(
+        {"oof", "final"}
+    ):
         raise ArtifactMismatch("baseline manifest stages are invalid")
     return raw
 
@@ -466,10 +481,8 @@ def _expected_combinations(
     for model in models:
         if members and model not in _NEURAL_MODELS:
             continue
-        seeds = (
-            PAPER_SEEDS
-            if members
-            else ((ENSEMBLE_SEED,) if model in _NEURAL_MODELS else (classical_seed,))
+        seeds = PAPER_SEEDS if members else (
+            (ENSEMBLE_SEED,) if model in _NEURAL_MODELS else (classical_seed,)
         )
         for feature_set in feature_sets:
             for seed in seeds:
@@ -492,14 +505,19 @@ def _coverage_record(frame: pl.DataFrame) -> dict[str, object]:
         raise DataContractError("expected prediction coverage must not contain nulls")
     if not normalized["observed_mw"].is_finite().all():
         raise DataContractError("expected prediction coverage values must be finite")
-    canonical = normalized.with_columns(
-        pl.col("origin").cast(pl.Int64),
-        pl.col("target_timestamp").cast(pl.Int64),
-    ).sort("split_id", "origin", "target_timestamp", "horizon")
+    canonical = (
+        normalized.with_columns(
+            pl.col("origin").cast(pl.Int64),
+            pl.col("target_timestamp").cast(pl.Int64),
+        )
+        .sort("split_id", "origin", "target_timestamp", "horizon")
+    )
     digest = hashlib.sha256()
     for origin, target, horizon, split_id, observed in canonical.iter_rows():
         encoded_split = split_id.encode("utf-8")
-        digest.update(struct.pack(">qqqI", origin, target, horizon, len(encoded_split)))
+        digest.update(
+            struct.pack(">qqqI", origin, target, horizon, len(encoded_split))
+        )
         digest.update(encoded_split)
         digest.update(struct.pack(">d", observed))
     return {"count": canonical.height, "sha256": digest.hexdigest()}
@@ -561,10 +579,16 @@ def _expected_preprocessing_populations(
                 fit_train = (
                     outer_train
                     if model == "svr"
-                    else chronological_validation_tail(outer_train, days=validation_days)[0]
+                    else chronological_validation_tail(
+                        outer_train, days=validation_days
+                    )[0]
                 )
-                fit_daily = _timestamp_population(fit_train.origins, unit="daily-sample")
-                target = _timestamp_population(fit_train.target_times, unit="unique-hour")
+                fit_daily = _timestamp_population(
+                    fit_train.origins, unit="daily-sample"
+                )
+                target = _timestamp_population(
+                    fit_train.target_times, unit="unique-hour"
+                )
                 if target["count"] != len(fit_train.origins) * 24:
                     raise DataContractError(
                         "estimator-fit targets must be non-overlapping complete days"
@@ -577,7 +601,9 @@ def _expected_preprocessing_populations(
                     )
                     scalers = {
                         "target": target,
-                        "weather": _timestamp_population(history_times, unit="unique-hour"),
+                        "weather": _timestamp_population(
+                            history_times, unit="unique-hour"
+                        ),
                         "calendar": target,
                     }
                 else:
@@ -614,7 +640,9 @@ def _verified_actual_preprocessing_populations(
             raise DataContractError("expected preprocessing populations contain duplicates")
         expected_by_key[key] = expected
 
-    actual_by_key: dict[tuple[str, str, str], list[tuple[int, dict[str, dict[str, object]]]]] = {}
+    actual_by_key: dict[
+        tuple[str, str, str], list[tuple[int, dict[str, dict[str, object]]]]
+    ] = {}
     for actual in actual_records:
         if set(actual) != {"model", "feature_set", "split_id", "seed", "scalers"}:
             raise DataContractError("actual preprocessing population schema is invalid")
@@ -651,7 +679,9 @@ def _verified_actual_preprocessing_populations(
         first_population = reports[0][1]
         if any(population != first_population for _, population in reports[1:]):
             if key[0] in _NEURAL_MODELS:
-                raise DataContractError("neural seeds report inconsistent preprocessing population")
+                raise DataContractError(
+                    "neural seeds report inconsistent preprocessing population"
+                )
             raise DataContractError(
                 "repeated baseline fits report inconsistent preprocessing population"
             )
@@ -705,7 +735,11 @@ def _validate_published_frames(
     def combinations(frame: pl.DataFrame) -> set[tuple[str, str, int, str]]:
         if frame.is_empty():
             return set()
-        return set(frame.select("model", "feature_set", "seed", "split_id").unique().iter_rows())
+        return set(
+            frame.select("model", "feature_set", "seed", "split_id")
+            .unique()
+            .iter_rows()
+        )
 
     if combinations(point) != _expected_combinations(
         models=models,
@@ -727,7 +761,9 @@ def _validate_published_frames(
     def validate_stream_coverage(frame: pl.DataFrame, *, description: str) -> None:
         if frame.is_empty():
             return
-        for stream in frame.partition_by(["model", "feature_set", "seed"], maintain_order=True):
+        for stream in frame.partition_by(
+            ["model", "feature_set", "seed"], maintain_order=True
+        ):
             try:
                 actual = _coverage_record(stream.select(_COVERAGE_COLUMNS))
             except (DataContractError, TypeError, ValueError) as error:
@@ -743,7 +779,9 @@ def _validate_published_frames(
     validate_stream_coverage(members, description="member")
     if set(point["target_timestamp"].dt.year()) != set(eval_years):
         raise ArtifactMismatch("prediction evaluation years differ from the stage contract")
-    if not members.is_empty() and set(members["target_timestamp"].dt.year()) != set(eval_years):
+    if not members.is_empty() and set(members["target_timestamp"].dt.year()) != set(
+        eval_years
+    ):
         raise ArtifactMismatch("member evaluation years differ from the stage contract")
 
     point_stream_keys: set[tuple[str, str]] = set()
@@ -835,12 +873,13 @@ def derive_oof_source_truth(
     normalized, _ = _matrix_contracts(matrices, selected_features)
     allowed_folds = expanding_oof_folds()
     folds = tuple(fold for fold in allowed_folds if fold.split_id in split_ids)
-    if (
-        tuple(fold.split_id for fold in folds) != split_ids
-        or tuple(fold.eval_year for fold in folds) != eval_years
-    ):
+    if tuple(fold.split_id for fold in folds) != split_ids or tuple(
+        fold.eval_year for fold in folds
+    ) != eval_years:
         raise ArtifactMismatch("OOF source-truth split identities differ")
-    expected_coverage = _expected_stage_coverage(normalized[selected_features[0]], folds)
+    expected_coverage = _expected_stage_coverage(
+        normalized[selected_features[0]], folds
+    )
     expected_populations = _expected_preprocessing_populations(
         normalized[selected_features[0]],
         folds,
@@ -880,7 +919,9 @@ def validate_oof_publication_against_source_matrices(
     expected_coverage = truth["expected_coverage"]
     expected_populations = truth["preprocessing_populations"]
     if stage_record.get("expected_coverage") != expected_coverage:
-        raise ArtifactMismatch("OOF expected coverage differs from source-derived observed targets")
+        raise ArtifactMismatch(
+            "OOF expected coverage differs from source-derived observed targets"
+        )
     if stage_record.get("preprocessing_populations") != expected_populations:
         raise ArtifactMismatch(
             "OOF preprocessing populations differ from source-derived populations"
@@ -959,7 +1000,9 @@ def _expected_fit_units(
     models: tuple[str, ...], feature_sets: tuple[FeatureSet, ...], folds: int
 ) -> int:
     return sum(
-        (len(PAPER_SEEDS) if model in _NEURAL_MODELS else 1) * len(feature_sets) * folds
+        (len(PAPER_SEEDS) if model in _NEURAL_MODELS else 1)
+        * len(feature_sets)
+        * folds
         for model in models
     )
 
@@ -1075,7 +1118,9 @@ def _load_transaction(
         raise ArtifactMismatch("publication journal is invalid") from error
 
     stage: Literal["oof", "final"] = raw["stage"]
-    expected_members, expected_point, expected_manifest = _artifact_paths(directory.parent, stage)
+    expected_members, expected_point, expected_manifest = _artifact_paths(
+        directory.parent, stage
+    )
     expected_finals = {
         "members": expected_members.name,
         "point": expected_point.name,
@@ -1110,7 +1155,9 @@ def _load_transaction(
         paths[f"{component}_temp"] = temporary_path
         paths[f"{component}_final"] = final_path
 
-    intended = _require_transaction_manifest(raw["intended_manifest"], description="intended")
+    intended = _require_transaction_manifest(
+        raw["intended_manifest"], description="intended"
+    )
     prior_value = raw["prior_manifest"]
     prior = (
         None
@@ -1143,7 +1190,9 @@ def _load_transaction(
     }
     if artifacts != expected_artifacts:
         raise ArtifactMismatch("publication journal artifact binding is invalid")
-    if hashlib.sha256(_canonical_json_bytes(intended)).hexdigest() != raw["manifest"]["sha256"]:
+    if hashlib.sha256(_canonical_json_bytes(intended)).hexdigest() != raw["manifest"][
+        "sha256"
+    ]:
         raise ArtifactMismatch("publication journal manifest hash differs")
     return raw, paths
 
@@ -1152,7 +1201,9 @@ def _matches_digest(path: Path, digest: str) -> bool:
     return path.is_file() and not path.is_symlink() and file_sha256(path) == digest
 
 
-def _recover_component(*, temporary: Path, final: Path, digest: str, description: str) -> None:
+def _recover_component(
+    *, temporary: Path, final: Path, digest: str, description: str
+) -> None:
     if _matches_digest(final, digest):
         if temporary.exists():
             if not temporary.is_file() or temporary.is_symlink():
@@ -1191,7 +1242,9 @@ def _rollback_transaction(
     _fsync_directory(directory)
 
 
-def _recover_publication(directory: Path, *, validate_completed: Callable[[], Any]) -> Any | None:
+def _recover_publication(
+    directory: Path, *, validate_completed: Callable[[], Any]
+) -> Any | None:
     loaded = _load_transaction(directory)
     if loaded is None:
         return None
@@ -1233,7 +1286,9 @@ def _publish_stage(
     manifest_temp = _temporary_path(directory, ".manifest.json")
     journal_path = directory / _TRANSACTION_NAME
     prior_manifest = (
-        json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else None
+        json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest_path.is_file()
+        else None
     )
     transaction: dict[str, Any] | None = None
     paths: dict[str, Path] | None = None
@@ -1352,7 +1407,9 @@ def _stage_preflight(
 ) -> PaperStageResult | tuple[dict[str, Any], Path, Path, Path]:
     members_path, point_path, manifest_path = _artifact_paths(run_dir, stage)
     manifest = _load_manifest(manifest_path, identity)
-    stage_products = {name: _artifact_paths(run_dir, name)[:2] for name in ("oof", "final")}
+    stage_products = {
+        name: _artifact_paths(run_dir, name)[:2] for name in ("oof", "final")
+    }
     all_products = [path for products in stage_products.values() for path in products]
     validated_stages: dict[str, tuple[Path, Path]] = {}
     if manifest is None:
@@ -1364,9 +1421,13 @@ def _stage_preflight(
             present = [path.is_file() and not path.is_symlink() for path in products]
             exists = [path.exists() or path.is_symlink() for path in products]
             if recorded_stage not in manifest["stages"] and any(exists):
-                raise ArtifactMismatch(f"orphan {recorded_stage} baseline publication")
+                raise ArtifactMismatch(
+                    f"orphan {recorded_stage} baseline publication"
+                )
             if recorded_stage in manifest["stages"] and not all(present):
-                raise ArtifactMismatch(f"partial {recorded_stage} baseline publication")
+                raise ArtifactMismatch(
+                    f"partial {recorded_stage} baseline publication"
+                )
         for recorded_stage, record in manifest["stages"].items():
             recorded_folds = _recorded_stage_folds(
                 recorded_stage=recorded_stage,
@@ -1474,9 +1535,13 @@ def _run_paper_stage(
         or not isinstance(smoke_boosting_rounds, int)
         or smoke_boosting_rounds <= 0
     ):
-        raise DataContractError("smoke_boosting_rounds is a positive-integer non-paper override")
+        raise DataContractError(
+            "smoke_boosting_rounds is a positive-integer non-paper override"
+        )
     execution_overrides = (
-        {} if smoke_boosting_rounds is None else {"boosting_rounds": smoke_boosting_rounds}
+        {}
+        if smoke_boosting_rounds is None
+        else {"boosting_rounds": smoke_boosting_rounds}
     )
     try:
         normalized_matrices, schemas = _matrix_contracts(matrices, selected_features)
@@ -1490,7 +1555,9 @@ def _run_paper_stage(
         raise DataContractError("paper OOF publication requires all four immutable folds")
     split_ids = tuple(fold.split_id for fold in folds)
     eval_years = tuple(fold.eval_year for fold in folds)
-    expected_coverage = _expected_stage_coverage(normalized_matrices[selected_features[0]], folds)
+    expected_coverage = _expected_stage_coverage(
+        normalized_matrices[selected_features[0]], folds
+    )
     expected_preprocessing_populations = _expected_preprocessing_populations(
         normalized_matrices[selected_features[0]],
         folds,
@@ -1512,8 +1579,9 @@ def _run_paper_stage(
     cache = PredictionCache(Path(cache_dir))
     predictions_dir = run / "predictions"
     with _publication_lock(predictions_dir):
-
-        def preflight_publication() -> PaperStageResult | tuple[dict[str, Any], Path, Path, Path]:
+        def preflight_publication() -> (
+            PaperStageResult | tuple[dict[str, Any], Path, Path, Path]
+        ):
             return _stage_preflight(
                 run_dir=run,
                 stage=stage,
@@ -1529,7 +1597,9 @@ def _run_paper_stage(
                 validation_days=config.validation_days,
             )
 
-        recovered = _recover_publication(predictions_dir, validate_completed=preflight_publication)
+        recovered = _recover_publication(
+            predictions_dir, validate_completed=preflight_publication
+        )
         preflight = preflight_publication() if recovered is None else recovered
         if isinstance(preflight, PaperStageResult):
             return preflight
@@ -1554,7 +1624,9 @@ def _run_paper_stage(
             seeds = PAPER_SEEDS if model in _NEURAL_MODELS else (classical_seed,)
             for feature_set in selected_features:
                 stream_members: list[pl.DataFrame] = []
-                stream_hashes = _cache_hashes(hashes, schemas[feature_set], execution_overrides)
+                stream_hashes = _cache_hashes(
+                    hashes, schemas[feature_set], execution_overrides
+                )
                 for seed in seeds:
                     if stage == "oof":
                         result = generate_oof_stream(
@@ -1613,13 +1685,17 @@ def _run_paper_stage(
                         )
                     )
         members = (
-            pl.concat(member_frames, how="vertical") if member_frames else _empty_prediction_frame()
+            pl.concat(member_frames, how="vertical")
+            if member_frames
+            else _empty_prediction_frame()
         )
         point = pl.concat(point_frames, how="vertical")
-        verified_preprocessing_populations = _verified_actual_preprocessing_populations(
-            actual_population_records,
-            expected_preprocessing_populations,
-            classical_seed=classical_seed,
+        verified_preprocessing_populations = (
+            _verified_actual_preprocessing_populations(
+                actual_population_records,
+                expected_preprocessing_populations,
+                classical_seed=classical_seed,
+            )
         )
         _validate_published_frames(
             members,
@@ -1636,7 +1712,9 @@ def _run_paper_stage(
             "expected_coverage": expected_coverage,
             "preprocessing_populations": verified_preprocessing_populations,
             "split_ids": list(split_ids),
-            "streams": _stream_records(selected_models, selected_features, classical_seed),
+            "streams": _stream_records(
+                selected_models, selected_features, classical_seed
+            ),
         }
         members_path, point_path, manifest_path = _publish_stage(
             run_dir=run,

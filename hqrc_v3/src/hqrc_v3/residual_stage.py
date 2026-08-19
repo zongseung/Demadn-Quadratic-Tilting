@@ -285,7 +285,9 @@ def build_standardized_residuals(
         "model", "feature_set", "seed", "target_timestamp"
     )
     duplicate_hours = frame.select(
-        pl.struct("model", "feature_set", "seed", "target_timestamp").is_duplicated().any()
+        pl.struct("model", "feature_set", "seed", "target_timestamp")
+        .is_duplicated()
+        .any()
     ).item()
     if duplicate_hours:
         raise DataContractError("standardized residual artifact contains duplicate context hours")
@@ -314,7 +316,9 @@ def _validate_standardized_frame(frame: pl.DataFrame) -> None:
     )
     if any(frame.schema[column] not in {pl.Float32, pl.Float64} for column in float_columns):
         raise ArtifactMismatch("standardized residual numeric schema differs")
-    all_finite = pl.all_horizontal(*(pl.col(name).is_finite() for name in float_columns)).all()
+    all_finite = pl.all_horizontal(
+        *(pl.col(name).is_finite() for name in float_columns)
+    ).all()
     if not frame.select(all_finite).item():
         raise ArtifactMismatch("standardized residual output contains nonfinite values")
     if not frame.select((pl.col("sigma_n_mw") > 0).all()).item():
@@ -336,15 +340,13 @@ def _validate_standardized_frame(frame: pl.DataFrame) -> None:
     string_columns = ("model", "feature_set", "split_id", "occurrence_id", "holiday_type")
     if any(frame.schema[column] not in string_types for column in string_columns):
         raise ArtifactMismatch("standardized residual identifier schema differs")
-    if (
-        frame.schema["origin"].base_type() != pl.Datetime
-        or frame.schema["target_timestamp"].base_type() != pl.Datetime
-    ):
+    if frame.schema["origin"].base_type() != pl.Datetime or frame.schema[
+        "target_timestamp"
+    ].base_type() != pl.Datetime:
         raise ArtifactMismatch("standardized residual timestamps must be datetimes")
-    if (
-        frame.schema["origin"].time_zone is not None
-        or frame.schema["target_timestamp"].time_zone is not None
-    ):
+    if frame.schema["origin"].time_zone is not None or frame.schema[
+        "target_timestamp"
+    ].time_zone is not None:
         raise ArtifactMismatch("standardized residual timestamps must be timezone-naive")
     if not frame.filter(
         ~pl.col("model").is_in(MODEL_NAMES)
@@ -361,9 +363,12 @@ def _validate_standardized_frame(frame: pl.DataFrame) -> None:
         pl.col("residual_mw") - (pl.col("observed_mw") - pl.col("predicted_mw"))
     ).abs()
     standardized_error = (
-        pl.col("standardized_residual") * pl.col("sigma_n_mw") - pl.col("residual_mw")
+        pl.col("standardized_residual") * pl.col("sigma_n_mw")
+        - pl.col("residual_mw")
     ).abs()
-    if not frame.select((residual_error <= 1e-9).all() & (standardized_error <= 1e-8).all()).item():
+    if not frame.select(
+        (residual_error <= 1e-9).all() & (standardized_error <= 1e-8).all()
+    ).item():
         raise ArtifactMismatch("standardized residual arithmetic differs")
     tau_hours = pl.col("tau_days") * 24.0
     if not frame.select(
@@ -382,21 +387,28 @@ def _validate_standardized_frame(frame: pl.DataFrame) -> None:
         ["model", "feature_set", "seed", "occurrence_id"], maintain_order=True
     ):
         if any(
-            event[column].n_unique() != 1 for column in ("holiday_type", "restriction", "split_id")
+            event[column].n_unique() != 1
+            for column in ("holiday_type", "restriction", "split_id")
         ):
             raise ArtifactMismatch("event residual metadata varies within an occurrence")
         if not event.select(
             pl.col("target_timestamp").diff().drop_nulls().eq(pl.duration(hours=1)).all()
-            & pl.col("tau_days").diff().drop_nulls().sub(1.0 / 24.0).abs().le(1e-8).all()
+            & pl.col("tau_days")
+            .diff()
+            .drop_nulls()
+            .sub(1.0 / 24.0)
+            .abs()
+            .le(1e-8)
+            .all()
         ).item():
             raise ArtifactMismatch("event residual hours are not contiguous")
 
 
 def _canonical_json(value: object) -> bytes:
     try:
-        return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
-            "utf-8"
-        )
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
     except (TypeError, ValueError) as error:
         raise ArtifactMismatch("residual manifest must be finite canonical JSON") from error
 
@@ -652,7 +664,8 @@ def _load_baseline_source(
         not isinstance(split_ids, list)
         or not split_ids
         or any(
-            not isinstance(split_id, str) or not is_oof_split_id(split_id) for split_id in split_ids
+            not isinstance(split_id, str) or not is_oof_split_id(split_id)
+            for split_id in split_ids
         )
         or split_ids != sorted(set(split_ids))
         or not isinstance(eval_years, list)
@@ -670,7 +683,9 @@ def _load_baseline_source(
             "model": model,
             "feature_set": feature_set,
             "seeds": list(
-                PAPER_SEEDS if model in _NEURAL_MODELS else (manifest["classical_seed"],)
+                PAPER_SEEDS
+                if model in _NEURAL_MODELS
+                else (manifest["classical_seed"],)
             ),
         }
         for model in models_tuple
@@ -716,7 +731,10 @@ def _load_baseline_source(
     except (DataContractError, TypeError, ValueError) as error:
         raise ArtifactMismatch(f"OOF prediction artifact is invalid: {error}") from error
     classical_seed = manifest.get("classical_seed")
-    if isinstance(classical_seed, bool) or not isinstance(classical_seed, int):
+    if (
+        isinstance(classical_seed, bool)
+        or not isinstance(classical_seed, int)
+    ):
         raise ArtifactMismatch("baseline point-stream seeds are invalid")
     expected = {
         (
@@ -730,7 +748,9 @@ def _load_baseline_source(
         for split_id in split_ids
     }
     actual = set(
-        predictions.select("model", "feature_set", "seed", "split_id").unique().iter_rows()
+        predictions.select("model", "feature_set", "seed", "split_id")
+        .unique()
+        .iter_rows()
     )
     if actual != expected:
         raise ArtifactMismatch("OOF point prediction contexts differ from the baseline manifest")
@@ -742,7 +762,9 @@ def _load_baseline_source(
                 "expected_end": FIXED_END,
                 "expected_rows": FIXED_ROWS,
                 "expected_public_holiday_dates": FIXED_PUBLIC_HOLIDAY_DATES,
-                "expected_substitute_or_temporary_dates": (FIXED_SUBSTITUTE_OR_TEMPORARY_DATES),
+                "expected_substitute_or_temporary_dates": (
+                    FIXED_SUBSTITUTE_OR_TEMPORARY_DATES
+                ),
                 "temporary_holiday_availability": temporary_availability,
             }
             if profile == "paper"
@@ -756,7 +778,9 @@ def _load_baseline_source(
         audited = audit_hourly_data(read_hourly_data(Path(data_path)), **paper_bounds)
         featured = attach_calendar_features(audited, calendar)
         matrices = {
-            feature_set: build_daily_forecast_matrix(featured, feature_set=feature_set)
+            feature_set: build_daily_forecast_matrix(
+                featured, feature_set=feature_set
+            )
             for feature_set in feature_sets_tuple
         }
         validate_oof_publication_against_source_matrices(
@@ -824,7 +848,9 @@ def _validate_exact_coverage(
 
 def _context_records(build: StandardizedResidualBuild) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
-    for context in build.frame.partition_by(["model", "feature_set", "seed"], maintain_order=True):
+    for context in build.frame.partition_by(
+        ["model", "feature_set", "seed"], maintain_order=True
+    ):
         model = str(context["model"].item(0))
         feature_set = str(context["feature_set"].item(0))
         seed = int(context["seed"].item(0))
@@ -912,7 +938,9 @@ def _safe_bound_path(run_dir: Path, entry: object, *, expected: str | None = Non
 def _validate_context_manifest(value: object, frame: pl.DataFrame) -> None:
     if not isinstance(value, list) or not value:
         raise ArtifactMismatch("residual manifest contexts must be a nonempty list")
-    actual_keys = set(frame.select("model", "feature_set", "seed").unique().iter_rows())
+    actual_keys = set(
+        frame.select("model", "feature_set", "seed").unique().iter_rows()
+    )
     recorded_keys: set[tuple[str, str, int]] = set()
     for record in value:
         required = {
@@ -952,11 +980,9 @@ def _validate_context_manifest(value: object, frame: pl.DataFrame) -> None:
         if record["split_ids"] != split_ids or record["occurrence_ids"] != occurrence_ids:
             raise ArtifactMismatch("residual context coverage differs")
         scales = record["fold_scales"]
-        recorded_splits = (
-            [item.get("split_id") for item in scales if isinstance(item, dict)]
-            if isinstance(scales, list)
-            else []
-        )
+        recorded_splits = [
+            item.get("split_id") for item in scales if isinstance(item, dict)
+        ] if isinstance(scales, list) else []
         if not isinstance(scales, list) or recorded_splits != split_ids:
             raise ArtifactMismatch("residual context fold scales differ")
         for scale in scales:
@@ -1124,7 +1150,9 @@ def prepare_standardized_residual_artifact(
             model_config_path=Path(model_config_path),
             event_registry_path=event_path,
             holiday_calendar_path=Path(holiday_calendar_path),
-            temporary_holiday_availability_path=Path(temporary_holiday_availability_path),
+            temporary_holiday_availability_path=Path(
+                temporary_holiday_availability_path
+            ),
             profile=profile,
         )
         config_sha = inputs["experiment_config"]["sha256"]

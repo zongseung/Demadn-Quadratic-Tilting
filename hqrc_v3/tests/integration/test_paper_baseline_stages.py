@@ -45,10 +45,14 @@ def _population(times: np.ndarray, *, unit: str) -> dict[str, object]:
     }
 
 
-def _actual_population_contract(model: str, train: ForecastMatrix) -> dict[str, dict[str, object]]:
+def _actual_population_contract(
+    model: str, train: ForecastMatrix
+) -> dict[str, dict[str, object]]:
     target = _population(train.target_times, unit="unique-hour")
     if model in {"seq2seq_lstm", "transformer"}:
-        history_times = train.origins[:, None] + np.arange(-168, 0).astype("timedelta64[h]")
+        history_times = train.origins[:, None] + np.arange(-168, 0).astype(
+            "timedelta64[h]"
+        )
         return {
             "target": target,
             "weather": _population(history_times, unit="unique-hour"),
@@ -299,10 +303,12 @@ def _rewrite_interrupted_manifest_binding(run: Path, *, sibling_stage: str) -> N
         frame = pl.read_parquet(path)
         frame.filter(pl.col("origin") != frame["origin"].min()).write_parquet(path)
         digest = file_sha256(path)
-        journal["prior_manifest"]["stages"][sibling_stage]["artifacts"][artifact]["sha256"] = digest
-        journal["intended_manifest"]["stages"][sibling_stage]["artifacts"][artifact]["sha256"] = (
-            digest
-        )
+        journal["prior_manifest"]["stages"][sibling_stage]["artifacts"][artifact][
+            "sha256"
+        ] = digest
+        journal["intended_manifest"]["stages"][sibling_stage]["artifacts"][artifact][
+            "sha256"
+        ] = digest
     intended_payload = json.dumps(
         journal["intended_manifest"], sort_keys=True, separators=(",", ":")
     ).encode()
@@ -344,7 +350,9 @@ def _mutate_all_oof_coverage(run: Path, mutation: str) -> None:
                 .alias("target_timestamp")
             )
         elif mutation == "observed":
-            changed = frame.with_columns((pl.col("observed_mw") + 0.25).alias("observed_mw"))
+            changed = frame.with_columns(
+                (pl.col("observed_mw") + 0.25).alias("observed_mw")
+            )
         else:  # pragma: no cover - test helper has a closed call set
             raise AssertionError(mutation)
         changed.write_parquet(path)
@@ -365,12 +373,16 @@ def test_oof_stage_publishes_exact_years_members_and_pointwise_means(tmp_path: P
     assert set(point["target_timestamp"].dt.year()) == {2020, 2021, 2022, 2023}
     assert set(members["model"]) == {"seq2seq_lstm", "transformer"}
     assert set(members["seed"]) == set(PAPER_SEEDS)
-    assert set(point.filter(pl.col("model").is_in(["seq2seq_lstm", "transformer"]))["seed"]) == {0}
+    assert set(
+        point.filter(pl.col("model").is_in(["seq2seq_lstm", "transformer"]))["seed"]
+    ) == {0}
 
     member_mean = members.group_by(
         "origin", "target_timestamp", "horizon", "observed_mw", "model", "feature_set", "split_id"
     ).agg(pl.col("predicted_mw").mean().alias("member_mean"))
-    neural_point = point.filter(pl.col("model").is_in(["seq2seq_lstm", "transformer"])).join(
+    neural_point = point.filter(
+        pl.col("model").is_in(["seq2seq_lstm", "transformer"])
+    ).join(
         member_mean,
         on=[
             "origin",
@@ -436,9 +448,9 @@ def test_completed_oof_is_a_validated_cache_hit_without_fitting(tmp_path: Path) 
 
 def test_stream_caches_resume_publication_without_refitting(tmp_path: Path) -> None:
     first = _run_oof(tmp_path)
-    first_populations = json.loads(first.manifest_path.read_text(encoding="utf-8"))["stages"][
-        "oof"
-    ]["preprocessing_populations"]
+    first_populations = json.loads(first.manifest_path.read_text(encoding="utf-8"))[
+        "stages"
+    ]["oof"]["preprocessing_populations"]
     first.members_path.unlink()
     first.point_path.unlink()
     first.manifest_path.unlink()
@@ -451,9 +463,9 @@ def test_stream_caches_resume_publication_without_refitting(tmp_path: Path) -> N
     assert resumed.members_path.is_file()
     assert resumed.point_path.is_file()
     assert all(factory.calls == [] for factory in factories.values())
-    resumed_populations = json.loads(resumed.manifest_path.read_text(encoding="utf-8"))["stages"][
-        "oof"
-    ]["preprocessing_populations"]
+    resumed_populations = json.loads(
+        resumed.manifest_path.read_text(encoding="utf-8")
+    )["stages"]["oof"]["preprocessing_populations"]
     assert resumed_populations == first_populations
 
 
@@ -630,7 +642,9 @@ def test_completed_stage_rejects_changed_or_omitted_preprocessing_identity(
 def test_completed_stage_rejects_rewritten_scaler_population(tmp_path: Path) -> None:
     result = _run_oof(tmp_path)
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
-    manifest["stages"]["oof"]["preprocessing_populations"][0]["scalers"]["x"]["count"] += 1
+    manifest["stages"]["oof"]["preprocessing_populations"][0]["scalers"]["x"][
+        "count"
+    ] += 1
     result.manifest_path.write_text(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
     )
@@ -649,11 +663,15 @@ def test_completed_stage_rejects_omitted_temporary_availability_hash(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
     )
 
-    with pytest.raises(ArtifactMismatch, match="temporary_holiday_availability_sha256"):
+    with pytest.raises(
+        ArtifactMismatch, match="temporary_holiday_availability_sha256"
+    ):
         _run_oof(tmp_path)
 
 
-@pytest.mark.parametrize("mutation", ["missing", "extra", "duplicate", "misaligned", "observed"])
+@pytest.mark.parametrize(
+    "mutation", ["missing", "extra", "duplicate", "misaligned", "observed"]
+)
 def test_hash_rebound_uniform_coverage_tampering_never_becomes_a_cache_hit(
     tmp_path: Path,
     mutation: str,
@@ -661,7 +679,9 @@ def test_hash_rebound_uniform_coverage_tampering_never_becomes_a_cache_hit(
     _run_oof(tmp_path)
     _mutate_all_oof_coverage(tmp_path, mutation)
 
-    with pytest.raises(ArtifactMismatch, match="coverage|duplicate|target timestamp"):
+    with pytest.raises(
+        ArtifactMismatch, match="coverage|duplicate|target timestamp"
+    ):
         _run_oof(tmp_path)
 
 
@@ -801,7 +821,9 @@ def test_rehashed_wrong_model_final_sibling_blocks_oof_stage(tmp_path: Path) -> 
         .alias("model")
     )
     changed.write_parquet(final.point_path)
-    _rebind_artifact_hash(tmp_path, stage="final", artifact="point", path=final.point_path)
+    _rebind_artifact_hash(
+        tmp_path, stage="final", artifact="point", path=final.point_path
+    )
 
     with pytest.raises(ArtifactMismatch, match="model"):
         _run_oof(tmp_path)
@@ -1101,7 +1123,9 @@ def test_concrete_cli_loads_both_feature_matrices_and_hash_bound_inputs(
         "experiment_sha256": file_sha256(PROJECT_ROOT / "configs/experiment.toml"),
         "model_config_sha256": file_sha256(MODEL_CONFIG),
         "event_registry_sha256": file_sha256(PROJECT_ROOT / "configs/events.csv"),
-        "holiday_calendar_sha256": file_sha256(PROJECT_ROOT / "configs/holiday_calendar.csv"),
+        "holiday_calendar_sha256": file_sha256(
+            PROJECT_ROOT / "configs/holiday_calendar.csv"
+        ),
         "temporary_holiday_availability_sha256": file_sha256(
             PROJECT_ROOT / "configs/temporary_holiday_availability.csv"
         ),
@@ -1177,7 +1201,7 @@ def test_readme_hqrc_commands_are_executable_from_the_repository_root() -> None:
     assert "\nhqrc " not in readme
     assert "MODEL_SHA256=<" not in readme
     assert (
-        'MODEL_SHA256="$(openssl dgst -sha256 '
+        "MODEL_SHA256=\"$(openssl dgst -sha256 "
         "hqrc_v3/configs/model_spaces.toml | awk '{print $NF}')\""
     ) in readme
     assert readme.count('--frozen-model-hash "$MODEL_SHA256"') == 4
