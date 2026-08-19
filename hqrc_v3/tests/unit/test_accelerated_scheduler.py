@@ -61,6 +61,58 @@ def test_single_cuda_device_runs_all_models_in_one_sequential_queue():
     assert model_queues((3,)) == (("cuda:3", PAPER_MODELS),)
 
 
+def test_cpu_two_logical_cpus_create_ordered_one_thread_queues():
+    assert scheduler._cpu_queue_specs(PAPER_MODELS, logical_cpus=2) == (
+        (("lightgbm", "seq2seq_lstm"), 1),
+        (("svr", "transformer"), 1),
+    )
+
+
+def test_cpu_scheduler_runs_all_models_concurrently_with_even_thread_budgets(
+    tmp_path, monkeypatch
+):
+    request = _request(tmp_path, accelerator="cpu")
+    _validated(monkeypatch)
+    monkeypatch.setattr(
+        scheduler,
+        "_preflight_accelerator",
+        lambda *_args, **_kwargs: scheduler._ResolvedAccelerator("cpu", "cpu", None, "probe", None),
+    )
+    monkeypatch.setattr(scheduler.os, "cpu_count", lambda: 24)
+    all_started = threading.Barrier(4)
+    environments = {}
+
+    def run_job(job):
+        environments[job.model] = job.environment
+        job.log_path.parent.mkdir(parents=True, exist_ok=True)
+        job.log_path.write_text(f"{job.model}\n")
+        all_started.wait(timeout=2)
+        return scheduler._JobOutcome(job, 0)
+
+    monkeypatch.setattr(scheduler, "_run_job", run_job)
+    result = run_accelerated_loeo(request)
+
+    assert result.completed_models == PAPER_MODELS
+    assert set(environments) == set(PAPER_MODELS)
+    for environment in environments.values():
+        assert {
+            name: environment[name]
+            for name in (
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+                "VECLIB_MAXIMUM_THREADS",
+            )
+        } == {
+            "OMP_NUM_THREADS": "6",
+            "MKL_NUM_THREADS": "6",
+            "OPENBLAS_NUM_THREADS": "6",
+            "NUMEXPR_NUM_THREADS": "6",
+            "VECLIB_MAXIMUM_THREADS": "6",
+        }
+
+
 @pytest.mark.parametrize("devices", ((1, 0), (2, 3)))
 def test_two_cuda_devices_require_physical_zero_then_one_before_validation_or_logs(
     tmp_path, monkeypatch, devices

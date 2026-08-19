@@ -109,6 +109,20 @@ def model_queues(devices: tuple[int, ...]) -> tuple[tuple[str, tuple[str, ...]],
     )
 
 
+def _cpu_queue_specs(
+    models: tuple[str, ...], logical_cpus: int | None = None
+) -> tuple[tuple[tuple[str, ...], int], ...]:
+    available = max(1, logical_cpus if logical_cpus is not None else (os.cpu_count() or 1))
+    worker_count = min(len(models), available)
+    if not worker_count:
+        return ()
+    threads, remainder = divmod(available, worker_count)
+    return tuple(
+        (tuple(models[index::worker_count]), threads + (index < remainder))
+        for index in range(worker_count)
+    )
+
+
 def _ordered_subset(value: tuple[str, ...], complete: tuple[str, ...], description: str) -> None:
     if (
         not value
@@ -321,6 +335,7 @@ def _build_job(
     *,
     physical_device: int | None,
     device: str,
+    thread_budget: int | None = None,
 ) -> _Job:
     command = [
         sys.executable,
@@ -367,6 +382,15 @@ def _build_job(
         suffix = f"cuda-{physical_device}"
     else:
         suffix = device.replace(":", "-")
+    if thread_budget is not None:
+        for name in (
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+        ):
+            environment[name] = str(thread_budget)
     return _Job(
         model=model,
         physical_device=physical_device,
@@ -450,17 +474,24 @@ def run_accelerated_loeo(request: AcceleratedRequest) -> AcceleratedResult:
             (
                 int(device.removeprefix("cuda:")),
                 tuple(model for model in models if model in request.models),
+                None,
             )
             for device, models in model_queues(request.devices)
         )
+    elif resolved.kind == "cpu":
+        queue_specs = tuple(
+            (None, models, threads) for models, threads in _cpu_queue_specs(request.models)
+        )
     else:
-        queue_specs = ((None, request.models),)
+        queue_specs = ((None, request.models, None),)
 
     stop = threading.Event()
     lock = threading.Lock()
     outcomes: list[_JobOutcome] = []
 
-    def run_queue(physical_device: int | None, models: tuple[str, ...]) -> None:
+    def run_queue(
+        physical_device: int | None, models: tuple[str, ...], thread_budget: int | None
+    ) -> None:
         for model in models:
             if stop.is_set():
                 break
@@ -469,6 +500,7 @@ def run_accelerated_loeo(request: AcceleratedRequest) -> AcceleratedResult:
                 model,
                 physical_device=physical_device,
                 device="cuda:0" if physical_device is not None else resolved.logical_device,
+                thread_budget=thread_budget,
             )
             outcome = _run_job(job)
             with lock:
@@ -477,9 +509,11 @@ def run_accelerated_loeo(request: AcceleratedRequest) -> AcceleratedResult:
                 stop.set()
                 break
 
-    active = tuple((device, models) for device, models in queue_specs if models)
+    active = tuple((device, models, threads) for device, models, threads in queue_specs if models)
     with ThreadPoolExecutor(max_workers=len(active), thread_name_prefix="hqrc-accelerator") as pool:
-        futures = tuple(pool.submit(run_queue, device, models) for device, models in active)
+        futures = tuple(
+            pool.submit(run_queue, device, models, threads) for device, models, threads in active
+        )
         for future in futures:
             future.result()
 
