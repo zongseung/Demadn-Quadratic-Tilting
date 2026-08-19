@@ -83,10 +83,11 @@ def execute(request_path: Path, result_path: Path) -> Path:
     wall = time.perf_counter() - started
     diagnostics = validate_inference_data(idata, paper_profile=sampler["profile"] == "paper")
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "request_digest": request["request_digest"],
         "backend": sampler["backend"],
         "pid": os.getpid(),
+        "parent_pid": os.getppid(),
         "wall_seconds": wall,
         "peak_rss_mb": _rss_mb(),
         "diagnostics": {

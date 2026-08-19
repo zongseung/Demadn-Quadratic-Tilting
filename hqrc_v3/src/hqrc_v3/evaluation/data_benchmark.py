@@ -22,6 +22,7 @@ from hqrc_v3.bayes.benchmark import (
 from hqrc_v3.provenance import file_sha256
 
 _VERSION = 1
+_RESULT_VERSION = 2
 _WORKLOAD = "polars-numeric-summary-v1"
 _REQUEST_KEYS = {
     "schema_version",
@@ -37,6 +38,7 @@ _RESULT_KEYS = {
     "schema_version",
     "request_digest",
     "pid",
+    "parent_pid",
     "threads",
     "dimensions",
     "zero_copy",
@@ -277,13 +279,16 @@ def load_data_benchmark_worker_result(
     if not isinstance(result_digest, str) or result_digest != _digest(payload):
         raise DataBenchmarkError("data benchmark worker result digest differs")
     payload["result_digest"] = result_digest
-    if type(payload["schema_version"]) is not int or payload["schema_version"] != _VERSION:
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != _RESULT_VERSION:
         raise DataBenchmarkError("data benchmark worker result version differs")
     if payload["request_digest"] != request["request_digest"]:
         raise DataBenchmarkError("data benchmark worker request digest differs")
     pid = _integer(payload["pid"], "worker PID")
     if pid == os.getpid():
         raise DataBenchmarkError("worker PID does not identify a child process")
+    parent_pid = _integer(payload["parent_pid"], "worker parent PID")
+    if pid == parent_pid:
+        raise DataBenchmarkError("worker PID relationship differs")
     threads = payload["threads"]
     if not isinstance(threads, dict) or set(threads) != {"requested", "actual"}:
         raise DataBenchmarkError("worker thread schema differs")
@@ -403,7 +408,7 @@ def run_data_benchmark_worker(
     loaded = load_data_benchmark_worker_result(
         result, request=request, requested_threads=requested_threads
     )
-    if loaded["pid"] != process.pid:
+    if loaded["pid"] != process.pid and loaded["parent_pid"] != process.pid:
         raise DataBenchmarkError("worker result PID differs from the spawned process")
     return loaded
 
@@ -650,9 +655,11 @@ def load_data_benchmark(path: Path) -> dict[str, Any]:
     columns = _columns(request["columns"])
     repetitions = _integer(request["repetitions"], "repetitions", minimum=3)
     workers = _integer(request["workers"], "workers", minimum=2)
-    if isinstance(request["seed"], bool) or not isinstance(request["seed"], int) or request[
-        "seed"
-    ] < 0:
+    if (
+        isinstance(request["seed"], bool)
+        or not isinstance(request["seed"], int)
+        or request["seed"] < 0
+    ):
         raise DataBenchmarkError("data benchmark seed differs")
     if request["workload"] != _WORKLOAD:
         raise DataBenchmarkError("data benchmark workload differs")
@@ -770,9 +777,7 @@ def load_data_benchmark(path: Path) -> dict[str, Any]:
         ("data_processing_share_of_measured_total", data_share),
     )
     if any(
-        not math.isclose(
-            _positive_float(derived[name], f"derived {name}"), expected, rel_tol=1e-12
-        )
+        not math.isclose(_positive_float(derived[name], f"derived {name}"), expected, rel_tol=1e-12)
         for name, expected in measured_values
     ):
         raise DataBenchmarkError("data benchmark measured share differs")
@@ -803,9 +808,7 @@ def load_data_benchmark(path: Path) -> dict[str, Any]:
     if decision["polars_already_rust"] is not True:
         raise DataBenchmarkError("Polars engine claim differs")
     expected_status = (
-        "candidate-for-further-benchmarking-only"
-        if rust_candidate
-        else "deferred-by-measured-gate"
+        "candidate-for-further-benchmarking-only" if rust_candidate else "deferred-by-measured-gate"
     )
     if decision["status"] != expected_status:
         raise DataBenchmarkError("custom Rust status differs")
@@ -819,9 +822,7 @@ def load_data_benchmark(path: Path) -> dict[str, Any]:
     if not isinstance(environment, dict) or set(environment) != {"serial", "parallel"}:
         raise DataBenchmarkError("data benchmark environment schema differs")
     serial_versions = _validate_environment_versions(environment["serial"], label="serial")
-    parallel_versions = _validate_environment_versions(
-        environment["parallel"], label="parallel"
-    )
+    parallel_versions = _validate_environment_versions(environment["parallel"], label="parallel")
     if serial_versions != parallel_versions:
         raise DataBenchmarkError("serial and parallel environment versions differ")
     return payload

@@ -33,6 +33,10 @@ def _digest(value: object) -> str:
     return hashlib.sha256(_canonical(value).encode()).hexdigest()
 
 
+def _write_json_with_lf(path: Path, payload: str) -> None:
+    path.write_bytes((payload + "\n").encode("utf-8"))
+
+
 def _parquet(tmp_path: Path, *, nullable: bool = False) -> Path:
     path = tmp_path / "numeric.parquet"
     second = [4.0, None, 2.0, 1.0] if nullable else [4.0, 3.0, 2.0, 1.0]
@@ -85,7 +89,7 @@ def _sampler_benchmark(tmp_path: Path, *, wall_seconds: float = 2.0) -> Path:
     }
     payload["benchmark_digest"] = _digest(payload)
     path = tmp_path / "sampler-benchmark.json"
-    path.write_text(_canonical(payload) + "\n")
+    _write_json_with_lf(path, _canonical(payload))
     return path
 
 
@@ -119,8 +123,7 @@ def test_real_polars_workers_measure_copy_ownership_and_parallelism(tmp_path):
     assert payload["processing"]["parallel"]["pid"] != os.getpid()
     assert payload["processing"]["serial"]["pid"] != payload["processing"]["parallel"]["pid"]
     assert (
-        payload["processing"]["serial"]["checksum"]
-        == payload["processing"]["parallel"]["checksum"]
+        payload["processing"]["serial"]["checksum"] == payload["processing"]["parallel"]["checksum"]
     )
     assert len(payload["processing"]["serial"]["timings_seconds"]) == 3
     assert payload["derived"]["data_processing_share_of_measured_total"] > 0
@@ -132,7 +135,7 @@ def test_real_polars_workers_measure_copy_ownership_and_parallelism(tmp_path):
     payload.pop("benchmark_digest")
     payload["derived"]["data_processing_share_of_measured_total"] = 0.75
     payload["benchmark_digest"] = _digest(payload)
-    output.write_text(_canonical(payload) + "\n")
+    _write_json_with_lf(output, _canonical(payload))
     with pytest.raises(DataBenchmarkError, match="measured share"):
         load_data_benchmark(output)
 
@@ -211,15 +214,15 @@ def test_request_rejects_bound_hash_schema_canonical_and_input_tamper(tmp_path):
     wrong_schema.pop("request_digest")
     wrong_schema["unexpected"] = True
     wrong_schema["request_digest"] = _digest(wrong_schema)
-    request.write_text(_canonical(wrong_schema) + "\n")
+    _write_json_with_lf(request, _canonical(wrong_schema))
     with pytest.raises(DataBenchmarkError, match="schema"):
         load_data_benchmark_request(request)
 
-    request.write_text(json.dumps(original, indent=2) + "\n")
+    _write_json_with_lf(request, json.dumps(original, indent=2))
     with pytest.raises(DataBenchmarkError, match="canonical"):
         load_data_benchmark_request(request)
 
-    request.write_text(_canonical(original) + "\n")
+    _write_json_with_lf(request, _canonical(original))
     with (tmp_path / "numeric.parquet").open("ab") as output:
         output.write(b"tamper")
     with pytest.raises(DataBenchmarkError, match="input digest"):
@@ -227,30 +230,26 @@ def test_request_rejects_bound_hash_schema_canonical_and_input_tamper(tmp_path):
 
 
 @pytest.mark.parametrize("invalid_version", [True, 1.0], ids=("boolean", "float"))
-def test_parent_request_loader_rejects_noninteger_version_after_redigest(
-    tmp_path, invalid_version
-):
+def test_parent_request_loader_rejects_noninteger_version_after_redigest(tmp_path, invalid_version):
     request = _request(tmp_path)
     payload = json.loads(request.read_bytes())
     payload.pop("request_digest")
     payload["schema_version"] = invalid_version
     payload["request_digest"] = _digest(payload)
-    request.write_text(_canonical(payload) + "\n")
+    _write_json_with_lf(request, _canonical(payload))
 
     with pytest.raises(DataBenchmarkError, match="request version"):
         load_data_benchmark_request(request)
 
 
 @pytest.mark.parametrize("invalid_version", [True, 1.0], ids=("boolean", "float"))
-def test_worker_request_loader_rejects_noninteger_version_after_redigest(
-    tmp_path, invalid_version
-):
+def test_worker_request_loader_rejects_noninteger_version_after_redigest(tmp_path, invalid_version):
     request = _request(tmp_path)
     payload = json.loads(request.read_bytes())
     payload.pop("request_digest")
     payload["schema_version"] = invalid_version
     payload["request_digest"] = _digest(payload)
-    request.write_text(_canonical(payload) + "\n")
+    _write_json_with_lf(request, _canonical(payload))
 
     with pytest.raises(data_benchmark_worker.DataBenchmarkError, match="request version"):
         data_benchmark_worker._load_request(request)
@@ -274,12 +273,10 @@ def test_parent_worker_result_loader_rejects_noninteger_version_after_redigest(
     payload.pop("result_digest")
     payload["schema_version"] = invalid_version
     payload["result_digest"] = _digest(payload)
-    result_path.write_text(_canonical(payload) + "\n")
+    _write_json_with_lf(result_path, _canonical(payload))
 
     with pytest.raises(DataBenchmarkError, match="worker result version"):
-        load_data_benchmark_worker_result(
-            result_path, request=request, requested_threads=1
-        )
+        load_data_benchmark_worker_result(result_path, request=request, requested_threads=1)
 
 
 def test_real_worker_rejects_nullable_float_that_would_force_copy(tmp_path):
@@ -297,6 +294,8 @@ def test_real_worker_rejects_nullable_float_that_would_force_copy(tmp_path):
     [
         ("bad-digest", 5, "digest"),
         ("bad-pid", 5, "PID"),
+        ("bad-parent-pid", 5, "PID relationship"),
+        ("bad-relationship", 5, "PID differs"),
         ("extra-key", 5, "schema"),
         ("nonzero", 5, "exit"),
         ("malformed", 5, "JSON"),
@@ -348,7 +347,7 @@ def test_orchestrator_revalidates_sampler_schema_digest_and_bound_hash(tmp_path)
     payload.pop("benchmark_digest")
     payload["unexpected"] = True
     payload["benchmark_digest"] = _digest(payload)
-    sampler.write_text(_canonical(payload) + "\n")
+    _write_json_with_lf(sampler, _canonical(payload))
     with pytest.raises(DataBenchmarkError, match="sampler benchmark schema"):
         benchmark_polars_data(
             tmp_path / "benchmark.json",
@@ -362,7 +361,7 @@ def test_orchestrator_revalidates_sampler_schema_digest_and_bound_hash(tmp_path)
     sampler = _sampler_benchmark(tmp_path)
     payload = json.loads(sampler.read_text())
     payload["benchmarks"]["pymc"]["wall_seconds"] = 99.0
-    sampler.write_text(_canonical(payload) + "\n")
+    _write_json_with_lf(sampler, _canonical(payload))
     with pytest.raises(DataBenchmarkError, match="sampler benchmark digest"):
         benchmark_polars_data(
             tmp_path / "benchmark.json",
@@ -380,7 +379,7 @@ def test_production_sampler_loader_rejects_boolean_version_after_redigest(tmp_pa
     payload.pop("benchmark_digest")
     payload["schema_version"] = True
     payload["benchmark_digest"] = _digest(payload)
-    sampler.write_text(_canonical(payload) + "\n")
+    _write_json_with_lf(sampler, _canonical(payload))
 
     with pytest.raises(SamplerWorkerError, match="benchmark version"):
         load_sampler_benchmark(sampler)
@@ -408,7 +407,7 @@ def test_final_data_benchmark_loader_rejects_noninteger_version_after_redigest(
     payload.pop("benchmark_digest")
     payload["schema_version"] = invalid_version
     payload["benchmark_digest"] = _digest(payload)
-    output.write_text(_canonical(payload) + "\n")
+    _write_json_with_lf(output, _canonical(payload))
 
     with pytest.raises(DataBenchmarkError, match="data benchmark version"):
         load_data_benchmark(output)

@@ -34,6 +34,15 @@ from hqrc_v3.provenance import file_sha256
 base_source = source_fixture
 
 
+def _symlink_or_skip(path: Path, target: Path, *, target_is_directory: bool = False) -> None:
+    try:
+        path.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("host cannot create the requested test symlink")
+        raise
+
+
 @pytest.fixture(name="source")
 def _ar_source(
     base_source: ValidatedCorrectionSource, monkeypatch: pytest.MonkeyPatch
@@ -520,7 +529,7 @@ def test_loader_rejects_symlink_plot_and_changed_physical_fold(
     target = tmp_path / "plot-copy.svg"
     target.write_bytes(proposal.plot_paths[held_out].read_bytes())
     proposal.plot_paths[held_out].unlink()
-    proposal.plot_paths[held_out].symlink_to(target)
+    _symlink_or_skip(proposal.plot_paths[held_out], target)
     with pytest.raises(LOEOARProposalError, match="unsafe"):
         load_approved_loeo_ar_set(source, publication, output_dir=proposal.output_dir)
 
@@ -609,7 +618,7 @@ def test_publication_lock_rejects_symlink_without_touching_target(
     target = tmp_path / "outside-lock"
     if target_exists:
         target.write_bytes(b"outside evidence")
-    (root / ".loeo-ar.lock").symlink_to(target)
+    _symlink_or_skip(root / ".loeo-ar.lock", target)
     before = target.read_bytes() if target_exists else None
 
     with pytest.raises(LOEOARProposalError, match="lock|unsafe"):
@@ -633,7 +642,7 @@ def test_approval_entry_symlink_is_preserved_and_target_untouched(
         target.mkdir()
         (target / "evidence").write_bytes(b"outside evidence")
     approval = proposal.generation_dir / "approval"
-    approval.symlink_to(target, target_is_directory=True)
+    _symlink_or_skip(approval, target, target_is_directory=True)
     target_state = _tree_snapshot(target) if target_exists else None
 
     with pytest.raises(LOEOARProposalError, match="approval|unsafe"):
@@ -693,7 +702,7 @@ def test_fresh_prepare_preserves_foreign_or_unsafe_stage(
     else:
         target = tmp_path / "outside-stage"
         target.write_bytes(b"outside evidence")
-        (stage / "COMPLETE").symlink_to(target)
+        _symlink_or_skip(stage / "COMPLETE", target)
     before = _tree_snapshot(stage)
 
     with pytest.raises(LOEOARProposalError, match="stage|staging|identity|unsafe|preserved"):
@@ -777,7 +786,7 @@ def test_fresh_approval_preserves_foreign_or_unsafe_stage(
     else:
         target = tmp_path / "outside-approval-stage"
         target.write_bytes(b"outside evidence")
-        (stage / "COMPLETE").symlink_to(target)
+        _symlink_or_skip(stage / "COMPLETE", target)
     before = _tree_snapshot(stage)
 
     with pytest.raises(LOEOARProposalError, match="stage|staging|identity|unsafe|preserved"):

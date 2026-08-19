@@ -36,6 +36,15 @@ SPLITS = tuple(f"oof-{year}" for year in range(2020, 2024))
 GEOMETRY_NAMESPACE = f"init-{PYMC_INITIALIZATION}-geometry-{SAMPLER_GEOMETRY}"
 
 
+def _symlink_or_skip(path: Path, target: Path) -> None:
+    try:
+        path.symlink_to(target)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("host cannot create the requested test symlink")
+        raise
+
+
 def _approved(tmp_path: Path, event_ids: tuple[str, ...]):
     proposal = write_ar_diagnostics(
         tmp_path / "proposal.json",
@@ -502,12 +511,10 @@ def _stage_arguments(
 
 
 def test_causal_sampler_contract_resolves_and_validates_cores():
-    assert stage._sampler_contract(
-        "smoke", seed=19, draws=3, tune=3, chains=2
-    )["cores"] == 1
-    assert stage._sampler_contract(
-        "smoke", seed=19, draws=3, tune=3, chains=4, cores=4
-    )["cores"] == 4
+    assert stage._sampler_contract("smoke", seed=19, draws=3, tune=3, chains=2)["cores"] == 1
+    assert (
+        stage._sampler_contract("smoke", seed=19, draws=3, tune=3, chains=4, cores=4)["cores"] == 4
+    )
     with pytest.raises(CausalCorrectionError, match="cores"):
         stage._sampler_contract("smoke", seed=19, draws=3, tune=3, chains=2, cores=3)
 
@@ -607,9 +614,9 @@ def test_each_downstream_crash_resumes_from_checkpoint_without_resampling(
     monkeypatch.setattr(
         stage,
         "_publication_boundary",
-        lambda current: (_ for _ in ()).throw(RuntimeError(boundary))
-        if current == boundary
-        else None,
+        lambda current: (
+            (_ for _ in ()).throw(RuntimeError(boundary)) if current == boundary else None
+        ),
     )
     with pytest.raises(RuntimeError, match=boundary):
         fit_causal_2024_correction(**arguments)
@@ -633,9 +640,11 @@ def test_partial_resume_fails_closed_on_unsafe_or_invalid_checkpoint(
     monkeypatch.setattr(
         stage,
         "_publication_boundary",
-        lambda current: (_ for _ in ()).throw(RuntimeError("product crash"))
-        if current == "event_predictions-published"
-        else None,
+        lambda current: (
+            (_ for _ in ()).throw(RuntimeError("product crash"))
+            if current == "event_predictions-published"
+            else None
+        ),
     )
     with pytest.raises(RuntimeError, match="product crash"):
         fit_causal_2024_correction(**arguments)
@@ -650,7 +659,7 @@ def test_partial_resume_fails_closed_on_unsafe_or_invalid_checkpoint(
     elif mutation == "symlink":
         product = output_dir / "event_predictions.parquet"
         product.unlink()
-        product.symlink_to(output_dir / "posterior.nc")
+        _symlink_or_skip(product, output_dir / "posterior.nc")
     elif mutation == "hqrc":
         (output_dir / "hqrc_data.current.json").write_bytes(b"{}")
     else:
@@ -707,18 +716,18 @@ def test_complete_reuse_rejects_rehashed_manifest_output_alias(tmp_path, monkeyp
 @pytest.mark.parametrize(
     "mutation", ["npz-symlink", "metadata-symlink", "unknown", "unknown-symlink"]
 )
-def test_partial_resume_rejects_unsafe_current_generation_entries(
-    tmp_path, monkeypatch, mutation
-):
+def test_partial_resume_rejects_unsafe_current_generation_entries(tmp_path, monkeypatch, mutation):
     inputs = _stage_inputs(tmp_path)
     calls = _install_fake_stage(monkeypatch, inputs)
     arguments = _stage_arguments(tmp_path, inputs)
     monkeypatch.setattr(
         stage,
         "_publication_boundary",
-        lambda current: (_ for _ in ()).throw(RuntimeError("product crash"))
-        if current == "event_predictions-published"
-        else None,
+        lambda current: (
+            (_ for _ in ()).throw(RuntimeError("product crash"))
+            if current == "event_predictions-published"
+            else None
+        ),
     )
     with pytest.raises(RuntimeError, match="product crash"):
         fit_causal_2024_correction(**arguments)
@@ -736,13 +745,11 @@ def test_partial_resume_rejects_unsafe_current_generation_entries(
         alternate = generation_dir / f"alternate-{current.name}"
         alternate.write_bytes(current.read_bytes())
         current.unlink()
-        current.symlink_to(alternate.name)
+        _symlink_or_skip(current, alternate.name)
     elif mutation == "unknown":
         (generation_dir / "unknown.bin").write_bytes(b"unknown")
     else:
-        (generation_dir / "unknown-link").symlink_to(
-            (output_dir / pointer["npz"]).name
-        )
+        _symlink_or_skip(generation_dir / "unknown-link", (output_dir / pointer["npz"]).name)
 
     monkeypatch.setattr(stage, "_publication_boundary", lambda _: None)
     with pytest.raises(CausalCorrectionError):
@@ -766,9 +773,7 @@ def test_sampler_profile_and_rng_seed_have_distinct_namespaces(tmp_path, monkeyp
     )
 
     smoke_19 = fit_causal_2024_correction(**_stage_arguments(tmp_path, inputs))
-    smoke_23 = fit_causal_2024_correction(
-        **_stage_arguments(tmp_path, inputs, sampler_seed=23)
-    )
+    smoke_23 = fit_causal_2024_correction(**_stage_arguments(tmp_path, inputs, sampler_seed=23))
     paper_29 = fit_causal_2024_correction(
         **_stage_arguments(
             tmp_path,
@@ -789,15 +794,13 @@ def test_sampler_profile_and_rng_seed_have_distinct_namespaces(tmp_path, monkeyp
     assert "paper" in paper_29.output_dir.parts
     assert "sampler-seed-29" in paper_29.output_dir.parts
     assert all(
-        GEOMETRY_NAMESPACE in result.output_dir.parts
-        for result in (smoke_19, smoke_23, paper_29)
+        GEOMETRY_NAMESPACE in result.output_dir.parts for result in (smoke_19, smoke_23, paper_29)
     )
     assert smoke_19.output_dir.name == "draws-3-tune-3-chains-2-cores-1"
     assert smoke_23.output_dir.name == "draws-3-tune-3-chains-2-cores-1"
     assert paper_29.output_dir.name == "draws-1000-tune-1000-chains-4-cores-1"
     assert all(
-        (result.output_dir / "COMPLETE").is_file()
-        for result in (smoke_19, smoke_23, paper_29)
+        (result.output_dir / "COMPLETE").is_file() for result in (smoke_19, smoke_23, paper_29)
     )
     assert len(calls) == 3
 

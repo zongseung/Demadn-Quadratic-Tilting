@@ -22,6 +22,8 @@ from hqrc_v3.correction_source import CorrectionSourceError, ValidatedCorrection
 from hqrc_v3.diagnostics.ar import EventResidualContext
 from hqrc_v3.events import EventOccurrence
 from hqrc_v3.provenance import file_sha256
+from hqrc_v3.publication_fs import _fsync_directory as _portable_fsync_directory
+from hqrc_v3.publication_fs import _fsync_file as _portable_fsync_file
 from hqrc_v3.publication_fs import exclusive_lock
 from hqrc_v3.residual_stage import STANDARDIZED_RESIDUAL_COLUMNS
 
@@ -142,17 +144,12 @@ def _write_json(path: Path, value: object) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    _portable_fsync_directory(path)
 
 
 def _fsync_file(path: Path) -> None:
     _require_real_file(path, "LOEO publication artifact")
-    with path.open("rb") as source:
-        os.fsync(source.fileno())
+    _portable_fsync_file(path)
 
 
 def _incomplete_generation_removal_plan(

@@ -9,6 +9,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from hqrc_v3.publication_fs import _fsync_directory as _portable_fsync_directory
+
 
 class LOEOARProposalError(ValueError):
     """Raised when a LOEO AR set is incomplete, incompatible, or untrusted."""
@@ -64,8 +66,4 @@ def write_json(path: Path, value: object) -> None:
 
 
 def fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    _portable_fsync_directory(path)

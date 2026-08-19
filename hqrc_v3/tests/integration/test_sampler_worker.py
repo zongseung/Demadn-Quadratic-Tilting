@@ -125,6 +125,8 @@ def test_parent_launches_separate_worker_and_verifies_pid_and_digest(tmp_path):
         worker_command=(sys.executable, str(FAKE), "ok"),
     )
     assert result.pid != os.getpid()
+    assert result.parent_pid > 0
+    assert result.parent_pid != result.pid
     assert result.request_digest
     assert result.min_bulk_ess_per_second == pytest.approx(50.0)
 
@@ -175,7 +177,14 @@ def test_sampler_result_rejects_boolean_version_after_redigest(tmp_path):
 
 @pytest.mark.parametrize(
     ("mode", "match"),
-    [("bad-digest", "digest"), ("nonzero", "exit"), ("malformed", "JSON"), ("sleep", "timeout")],
+    [
+        ("bad-digest", "digest"),
+        ("bad-parent-pid", "PID relationship"),
+        ("bad-relationship", "PID differs"),
+        ("nonzero", "exit"),
+        ("malformed", "JSON"),
+        ("sleep", "timeout"),
+    ],
 )
 def test_parent_fails_closed_for_worker_errors(tmp_path, mode, match):
     with pytest.raises(SamplerWorkerError, match=match):

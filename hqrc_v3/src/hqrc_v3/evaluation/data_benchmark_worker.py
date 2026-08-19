@@ -255,9 +255,10 @@ def execute(request_path: Path, result_path: Path, *, requested_threads: int) ->
         raise DataBenchmarkError("repeated workload checksums differ")
 
     payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "request_digest": request["request_digest"],
         "pid": os.getpid(),
+        "parent_pid": os.getppid(),
         "threads": {"requested": requested_threads, "actual": actual_threads},
         "dimensions": {"rows": rows, "columns": request["columns"]},
         "zero_copy": {

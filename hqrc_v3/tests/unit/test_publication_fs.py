@@ -78,6 +78,13 @@ def test_exclusive_lock_blocks_a_spawned_writer(tmp_path):
     assert _spawn_lock_attempt(lock_path, timeout=2.0) == "acquired"
 
 
+def test_exclusive_lock_preserves_a_regular_file_after_release(tmp_path):
+    lock_path = tmp_path / "publication.lock"
+    with exclusive_lock(lock_path):
+        assert lock_path.is_file()
+    assert stat.S_ISREG(lock_path.lstat().st_mode)
+
+
 def test_require_local_entry_rejects_symlink_or_junction(tmp_path):
     target = tmp_path / "target"
     target.mkdir()
@@ -150,9 +157,7 @@ def test_windows_backend_preserves_existing_target_on_replace_failure(tmp_path, 
     assert (directory.path / "result.json").read_bytes() == b"old"
 
 
-def test_windows_hash_rejects_post_open_identity_swap_and_closes_descriptor(
-    tmp_path, monkeypatch
-):
+def test_windows_hash_rejects_post_open_identity_swap_and_closes_descriptor(tmp_path, monkeypatch):
     directory = _trusted_windows_directory(tmp_path)
     artifact = directory.path / "artifact.bin"
     artifact.write_bytes(b"content")

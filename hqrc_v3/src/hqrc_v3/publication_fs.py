@@ -270,9 +270,7 @@ def replace_entry(directory: TrustedDirectory, source_name: str, target_name: st
     return directory.path / target
 
 
-def unlink_entry(
-    directory: TrustedDirectory, name: str, *, missing_ok: bool = False
-) -> None:
+def unlink_entry(directory: TrustedDirectory, name: str, *, missing_ok: bool = False) -> None:
     """Remove one regular entry from a trusted directory."""
 
     safe = _entry_name(name)
@@ -379,6 +377,13 @@ def exclusive_lock(path: Path, *, timeout: float = -1) -> Iterator[None]:
     checked = require_within(Path(path).parent, Path(path))
     if checked.exists():
         require_local_entry(checked, kind="file")
+    if os.name == "nt":
+        with checked.open("a+b"):
+            require_local_entry(checked, kind="file")
+            with FileLock(str(checked), timeout=timeout):
+                require_within(checked.parent, checked)
+                yield
+        return
     with FileLock(str(checked), timeout=timeout):
         require_within(checked.parent, checked)
         yield

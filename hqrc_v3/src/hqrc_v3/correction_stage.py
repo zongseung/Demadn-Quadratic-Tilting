@@ -46,6 +46,8 @@ from hqrc_v3.diagnostics.ar import (
 from hqrc_v3.evaluation.metrics import point_metric_frame, probabilistic_metric_frame
 from hqrc_v3.events import EventOccurrence
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
+from hqrc_v3.publication_fs import _fsync_directory as _portable_fsync_directory
+from hqrc_v3.publication_fs import _fsync_file as _portable_fsync_file
 from hqrc_v3.publication_fs import exclusive_lock
 
 _CAUSAL_SPLITS = tuple(f"oof-{year}" for year in range(2020, 2024))
@@ -581,16 +583,11 @@ def _publication_boundary(_: str) -> None:
 
 
 def _fsync_file(path: Path) -> None:
-    with Path(path).open("rb") as stream:
-        os.fsync(stream.fileno())
+    _portable_fsync_file(path)
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    _portable_fsync_directory(path)
 
 
 def _atomic_bytes(path: Path, payload: bytes) -> Path:
@@ -1149,9 +1146,7 @@ def _validate_complete(
         predictive_draws=int(recorded_sampler["draws"]) * int(recorded_sampler["chains"]),
     )
     expected_frames = _product_frames(expected)
-    if manifest.get("rows") != {
-        name: frame.height for name, frame in expected_frames.items()
-    }:
+    if manifest.get("rows") != {name: frame.height for name, frame in expected_frames.items()}:
         raise CausalCorrectionError("published correction semantics differ")
     for name, expected_frame in expected_frames.items():
         try:
@@ -1171,9 +1166,7 @@ def _load_resumable_checkpoint(
     inputs: CausalCorrectionInputs,
     sampler: Mapping[str, object],
 ):
-    entries = {
-        path.name: path for path in directory.iterdir() if path.name != ".correction.lock"
-    }
+    entries = {path.name: path for path in directory.iterdir() if path.name != ".correction.lock"}
     allowed = _CHECKPOINT_ENTRIES | set(_DOWNSTREAM_FILENAMES)
     if set(entries) - allowed or not _CHECKPOINT_ENTRIES.issubset(entries):
         raise CausalCorrectionError("unsafe partial correction publication")

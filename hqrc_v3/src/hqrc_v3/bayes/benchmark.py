@@ -22,6 +22,7 @@ from hqrc_v3.diagnostics.ar import (
 from hqrc_v3.provenance import file_sha256
 
 _VERSION = 1
+_RESULT_VERSION = 2
 _REQUEST_KEYS = {
     "schema_version",
     "inputs",
@@ -36,6 +37,7 @@ _RESULT_KEYS = {
     "request_digest",
     "backend",
     "pid",
+    "parent_pid",
     "wall_seconds",
     "peak_rss_mb",
     "diagnostics",
@@ -308,6 +310,7 @@ def load_sampler_request(path: Path) -> dict[str, Any]:
 class SamplerWorkerResult:
     backend: str
     pid: int
+    parent_pid: int
     request_digest: str
     wall_seconds: float
     peak_rss_mb: float
@@ -438,15 +441,18 @@ def load_sampler_result(path: Path, *, request: Mapping[str, Any]) -> SamplerWor
     result_digest = payload.pop("result_digest")
     if not isinstance(result_digest, str) or result_digest != _digest(payload):
         raise SamplerWorkerError("worker result digest differs")
-    if type(payload["schema_version"]) is not int or payload["schema_version"] != _VERSION:
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != _RESULT_VERSION:
         raise SamplerWorkerError("worker result version differs")
     if payload["request_digest"] != request["request_digest"]:
         raise SamplerWorkerError("worker request digest differs")
     if payload["backend"] != request["sampler"]["backend"]:
         raise SamplerWorkerError("worker backend differs")
-    pid = payload["pid"]
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+    pid = _positive_integer(payload["pid"], "worker PID")
+    if pid == os.getpid():
         raise SamplerWorkerError("worker PID does not identify a child process")
+    parent_pid = _positive_integer(payload["parent_pid"], "worker parent PID")
+    if pid == parent_pid:
+        raise SamplerWorkerError("worker PID relationship differs")
     diagnostics = payload["diagnostics"]
     if not isinstance(diagnostics, dict) or set(diagnostics) != {
         "max_rhat",
@@ -471,6 +477,7 @@ def load_sampler_result(path: Path, *, request: Mapping[str, Any]) -> SamplerWor
     return SamplerWorkerResult(
         backend=payload["backend"],
         pid=pid,
+        parent_pid=parent_pid,
         request_digest=payload["request_digest"],
         wall_seconds=_finite_positive(payload["wall_seconds"], "worker wall_seconds"),
         peak_rss_mb=_finite_positive(payload["peak_rss_mb"], "worker peak_rss_mb"),
@@ -524,7 +531,7 @@ def run_sampler_worker(
         message = stderr.strip()[-500:]
         raise SamplerWorkerError(f"sampler worker exit status {process.returncode}: {message}")
     loaded = load_sampler_result(result, request=request)
-    if loaded.pid != process.pid:
+    if loaded.pid != process.pid and loaded.parent_pid != process.pid:
         raise SamplerWorkerError("worker result PID differs from the spawned process")
     return loaded
 

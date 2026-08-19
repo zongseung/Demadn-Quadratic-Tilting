@@ -18,14 +18,15 @@ if mode == "nonzero":
 if mode == "sleep":
     time.sleep(10)
 if mode == "malformed":
-    Path(result_path).write_text("not-json")
+    Path(result_path).write_bytes(b"not-json")
     raise SystemExit(0)
 request = json.loads(Path(request_path).read_text())
 payload = {
-    "schema_version": 1,
+    "schema_version": 2,
     "request_digest": request["request_digest"],
     "backend": request["sampler"]["backend"],
     "pid": os.getpid(),
+    "parent_pid": os.getppid(),
     "wall_seconds": 2.0,
     "peak_rss_mb": 10.0,
     "diagnostics": {
@@ -42,4 +43,13 @@ payload = {
 payload["result_digest"] = hashlib.sha256(canonical(payload).encode()).hexdigest()
 if mode == "bad-digest":
     payload["request_digest"] = "0" * 64
-Path(result_path).write_text(canonical(payload) + "\n")
+if mode == "bad-parent-pid":
+    payload["parent_pid"] = payload["pid"]
+    payload.pop("result_digest")
+    payload["result_digest"] = hashlib.sha256(canonical(payload).encode()).hexdigest()
+if mode == "bad-relationship":
+    payload["pid"] += 1
+    payload["parent_pid"] += 1
+    payload.pop("result_digest")
+    payload["result_digest"] = hashlib.sha256(canonical(payload).encode()).hexdigest()
+Path(result_path).write_bytes((canonical(payload) + "\n").encode("utf-8"))

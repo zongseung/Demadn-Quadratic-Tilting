@@ -27,6 +27,15 @@ CONTEXT = EventResidualContext(
 )
 
 
+def _symlink_or_skip(path: Path, target: Path) -> None:
+    try:
+        path.symlink_to(target)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("host cannot create the requested test symlink")
+        raise
+
+
 def _prediction_frame(*, split_id: str, observed: float = 100.0) -> pl.DataFrame:
     year = 2024 if split_id == "final-2024" else int(split_id.removeprefix("oof-"))
     origin = datetime(year, 1, 1)
@@ -46,9 +55,7 @@ def _prediction_frame(*, split_id: str, observed: float = 100.0) -> pl.DataFrame
 
 
 def _canonical_write(path: Path, value: object) -> None:
-    path.write_text(
-        json.dumps(value, sort_keys=True, separators=(",", ":")), encoding="utf-8"
-    )
+    path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")), encoding="utf-8")
 
 
 def _install_source_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -66,8 +73,7 @@ def _install_source_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "model_config": tmp_path / "model_spaces.toml",
         "event_registry": tmp_path / "events.csv",
         "holiday_calendar": tmp_path / "holiday_calendar.csv",
-        "temporary_holiday_availability": tmp_path
-        / "temporary_holiday_availability.csv",
+        "temporary_holiday_availability": tmp_path / "temporary_holiday_availability.csv",
     }
     for name, path in source_paths.items():
         path.write_text(name, encoding="utf-8")
@@ -77,9 +83,7 @@ def _install_source_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     oof_members = predictions / "oof_members.parquet"
     final_point = predictions / "final_2024.parquet"
     final_members = predictions / "final_2024_members.parquet"
-    oof_frame = pl.concat(
-        [_prediction_frame(split_id=split_id) for split_id in CONTEXT.split_ids]
-    )
+    oof_frame = pl.concat([_prediction_frame(split_id=split_id) for split_id in CONTEXT.split_ids])
     oof_frame.write_parquet(oof_point)
     pl.DataFrame(schema=oof_frame.schema).write_parquet(oof_members)
     _prediction_frame(split_id="final-2024").write_parquet(final_point)
@@ -212,9 +216,7 @@ def _install_source_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(source_module, "load_paper_baselines", lambda _path: object())
     monkeypatch.setattr(source_module, "read_hourly_data", lambda _path: object())
     monkeypatch.setattr(source_module, "audit_hourly_data", lambda value, **_kwargs: value)
-    monkeypatch.setattr(
-        source_module, "attach_calendar_features", lambda value, _calendar: value
-    )
+    monkeypatch.setattr(source_module, "attach_calendar_features", lambda value, _calendar: value)
     monkeypatch.setattr(
         source_module, "build_daily_forecast_matrix", lambda _value, *, feature_set: matrix
     )
@@ -261,9 +263,7 @@ def _install_source_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     )
 
 
-def test_validated_source_is_immutable_and_loads_canonical_context_streams(
-    tmp_path, monkeypatch
-):
+def test_validated_source_is_immutable_and_loads_canonical_context_streams(tmp_path, monkeypatch):
     fixture = _install_source_fixture(tmp_path, monkeypatch)
 
     source = validate_correction_source(
@@ -318,7 +318,7 @@ def test_final_artifact_preflight_rejects_before_baseline_runner(
         target = tmp_path / f"{artifact}-copy.parquet"
         target.write_bytes(path.read_bytes())
         path.unlink()
-        path.symlink_to(target)
+        _symlink_or_skip(path, target)
     elif condition == "hash":
         entry["sha256"] = "0" * 64
         _canonical_write(fixture.baseline_manifest_path, fixture.baseline_manifest)
@@ -416,7 +416,7 @@ def test_source_preflight_rejects_same_content_config_path_substitution(tmp_path
 def test_source_preflight_rejects_symlinked_requested_config(tmp_path, monkeypatch):
     fixture = _install_source_fixture(tmp_path, monkeypatch)
     substitute = tmp_path / "config-link.toml"
-    substitute.symlink_to(fixture.sources["experiment_config"])
+    _symlink_or_skip(substitute, fixture.sources["experiment_config"])
 
     with pytest.raises(CorrectionSourceError, match="requested experiment config.*unsafe"):
         validate_correction_source(
@@ -432,9 +432,9 @@ def test_source_preflight_rejects_rehashed_semantic_target_mutation(tmp_path, mo
         (pl.col("observed_mw") + 1.0).alias("observed_mw")
     )
     changed.write_parquet(fixture.final_point)
-    fixture.baseline_manifest["stages"]["final"]["artifacts"]["point"][
-        "sha256"
-    ] = file_sha256(fixture.final_point)
+    fixture.baseline_manifest["stages"]["final"]["artifacts"]["point"]["sha256"] = file_sha256(
+        fixture.final_point
+    )
     _canonical_write(fixture.baseline_manifest_path, fixture.baseline_manifest)
 
     with pytest.raises(CorrectionSourceError, match="source-derived truth"):
@@ -456,7 +456,7 @@ def test_source_preflight_rejects_unknown_or_symlinked_publication_entries(
         target = fixture.run / "final-copy.parquet"
         target.write_bytes(fixture.final_point.read_bytes())
         fixture.final_point.unlink()
-        fixture.final_point.symlink_to(target)
+        _symlink_or_skip(fixture.final_point, target)
 
     with pytest.raises(CorrectionSourceError, match="unknown|unsafe"):
         validate_correction_source(

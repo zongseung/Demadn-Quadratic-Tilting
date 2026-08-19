@@ -31,6 +31,15 @@ CONTEXT = EventResidualContext(
 )
 
 
+def _symlink_or_skip(path: Path, target: Path) -> None:
+    try:
+        path.symlink_to(target)
+    except OSError as error:
+        if getattr(error, "winerror", None) == 1314:
+            pytest.skip("host cannot create the requested test symlink")
+        raise
+
+
 def _events() -> tuple[EventOccurrence, ...]:
     return (
         EventOccurrence(
@@ -440,7 +449,7 @@ def test_completed_namespace_invalid_generation_is_preserved(
     else:
         target = tmp_path / "target"
         target.write_bytes(b"evidence")
-        (published.generation_dir / "unexpected").symlink_to(target)
+        _symlink_or_skip(published.generation_dir / "unexpected", target)
     before = {
         path.relative_to(published.generation_dir): file_sha256(path)
         for path in published.generation_dir.rglob("*")
@@ -499,6 +508,8 @@ def test_nested_unknown_in_incomplete_generation_is_preserved(
 def test_fifo_in_incomplete_generation_is_preserved(
     source: ValidatedCorrectionSource, tmp_path: Path
 ):
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("host cannot create FIFO test artifacts")
     output = tmp_path / "loeo"
     published = publish_loeo_universe(source, CONTEXT, output_dir=output)
     (output / "current.json").unlink()
@@ -582,9 +593,7 @@ def test_loader_rejects_rehashed_wrong_universe_path(
         load_loeo_universe(source, CONTEXT, output_dir=output)
 
 
-def test_loader_rejects_registry_substitution(
-    source: ValidatedCorrectionSource, tmp_path: Path
-):
+def test_loader_rejects_registry_substitution(source: ValidatedCorrectionSource, tmp_path: Path):
     output = tmp_path / "loeo"
     publish_loeo_universe(source, CONTEXT, output_dir=output)
     substituted = replace(source.events[0], restriction=1)
@@ -682,7 +691,7 @@ def test_publication_boundaries_fail_closed(
         target = tmp_path / "copy"
         target.write_bytes(published.universe_path.read_bytes())
         published.universe_path.unlink()
-        published.universe_path.symlink_to(target)
+        _symlink_or_skip(published.universe_path, target)
     elif mutation == "partial":
         (output / "current.json").unlink()
     elif mutation == "context":
