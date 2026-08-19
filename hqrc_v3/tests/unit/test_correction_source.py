@@ -27,6 +27,23 @@ CONTEXT = EventResidualContext(
 )
 
 
+def _residual_semantic_frame() -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "model": ["lightgbm", "lightgbm"],
+            "seed": [7, 7],
+            "sigma_n_mw": [10.0, 20.0],
+            "standardized_residual": [-1.0, 1.0],
+        }
+    )
+
+
+def _advance_float64(value: float, toward: float, steps: int) -> float:
+    for _ in range(steps):
+        value = float(np.nextafter(value, toward))
+    return value
+
+
 def _symlink_or_skip(path: Path, target: Path) -> None:
     try:
         path.symlink_to(target)
@@ -261,6 +278,64 @@ def _install_source_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         final_point=final_point,
         runner_state=runner_state,
     )
+
+
+def test_residual_semantic_comparator_allows_four_float64_ulps_for_derived_columns():
+    expected = _residual_semantic_frame()
+    actual = expected.with_columns(
+        pl.Series(
+            "sigma_n_mw",
+            [_advance_float64(10.0, np.inf, 4), _advance_float64(20.0, -np.inf, 4)],
+        ),
+        pl.Series(
+            "standardized_residual",
+            [_advance_float64(-1.0, np.inf, 4), _advance_float64(1.0, -np.inf, 4)],
+        ),
+    )
+
+    comparator = getattr(source_module, "_residual_frames_semantically_equal", None)
+
+    assert comparator is not None
+    assert comparator(expected, actual)
+
+
+def test_residual_semantic_comparator_rejects_five_float64_ulps_for_derived_columns():
+    expected = _residual_semantic_frame()
+    actual = expected.with_columns(
+        pl.Series("sigma_n_mw", [_advance_float64(10.0, np.inf, 5), 20.0])
+    )
+
+    comparator = getattr(source_module, "_residual_frames_semantically_equal", None)
+
+    assert comparator is not None
+    assert not comparator(expected, actual)
+
+
+def test_residual_semantic_comparator_rejects_nonfinite_derived_values():
+    expected = _residual_semantic_frame()
+    actual = expected.with_columns(pl.Series("standardized_residual", [np.nan, 1.0]))
+
+    comparator = getattr(source_module, "_residual_frames_semantically_equal", None)
+
+    assert comparator is not None
+    assert not comparator(expected, actual)
+
+
+@pytest.mark.parametrize(
+    "actual",
+    [
+        _residual_semantic_frame().head(1),
+        _residual_semantic_frame().with_columns(pl.col("seed").cast(pl.Int32)),
+        _residual_semantic_frame().select("seed", "model", "sigma_n_mw", "standardized_residual"),
+        _residual_semantic_frame().with_columns(pl.lit("svr").alias("model")),
+    ],
+    ids=["shape", "schema", "column-order", "base-value"],
+)
+def test_residual_semantic_comparator_rejects_structural_and_base_changes(actual):
+    comparator = getattr(source_module, "_residual_frames_semantically_equal", None)
+
+    assert comparator is not None
+    assert not comparator(_residual_semantic_frame(), actual)
 
 
 def test_validated_source_is_immutable_and_loads_canonical_context_streams(tmp_path, monkeypatch):
