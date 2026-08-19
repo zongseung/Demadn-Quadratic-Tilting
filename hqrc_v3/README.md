@@ -69,6 +69,153 @@ editable PEP 517 package that provides the `hqrc` console script. Do not create 
 use a member-local lock file; `uv.lock` at the repository root is the reproducible
 runtime and test lock.
 
+## Native H1--H3 accelerator runbook
+
+The accelerated paper scope is exactly the four non-XGBoost models
+`lightgbm`, `svr`, `seq2seq_lstm`, and `transformer`, both `B0` and `B1`,
+`H1`, `H2`, and `H3`, and all ten LOEO folds. XGBoost is excluded from
+accelerated scheduling and publication. On two CUDA devices, physical GPU 0
+runs `lightgbm` then `seq2seq_lstm`, while physical GPU 1 runs `svr` then
+`transformer`. The two model workers run concurrently, but every model fit
+runs its four NUTS chains sequentially inside its worker.
+
+Run the following commands from the repository root or linked worktree. The
+launchers perform a locked accelerator dependency sync before each action.
+The setup shown below uses the current checkout when it contains
+`artifacts.zip`; otherwise it resolves the source checkout two levels above a
+`.worktrees/<name>` linked worktree. When using another layout, set
+`SourceRoot`/`SOURCE_ROOT` explicitly to the canonical absolute source path
+before running the import command.
+
+### Windows PowerShell
+
+```powershell
+# Import the immutable correction source. An identical rerun validates and reuses it.
+$SourceRoot = if (Test-Path -LiteralPath 'artifacts.zip' -PathType Leaf) { (Resolve-Path '.').Path } else { (Resolve-Path '..\..').Path }
+scripts\run_hqrc_windows.ps1 import `
+  -Archive (Join-Path $SourceRoot 'artifacts.zip') `
+  -Data (Join-Path $SourceRoot 'power_demand_final copy.csv') `
+  -RepositoryRoot $SourceRoot `
+  -RunDir artifacts/hqrc-v3-paper-imported-20260819
+
+# Publish/reuse the complete paper AR proposals. This does not sample.
+scripts\run_hqrc_windows.ps1 proposal `
+  -SourceRunDir artifacts/hqrc-v3-paper-imported-20260819 `
+  -Config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml `
+  -OutputRoot artifacts/hqrc-v3-loeo-accelerated-20260819 `
+  -Devices 0,1
+
+# Reduced two-model/B0/H1 hardware-path smoke. Without approval it remains proposal-only.
+scripts\run_hqrc_windows.ps1 smoke `
+  -SourceRunDir artifacts/hqrc-v3-paper-imported-20260819 `
+  -Config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml `
+  -OutputRoot artifacts/hqrc-v3-loeo-accelerated-20260819 `
+  -Devices 0,1 -Models lightgbm,svr -FeatureSets B0 -Variants H1
+
+# Run the complete paper matrix only after reviewing every proposal path and digest.
+scripts\run_hqrc_windows.ps1 paper `
+  -SourceRunDir artifacts/hqrc-v3-paper-imported-20260819 `
+  -Config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml `
+  -OutputRoot artifacts/hqrc-v3-loeo-accelerated-20260819 `
+  -Devices 0,1 -ApproveDerivedAR
+
+# Resume uses the same immutable identities and explicit approval.
+scripts\run_hqrc_windows.ps1 resume `
+  -SourceRunDir artifacts/hqrc-v3-paper-imported-20260819 `
+  -Config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml `
+  -OutputRoot artifacts/hqrc-v3-loeo-accelerated-20260819 `
+  -Devices 0,1 -ApproveDerivedAR
+```
+
+### Linux Bash
+
+Linux uses the same fixed CUDA queues and physical device order:
+
+```bash
+SOURCE_ROOT="$(if [ -f artifacts.zip ]; then pwd -P; else cd ../.. && pwd -P; fi)"
+scripts/run_hqrc_linux.sh import \
+  --archive "$SOURCE_ROOT/artifacts.zip" \
+  --data "$SOURCE_ROOT/power_demand_final copy.csv" \
+  --repository-root "$SOURCE_ROOT" \
+  --run-dir artifacts/hqrc-v3-paper-imported-20260819
+
+scripts/run_hqrc_linux.sh proposal \
+  --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
+  --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
+  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 \
+  --devices 0 1
+
+scripts/run_hqrc_linux.sh smoke \
+  --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
+  --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
+  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 \
+  --devices 0 1 --models lightgbm svr --feature-sets B0 --variants H1
+
+scripts/run_hqrc_linux.sh paper \
+  --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
+  --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
+  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 \
+  --devices 0 1 --approve-derived-ar
+
+scripts/run_hqrc_linux.sh resume \
+  --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
+  --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
+  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 \
+  --devices 0 1 --approve-derived-ar
+```
+
+### macOS Bash
+
+The macOS launcher uses `--accelerator auto`. On Apple Silicon, `auto` selects
+MPS only after the HQRC float64/LKJ/AR gradient capability probe succeeds. If
+MPS is unavailable or fails that probe, the scheduler selects CPU and records
+the fallback reason. MPS and CPU execute the four models sequentially.
+
+```bash
+SOURCE_ROOT="$(if [ -f artifacts.zip ]; then pwd -P; else cd ../.. && pwd -P; fi)"
+scripts/run_hqrc_macos.sh import \
+  --archive "$SOURCE_ROOT/artifacts.zip" \
+  --data "$SOURCE_ROOT/power_demand_final copy.csv" \
+  --repository-root "$SOURCE_ROOT" \
+  --run-dir artifacts/hqrc-v3-paper-imported-20260819
+
+scripts/run_hqrc_macos.sh proposal \
+  --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
+  --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
+  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819
+
+scripts/run_hqrc_macos.sh smoke \
+  --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
+  --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
+  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 \
+  --models lightgbm svr --feature-sets B0 --variants H1
+
+scripts/run_hqrc_macos.sh paper \
+  --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
+  --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
+  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 \
+  --approve-derived-ar
+
+scripts/run_hqrc_macos.sh resume \
+  --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
+  --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
+  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 \
+  --approve-derived-ar
+```
+
+The AR boundary is mandatory on every platform: `import`, `proposal`, and an
+unapproved `smoke` may publish or reuse unapproved proposals, but posterior
+sampling starts only after a person reviews their plots and exact digests and
+reruns with `--approve-derived-ar`/`-ApproveDerivedAR`. Never derive or forward
+that approval automatically.
+
+Worker output is streamed and appended to model-specific files under
+`<output-root>/logs/`. A failing model stops the later model in its queue; the
+other in-flight queue may finish. Partial evidence is preserved. Rerunning the
+same `paper` or `resume` command revalidates completed immutable artifacts and
+continues at the first incomplete identity; it does not delete mismatched or
+partial evidence.
+
 ## One-command manuscript runner
 
 `run-paper` is the portable operator entry point.  It first completes the shared
