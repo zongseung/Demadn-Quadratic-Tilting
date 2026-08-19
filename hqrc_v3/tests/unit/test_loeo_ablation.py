@@ -94,6 +94,50 @@ def test_variant_sampler_seeds_are_separate_and_h3_is_backward_compatible() -> N
     assert seeds["H3"] == default_h3
 
 
+def test_parallel_ablation_core_count_creates_a_distinct_fold_identity(
+    approved_fold, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    monkeypatch.setattr(
+        fold_contract,
+        "resolve_device",
+        lambda _request: SimpleNamespace(kind="cpu", logical_device="cpu", physical_device=None),
+    )
+    common = {
+        "profile": "smoke",
+        "root_seed": 71,
+        "held_out_occurrence_id": "seollal-2024",
+        "variant": "H1",
+        "draws": 4,
+        "tune": 3,
+        "chains": 4,
+        "backend": "pyro",
+        "device": "cpu",
+    }
+    sequential = fold_contract.sampler_contract(**common, cores=1)
+    parallel = fold_contract.sampler_contract(**common, cores=4)
+    sequential_identity = ablation_module._fold_identity(
+        source,
+        publication,
+        approved,
+        held_out="seollal-2024",
+        variant="H1",
+        sampler=sequential,
+    )
+    parallel_identity = ablation_module._fold_identity(
+        source,
+        publication,
+        approved,
+        held_out="seollal-2024",
+        variant="H1",
+        sampler=parallel,
+    )
+
+    assert fold_contract.sha_json(sequential_identity) != fold_contract.sha_json(parallel_identity)
+    assert sequential_identity["sampler"]["cores"] == 1
+    assert parallel_identity["sampler"]["cores"] == 4
+
+
 def test_ablation_forwards_backend_and_device_to_each_fold(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

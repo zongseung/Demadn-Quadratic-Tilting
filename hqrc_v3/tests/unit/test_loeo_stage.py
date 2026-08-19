@@ -754,6 +754,145 @@ def test_pyro_reload_fails_closed_on_malformed_runtime_probe_fallback_and_versio
         idata.close()
 
 
+@pytest.mark.parametrize(
+    ("cores", "execution"),
+    [(1, "sequential"), (4, "parallel")],
+)
+def test_pyro_sampler_contract_supports_only_declared_chain_topologies(
+    monkeypatch: pytest.MonkeyPatch, cores: int, execution: str
+) -> None:
+    monkeypatch.setattr(
+        loeo_publication_module,
+        "resolve_device",
+        lambda _request: SimpleNamespace(kind="cpu", logical_device="cpu", physical_device=None),
+    )
+    sampler = loeo_publication_module.sampler_contract(
+        "smoke",
+        root_seed=919,
+        held_out_occurrence_id="seollal-2024",
+        draws=4,
+        tune=3,
+        chains=4,
+        cores=cores,
+        backend="pyro",
+        device="cpu",
+    )
+
+    assert sampler["cores"] == cores
+    assert loeo_publication_module._chain_execution(sampler) == execution
+
+
+@pytest.mark.parametrize("cores", [2, 3, 5])
+def test_pyro_sampler_contract_rejects_undeclared_chain_topologies(
+    cores: int,
+) -> None:
+    with pytest.raises(LOEOFoldError, match="cores"):
+        loeo_publication_module.sampler_contract(
+            "smoke",
+            root_seed=919,
+            held_out_occurrence_id="seollal-2024",
+            draws=4,
+            tune=3,
+            chains=4,
+            cores=cores,
+            backend="pyro",
+            device="cpu",
+        )
+
+
+def test_parallel_pyro_provenance_requires_parallel_metadata_and_new_identity(
+    approved_fold, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    inputs = prepare_loeo_fold_inputs(
+        source,
+        publication,
+        approved,
+        held_out_occurrence_id="seollal-2024",
+    )
+    monkeypatch.setattr(
+        loeo_publication_module,
+        "resolve_device",
+        lambda _request: SimpleNamespace(kind="cpu", logical_device="cpu", physical_device=None),
+    )
+    common = {
+        "profile": "smoke",
+        "root_seed": 919,
+        "held_out_occurrence_id": "seollal-2024",
+        "draws": 4,
+        "tune": 3,
+        "chains": 4,
+        "backend": "pyro",
+        "device": "cpu",
+    }
+    sequential = loeo_publication_module.sampler_contract(**common, cores=1)
+    parallel = loeo_publication_module.sampler_contract(**common, cores=4)
+    assert loeo_contract_module.sha_json(
+        loeo_publication_module.input_identity(inputs, sequential)
+    ) != loeo_contract_module.sha_json(loeo_publication_module.input_identity(inputs, parallel))
+
+    recorded = {
+        "draws": 4,
+        "tune": 3,
+        "chains": 4,
+        "cores": 4,
+        "seed": parallel["seed"],
+        "target_accept": 0.9,
+        "paper_profile": False,
+        "init": "pyro-default",
+        "geometry": "noncentered-cyclic-hour-rw1-v1",
+        "resolved_device_kind": "cpu",
+        "logical_device": "cpu",
+        "physical_device": None,
+        "dtype": "float64",
+        "chain_execution": "parallel",
+        "capability_probe": {"success": True, "detail": "float64-gradient-lkj-ar"},
+        "fallback_reason": None,
+    }
+    runtime = {
+        "hqrc_arviz_version": "0.21.0",
+        "hqrc_torch_version": "2.7.1",
+        "hqrc_pyro_version": "1.9.1",
+        "hqrc_device": "cpu",
+        "hqrc_physical_device": "",
+        "hqrc_dtype": "float64",
+        "hqrc_device_probe": "float64-gradient-lkj-ar",
+        "hqrc_device_fallback_reason": "",
+        "hqrc_chain_execution": "parallel",
+        "hqrc_causal": "false",
+    }
+    valid = _fake_idata(
+        inputs,
+        chains=4,
+        draws=4,
+        sampler=recorded,
+        backend="pyro",
+        extra_attrs=runtime,
+    )
+    try:
+        loeo_publication_module._posterior_metadata_matches(valid, inputs, parallel)
+    finally:
+        valid.close()
+
+    for bad_sampler, bad_runtime in (
+        ({**recorded, "chain_execution": "sequential"}, runtime),
+        (recorded, {**runtime, "hqrc_chain_execution": "sequential"}),
+    ):
+        invalid = _fake_idata(
+            inputs,
+            chains=4,
+            draws=4,
+            sampler=bad_sampler,
+            backend="pyro",
+            extra_attrs=bad_runtime,
+        )
+        try:
+            with pytest.raises(LOEOFoldError, match="metadata|device|sampler"):
+                loeo_publication_module._posterior_metadata_matches(invalid, inputs, parallel)
+        finally:
+            invalid.close()
+
+
 def test_safe_event_loader_and_preparation_bind_one_physical_fold(
     approved_fold, monkeypatch: pytest.MonkeyPatch
 ) -> None:

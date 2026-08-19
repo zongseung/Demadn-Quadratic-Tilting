@@ -138,8 +138,8 @@ def sampler_contract(
         raise LOEOFoldError("cores must be a positive integer")
     if resolved_cores > resolved[2]:
         raise LOEOFoldError("cores must not exceed chains")
-    if backend == "pyro" and (resolved[2] != 4 or resolved_cores != 1):
-        raise LOEOFoldError("pyro requires 4 sequential chains and cores=1")
+    if backend == "pyro" and (resolved[2] != 4 or resolved_cores not in {1, 4}):
+        raise LOEOFoldError("pyro requires 4 chains and cores=1 or cores=4")
     requested_init = PYMC_INITIALIZATION if init is None else init
     if requested_init not in {"adapt_diag", "jitter+adapt_diag"}:
         raise LOEOFoldError("LOEO sampler init is not approved")
@@ -181,6 +181,15 @@ def sampler_contract(
             }
         )
     return contract
+
+
+def _chain_execution(sampler: Mapping[str, object]) -> str:
+    cores = sampler.get("cores")
+    if cores == 1:
+        return "sequential"
+    if cores == 4:
+        return "parallel"
+    raise LOEOFoldError("Pyro sampler cores do not identify a supported chain topology")
 
 
 def _context_payload(context: object) -> dict[str, object]:
@@ -386,7 +395,7 @@ def _validate_posterior_provenance(
                 "logical_device": sampler["logical_device"],
                 "physical_device": sampler["physical_device"],
                 "dtype": "float64",
-                "chain_execution": "sequential",
+                "chain_execution": _chain_execution(sampler),
             }
         )
         runtime_keys = {"capability_probe", "fallback_reason"}
@@ -423,7 +432,7 @@ def _validate_posterior_provenance(
             "hqrc_dtype": "float64",
             "hqrc_device_probe": probe["detail"],
             "hqrc_device_fallback_reason": fallback_reason or "",
-            "hqrc_chain_execution": "sequential",
+            "hqrc_chain_execution": _chain_execution(sampler),
         }
         if any(idata.attrs.get(key) != value for key, value in expected_runtime.items()):
             raise LOEOFoldError("LOEO posterior Pyro runtime device metadata differs")
