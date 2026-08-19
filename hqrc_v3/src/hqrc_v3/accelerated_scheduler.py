@@ -123,11 +123,7 @@ def _cpu_queue_specs(
     worker_count = min(len(models), available)
     if not worker_count:
         return ()
-    threads, remainder = divmod(available, worker_count)
-    return tuple(
-        (tuple(models[index::worker_count]), threads + (index < remainder))
-        for index in range(worker_count)
-    )
+    return tuple((tuple(models[index::worker_count]), 1) for index in range(worker_count))
 
 
 def _ordered_subset(value: tuple[str, ...], complete: tuple[str, ...], description: str) -> None:
@@ -175,12 +171,13 @@ def _validate_request(request: AcceleratedRequest) -> None:
             or not _exact_int(request.tune, minimum=1)
             or not _exact_int(request.chains, minimum=4)
             or request.chains != 4
-            or not _exact_int(request.cores, minimum=1)
-            or request.cores != 1
+            or request.cores is not None
+            and (not _exact_int(request.cores, minimum=1) or request.cores not in {1, 4})
             or not _exact_target(request.target_accept, 0.9)
         ):
             raise AcceleratedRunError(
-                "smoke Pyro requires positive draws/tune, chains=4, cores=1, and target_accept=0.9"
+                "smoke Pyro requires positive draws/tune, chains=4, "
+                "optional cores=1 or cores=4, and target_accept=0.9"
             )
     else:
         raise AcceleratedRunError("profile must be paper or smoke")
@@ -192,12 +189,13 @@ def _validate_request(request: AcceleratedRequest) -> None:
         or request.chains is not None
         and (not _exact_int(request.chains, minimum=4) or request.chains != 4)
         or request.cores is not None
-        and (not _exact_int(request.cores, minimum=1) or request.cores != 1)
+        and (not _exact_int(request.cores, minimum=1) or request.cores not in {1, 4})
         or request.target_accept is not None
         and not _exact_target(request.target_accept, 0.99)
     ):
         raise AcceleratedRunError(
-            "paper Pyro requires draws/tune >=1000, chains=4, cores=1, and target_accept=0.99"
+            "paper Pyro requires draws/tune >=1000, chains=4, "
+            "optional cores=1 or cores=4, and target_accept=0.99"
         )
     if request.init is not None:
         raise AcceleratedRunError("accelerated Pyro does not accept an init override")
@@ -336,12 +334,22 @@ def _feature_argument(feature_sets: tuple[str, ...]) -> str:
     return "all" if feature_sets == PAPER_FEATURE_SETS else feature_sets[0]
 
 
+def _chain_workers(request: AcceleratedRequest, resolved: _ResolvedAccelerator) -> int:
+    required = 4 if resolved.kind == "cpu" else 1
+    if request.cores is not None and request.cores != required:
+        raise AcceleratedRunError(
+            f"resolved {resolved.kind} Pyro requires cores={required}, not cores={request.cores}"
+        )
+    return required
+
+
 def _build_job(
     request: AcceleratedRequest,
     model: str,
     *,
     physical_device: int | None,
     device: str,
+    chain_workers: int | None = None,
     thread_budget: int | None = None,
 ) -> _Job:
     command = [
@@ -370,7 +378,7 @@ def _build_job(
         ("--draws", request.draws),
         ("--tune", request.tune),
         ("--chains", request.chains),
-        ("--cores", request.cores),
+        ("--cores", request.cores if chain_workers is None else chain_workers),
         ("--init", request.init),
         ("--target-accept", request.target_accept),
     ):
@@ -451,9 +459,7 @@ def _restart_command(command: tuple[str, ...], *, platform_name: str | None = No
 
 def _restart_environment(job: _Job) -> str:
     if job.command[-1] == "cpu":
-        return ",".join(
-            f"{name}={job.environment[name]}" for name in CPU_THREAD_ENVIRONMENT_NAMES
-        )
+        return ",".join(f"{name}={job.environment[name]}" for name in CPU_THREAD_ENVIRONMENT_NAMES)
     if job.physical_device is not None:
         return (
             f"CUDA_VISIBLE_DEVICES={job.environment.get('CUDA_VISIBLE_DEVICES', 'unset')},"
@@ -486,6 +492,7 @@ def run_accelerated_loeo(request: AcceleratedRequest) -> AcceleratedResult:
     source, config, _output = _resolved_paths(request)
     validate_correction_source(run_dir=source, config_path=config, profile=request.profile)
     resolved = _preflight_accelerator(request.accelerator, request.devices)
+    chain_workers = _chain_workers(request, resolved)
 
     if resolved.kind == "cuda":
         queue_specs = tuple(
@@ -518,6 +525,7 @@ def run_accelerated_loeo(request: AcceleratedRequest) -> AcceleratedResult:
                 model,
                 physical_device=physical_device,
                 device="cuda:0" if physical_device is not None else resolved.logical_device,
+                chain_workers=chain_workers,
                 thread_budget=thread_budget,
             )
             outcome = _run_job(job)

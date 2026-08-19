@@ -489,7 +489,11 @@ def _add_loeo_pipeline_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--draws", type=int, help="retained draws per chain")
     parser.add_argument("--tune", type=int, help="warm-up draws per chain")
     parser.add_argument("--chains", type=int, help="number of NUTS chains")
-    parser.add_argument("--cores", type=int, help="chain worker count (Pyro requires 1)")
+    parser.add_argument(
+        "--cores",
+        type=int,
+        help="chain workers (Pyro supports 1 sequential or 4 parallel)",
+    )
     parser.add_argument(
         "--backend",
         choices=("pymc", "nutpie", "pyro"),
@@ -727,7 +731,11 @@ def build_parser() -> argparse.ArgumentParser:
     accelerated.add_argument("--draws", type=int)
     accelerated.add_argument("--tune", type=int)
     accelerated.add_argument("--chains", type=int)
-    accelerated.add_argument("--cores", type=int)
+    accelerated.add_argument(
+        "--cores",
+        type=int,
+        help="optional assertion: CPU resolves to 4; CUDA/MPS resolve to 1",
+    )
     accelerated.add_argument("--init", choices=("adapt_diag", "jitter+adapt_diag"))
     accelerated.add_argument("--target-accept", type=float)
     accelerated.add_argument("--approve-derived-ar", action="store_true")

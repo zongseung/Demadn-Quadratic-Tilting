@@ -54,7 +54,7 @@ if ($Action -eq "import") {
     $CliArgs = @("--profile", $Profile, "--accelerator", $Accelerator)
     if ($Action -eq "smoke") {
         $CliArgs += @(
-            "--draws", "4", "--tune", "4", "--chains", "4", "--cores", "1",
+            "--draws", "4", "--tune", "4", "--chains", "4",
             "--target-accept", "0.9"
         )
     }

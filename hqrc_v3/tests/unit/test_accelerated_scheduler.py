@@ -47,6 +47,10 @@ def _validated(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(scheduler, "validate_correction_source", lambda **_kwargs: object())
 
 
+def _command_option(command: tuple[str, ...], option: str) -> str:
+    return command[command.index(option) + 1]
+
+
 def test_fixed_two_cuda_queues_exclude_xgboost():
     assert model_queues((0, 1)) == (
         ("cuda:0", ("lightgbm", "seq2seq_lstm")),
@@ -68,18 +72,16 @@ def test_cpu_two_logical_cpus_create_ordered_one_thread_queues():
     )
 
 
-def test_cpu_ten_logical_cpus_divide_four_model_budgets_with_remainder():
+def test_cpu_ten_logical_cpus_create_four_single_thread_model_queues():
     assert scheduler._cpu_queue_specs(PAPER_MODELS, logical_cpus=10) == (
-        (("lightgbm",), 3),
-        (("svr",), 3),
-        (("seq2seq_lstm",), 2),
-        (("transformer",), 2),
+        (("lightgbm",), 1),
+        (("svr",), 1),
+        (("seq2seq_lstm",), 1),
+        (("transformer",), 1),
     )
 
 
-def test_cpu_scheduler_runs_all_models_concurrently_with_even_thread_budgets(
-    tmp_path, monkeypatch
-):
+def test_cpu_scheduler_runs_all_models_concurrently_with_even_thread_budgets(tmp_path, monkeypatch):
     request = _request(tmp_path, accelerator="cpu")
     _validated(monkeypatch)
     monkeypatch.setattr(
@@ -89,10 +91,10 @@ def test_cpu_scheduler_runs_all_models_concurrently_with_even_thread_budgets(
     )
     monkeypatch.setattr(scheduler.os, "cpu_count", lambda: 24)
     all_started = threading.Barrier(4)
-    environments = {}
+    jobs = {}
 
     def run_job(job):
-        environments[job.model] = job.environment
+        jobs[job.model] = job
         job.log_path.parent.mkdir(parents=True, exist_ok=True)
         job.log_path.write_text(f"{job.model}\n")
         all_started.wait(timeout=2)
@@ -102,10 +104,11 @@ def test_cpu_scheduler_runs_all_models_concurrently_with_even_thread_budgets(
     result = run_accelerated_loeo(request)
 
     assert result.completed_models == PAPER_MODELS
-    assert set(environments) == set(PAPER_MODELS)
-    for environment in environments.values():
+    assert set(jobs) == set(PAPER_MODELS)
+    for job in jobs.values():
+        assert _command_option(job.command, "--cores") == "4"
         assert {
-            name: environment[name]
+            name: job.environment[name]
             for name in (
                 "OMP_NUM_THREADS",
                 "MKL_NUM_THREADS",
@@ -114,17 +117,15 @@ def test_cpu_scheduler_runs_all_models_concurrently_with_even_thread_budgets(
                 "VECLIB_MAXIMUM_THREADS",
             )
         } == {
-            "OMP_NUM_THREADS": "6",
-            "MKL_NUM_THREADS": "6",
-            "OPENBLAS_NUM_THREADS": "6",
-            "NUMEXPR_NUM_THREADS": "6",
-            "VECLIB_MAXIMUM_THREADS": "6",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "VECLIB_MAXIMUM_THREADS": "1",
         }
 
 
-def test_cpu_scheduler_under_provisioning_uses_two_ordered_one_thread_queues(
-    tmp_path, monkeypatch
-):
+def test_cpu_scheduler_under_provisioning_uses_two_ordered_one_thread_queues(tmp_path, monkeypatch):
     request = _request(tmp_path, accelerator="cpu")
     _validated(monkeypatch)
     monkeypatch.setattr(
@@ -139,7 +140,7 @@ def test_cpu_scheduler_under_provisioning_uses_two_ordered_one_thread_queues(
     in_flight = 0
     maximum_in_flight = 0
     started = []
-    environments = {}
+    jobs = {}
 
     def run_job(job):
         nonlocal in_flight, maximum_in_flight
@@ -147,7 +148,7 @@ def test_cpu_scheduler_under_provisioning_uses_two_ordered_one_thread_queues(
             in_flight += 1
             maximum_in_flight = max(maximum_in_flight, in_flight)
             started.append(job.model)
-            environments[job.model] = job.environment
+            jobs[job.model] = job
         try:
             if job.model in first_jobs_finished:
                 first_jobs_started.wait(timeout=2)
@@ -168,9 +169,10 @@ def test_cpu_scheduler_under_provisioning_uses_two_ordered_one_thread_queues(
     assert started.count("lightgbm") == started.count("svr") == 1
     assert started.count("seq2seq_lstm") == started.count("transformer") == 1
     assert maximum_in_flight == 2
-    for environment in environments.values():
+    for job in jobs.values():
+        assert _command_option(job.command, "--cores") == "4"
         assert {
-            name: environment[name]
+            name: job.environment[name]
             for name in (
                 "OMP_NUM_THREADS",
                 "MKL_NUM_THREADS",
@@ -234,7 +236,6 @@ def test_smoke_accepts_only_ordered_non_xgboost_subsets(tmp_path):
         draws=4,
         tune=4,
         chains=4,
-        cores=1,
         target_accept=0.9,
     )
     scheduler._validate_request(good)
@@ -269,6 +270,48 @@ def test_invalid_smoke_sampler_contract_fails_before_validation_or_logs(
         run_accelerated_loeo(request)
     assert calls == []
     assert not request.output_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("kind", "logical_device", "physical_device", "expected"),
+    [
+        ("cpu", "cpu", None, 4),
+        ("cuda", "cuda:0", "0", 1),
+        ("mps", "mps", None, 1),
+    ],
+)
+def test_resolved_accelerator_selects_exact_chain_worker_count(
+    tmp_path, kind, logical_device, physical_device, expected
+):
+    request = _request(tmp_path)
+    resolved = scheduler._ResolvedAccelerator(kind, logical_device, physical_device, "probe", None)
+
+    assert scheduler._chain_workers(request, resolved) == expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "logical_device", "requested"),
+    [("cpu", "cpu", 1), ("cuda", "cuda:0", 4), ("mps", "mps", 4)],
+)
+def test_explicit_chain_worker_mismatch_fails_before_model_launch(
+    tmp_path, monkeypatch, kind, logical_device, requested
+):
+    request = _request(tmp_path, accelerator=kind, cores=requested)
+    _validated(monkeypatch)
+    monkeypatch.setattr(
+        scheduler,
+        "_preflight_accelerator",
+        lambda *_args, **_kwargs: scheduler._ResolvedAccelerator(
+            kind, logical_device, None, "probe", None
+        ),
+    )
+    jobs = []
+    monkeypatch.setattr(scheduler, "_run_job", lambda job: jobs.append(job))
+
+    with pytest.raises(AcceleratedRunError, match="cores"):
+        run_accelerated_loeo(request)
+
+    assert jobs == []
 
 
 @pytest.mark.parametrize(
@@ -523,11 +566,16 @@ def test_cpu_worker_writes_thread_budget_header_to_durable_log(tmp_path, monkeyp
         draws=4,
         tune=4,
         chains=4,
-        cores=1,
+        cores=4,
         target_accept=0.9,
     )
     job = scheduler._build_job(
-        request, "svr", physical_device=None, device="cpu", thread_budget=6
+        request,
+        "svr",
+        physical_device=None,
+        device="cpu",
+        chain_workers=4,
+        thread_budget=1,
     )
 
     class FakeProcess:
@@ -541,11 +589,11 @@ def test_cpu_worker_writes_thread_budget_header_to_durable_log(tmp_path, monkeyp
 
     assert job.log_path.read_text() == (
         "=== HQRC CPU ENVIRONMENT ===\n"
-        "OMP_NUM_THREADS=6\n"
-        "MKL_NUM_THREADS=6\n"
-        "OPENBLAS_NUM_THREADS=6\n"
-        "NUMEXPR_NUM_THREADS=6\n"
-        "VECLIB_MAXIMUM_THREADS=6\n"
+        "OMP_NUM_THREADS=1\n"
+        "MKL_NUM_THREADS=1\n"
+        "OPENBLAS_NUM_THREADS=1\n"
+        "NUMEXPR_NUM_THREADS=1\n"
+        "VECLIB_MAXIMUM_THREADS=1\n"
         "[CPU svr] hello\n"
     )
 
@@ -673,9 +721,7 @@ def test_native_launchers_sync_locked_and_only_forward_to_shared_cli(
     assert result.returncode == 0, result.stderr
     if action != "import":
         smoke_defaults = (
-            " --draws 4 --tune 4 --chains 4 --cores 1 --target-accept 0.9"
-            if action == "smoke"
-            else ""
+            " --draws 4 --tune 4 --chains 4 --target-accept 0.9" if action == "smoke" else ""
         )
         expected = expected.replace(
             " --source-run-dir",
@@ -696,9 +742,7 @@ def test_native_launchers_sync_locked_and_only_forward_to_shared_cli(
     ],
 )
 @pytest.mark.parametrize("action", ("proposal", "smoke", "paper", "resume"))
-def test_native_launchers_forward_explicit_cpu_accelerator_once(
-    tmp_path, script, shell, action
-):
+def test_native_launchers_forward_explicit_cpu_accelerator_once(tmp_path, script, shell, action):
     """A hard-coded platform accelerator must not override an explicit CPU request."""
     if not Path(shell).exists() and shell != "powershell":
         pytest.skip(f"native test shell is unavailable: {shell}")
@@ -854,7 +898,7 @@ def test_windows_launcher_translates_approved_named_parameters(tmp_path):
     assert capture.read_text().splitlines() == [
         "sync --project hqrc_v3 --extra accelerator --locked",
         "run --project hqrc_v3 --extra accelerator --locked hqrc run-loeo-accelerated "
-        "--profile smoke --accelerator cuda --draws 4 --tune 4 --chains 4 --cores 1 "
+        "--profile smoke --accelerator cuda --draws 4 --tune 4 --chains 4 "
         "--target-accept 0.9 --source-run-dir imported "
         "--config imported/sources/experiment.toml --output-root products "
         "--devices 0 1 --models svr transformer --feature-sets B1 --variants H1 H3 "

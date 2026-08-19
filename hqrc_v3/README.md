@@ -79,10 +79,15 @@ runs `lightgbm` then `seq2seq_lstm`, while physical GPU 1 runs `svr` then
 `transformer`. The two model workers run concurrently, but every model fit
 runs its four NUTS chains sequentially inside its worker.
 
-CPU selection uses bounded model-level parallelism while preserving those
-sequential Pyro chains inside each worker. For example, 24 logical CPUs and
-the four paper models produce four workers with six threads each. Platform
-defaults remain CUDA on Windows and Linux, and `auto` on macOS.
+CPU selection runs up to four model workers concurrently and gives each model
+four spawned, single-threaded Pyro chain processes. On the target Core i7-13700
+host this is `4 models x 4 chains x 1 thread`, matching its 16 physical cores;
+all OpenMP, MKL, OpenBLAS, NumExpr, and VecLib thread caps are `1`. Before a
+paper run, use the four-model smoke and require peak committed memory below
+28 GiB on the 32 GiB host with no sustained paging. CPU parallel results use
+`cores=4` in their immutable identity and cannot reuse sequential `cores=1`
+posteriors, so use a new output root. Platform defaults remain CUDA on Windows
+and Linux, and `auto` on macOS.
 
 Run the following commands from the repository root or linked worktree. The
 launchers perform a locked accelerator dependency sync before each action.
@@ -139,12 +144,12 @@ artifact contracts:
 scripts\run_hqrc_windows.ps1 paper -Accelerator cpu `
   -SourceRunDir artifacts/hqrc-v3-paper-imported-20260819 `
   -Config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml `
-  -OutputRoot artifacts/hqrc-v3-loeo-accelerated-20260819 -ApproveDerivedAR
+  -OutputRoot artifacts/hqrc-v3-loeo-cpu-four-chain-20260820 -ApproveDerivedAR
 
 scripts\run_hqrc_windows.ps1 resume -Accelerator cpu `
   -SourceRunDir artifacts/hqrc-v3-paper-imported-20260819 `
   -Config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml `
-  -OutputRoot artifacts/hqrc-v3-loeo-accelerated-20260819 -ApproveDerivedAR
+  -OutputRoot artifacts/hqrc-v3-loeo-cpu-four-chain-20260820 -ApproveDerivedAR
 ```
 
 ### Linux Bash
@@ -191,12 +196,12 @@ invocation:
 HQRC_ACCELERATOR=cpu scripts/run_hqrc_linux.sh paper \
   --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
   --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
-  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 --approve-derived-ar
+  --output-root artifacts/hqrc-v3-loeo-cpu-four-chain-20260820 --approve-derived-ar
 
 HQRC_ACCELERATOR=cpu scripts/run_hqrc_linux.sh resume \
   --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
   --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
-  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 --approve-derived-ar
+  --output-root artifacts/hqrc-v3-loeo-cpu-four-chain-20260820 --approve-derived-ar
 ```
 
 ### macOS Bash
@@ -205,8 +210,8 @@ The macOS launcher uses `--accelerator auto`. On Apple Silicon, `auto` selects
 MPS only after the HQRC float64/LKJ/AR gradient capability probe succeeds. If
 MPS is unavailable or fails that probe, the scheduler selects CPU and records
 the fallback reason. MPS executes the four models sequentially. Any resolved
-CPU path, including automatic MPS/CUDA fallback, uses bounded model-level
-parallelism.
+CPU path, including automatic MPS/CUDA fallback, uses the four-model/four-chain
+process topology when at least four model queues are available.
 
 ```bash
 SOURCE_ROOT="$(if [ -f artifacts.zip ]; then pwd -P; else cd ../.. && pwd -P; fi)"
@@ -247,12 +252,12 @@ invocation:
 HQRC_ACCELERATOR=cpu scripts/run_hqrc_macos.sh paper \
   --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
   --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
-  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 --approve-derived-ar
+  --output-root artifacts/hqrc-v3-loeo-cpu-four-chain-20260820 --approve-derived-ar
 
 HQRC_ACCELERATOR=cpu scripts/run_hqrc_macos.sh resume \
   --source-run-dir artifacts/hqrc-v3-paper-imported-20260819 \
   --config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml \
-  --output-root artifacts/hqrc-v3-loeo-accelerated-20260819 --approve-derived-ar
+  --output-root artifacts/hqrc-v3-loeo-cpu-four-chain-20260820 --approve-derived-ar
 ```
 
 The AR boundary is mandatory on every platform: `import`, `proposal`, and an
