@@ -5,8 +5,11 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import math
+import multiprocessing
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Literal
 
 import arviz as az
@@ -22,7 +25,11 @@ from hqrc_v3.bayes.model import (
     Variant,
     build_hqrc_model,
 )
-from hqrc_v3.diagnostics.ar import ApprovedARCalibration, require_approved_calibration
+from hqrc_v3.diagnostics.ar import (
+    ApprovedARCalibration,
+    load_approved_calibration,
+    require_approved_calibration,
+)
 
 
 class SamplingError(RuntimeError):
@@ -48,6 +55,31 @@ class SamplingDiagnostics:
     min_bulk_ess: float
     min_tail_ess: float
     divergences: int
+
+
+@dataclass(frozen=True)
+class _PyroChainRequest:
+    chain: int
+    data: HQRCData
+    approved_ar_path: Path
+    residual_sha256: str
+    config_sha256: str
+    event_sha256: str
+    variant: Variant
+    pooling: Pooling
+    options: HQRCModelOptions | None
+    draws: int
+    tune: int
+    seed: int
+    target_accept: float
+    device: str
+
+
+@dataclass(frozen=True)
+class _PyroChainResult:
+    chain: int
+    posterior: dict[str, np.ndarray]
+    divergences: np.ndarray
 
 
 def _summary_value(summary, name: str, reducer, default: float) -> float:
@@ -139,6 +171,64 @@ def _numpy(value) -> np.ndarray:
     return np.asarray(value.detach().cpu().numpy())
 
 
+def _public_pyro_chain(
+    chain: int,
+    samples,
+    divergences: np.ndarray,
+    data: HQRCData,
+    variant: Variant,
+) -> _PyroChainResult:
+    deterministic = reconstruct_pyro_deterministics(samples, data, variant)
+    public_samples = {
+        name: _numpy(value) for name, value in samples.items() if name not in _PRIVATE_PYRO_SITES
+    }
+    public_samples.update({name: _numpy(value) for name, value in deterministic.items()})
+    return _PyroChainResult(
+        chain=chain,
+        posterior=public_samples,
+        divergences=np.asarray(divergences, dtype=np.int8),
+    )
+
+
+def _initialize_pyro_chain_worker() -> None:
+    import torch
+
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+
+
+def _run_pyro_chain_worker(request: _PyroChainRequest) -> _PyroChainResult:
+    calibration = load_approved_calibration(
+        request.approved_ar_path,
+        current_residual_sha256=request.residual_sha256,
+        current_config_sha256=request.config_sha256,
+        current_event_sha256=request.event_sha256,
+    )
+    model = build_pyro_hqrc_model(
+        request.data,
+        calibration,
+        variant=request.variant,
+        pooling=request.pooling,
+        options=request.options,
+        device=request.device,
+    )
+    samples, divergences = _run_pyro_chain(
+        model,
+        draws=request.draws,
+        tune=request.tune,
+        seed=request.seed,
+        target_accept=request.target_accept,
+        num_chains=1,
+    )
+    return _public_pyro_chain(
+        request.chain,
+        samples,
+        divergences,
+        request.data,
+        request.variant,
+    )
+
+
 def _sample_pyro(
     data: HQRCData,
     calibration: ApprovedARCalibration,
@@ -151,42 +241,71 @@ def _sample_pyro(
     seed: int,
     target_accept: float,
     device: str,
+    cores: int,
 ) -> tuple[az.InferenceData, ResolvedDevice]:
     resolved = resolve_device(device)
-    model = build_pyro_hqrc_model(
-        data,
-        calibration,
-        variant=variant,
-        pooling=pooling,
-        options=options,
-        device=resolved.logical_device,
-    )
-    chain_posteriors: list[dict[str, np.ndarray]] = []
-    chain_divergences = []
-    for chain in range(4):
-        samples, divergences = _run_pyro_chain(
-            model,
-            draws=draws,
-            tune=tune,
-            seed=seed + chain,
-            target_accept=target_accept,
-            num_chains=1,
+    chain_results: tuple[_PyroChainResult, ...]
+    if cores == 1:
+        model = build_pyro_hqrc_model(
+            data,
+            calibration,
+            variant=variant,
+            pooling=pooling,
+            options=options,
+            device=resolved.logical_device,
         )
-        deterministic = reconstruct_pyro_deterministics(samples, data, variant)
-        public_samples = {
-            name: _numpy(value)
-            for name, value in samples.items()
-            if name not in _PRIVATE_PYRO_SITES
-        }
-        public_samples.update({name: _numpy(value) for name, value in deterministic.items()})
-        chain_posteriors.append(public_samples)
-        chain_divergences.append(np.asarray(divergences, dtype=np.int8))
+        sequential = []
+        for chain in range(4):
+            samples, divergences = _run_pyro_chain(
+                model,
+                draws=draws,
+                tune=tune,
+                seed=seed + chain,
+                target_accept=target_accept,
+                num_chains=1,
+            )
+            sequential.append(_public_pyro_chain(chain, samples, divergences, data, variant))
+        chain_results = tuple(sequential)
+    else:
+        requests = tuple(
+            _PyroChainRequest(
+                chain=chain,
+                data=data,
+                approved_ar_path=calibration.artifact_path,
+                residual_sha256=calibration.residual_sha256,
+                config_sha256=calibration.config_sha256,
+                event_sha256=calibration.event_sha256,
+                variant=variant,
+                pooling=pooling,
+                options=options,
+                draws=draws,
+                tune=tune,
+                seed=seed + chain,
+                target_accept=target_accept,
+                device=resolved.logical_device,
+            )
+            for chain in range(4)
+        )
+        context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=4,
+            mp_context=context,
+            initializer=_initialize_pyro_chain_worker,
+        ) as pool:
+            chain_results = tuple(pool.map(_run_pyro_chain_worker, requests))
+        if {result.chain for result in chain_results} != set(range(4)):
+            raise SamplingError("parallel Pyro chains returned invalid chain indexes")
+        chain_results = tuple(sorted(chain_results, key=lambda result: result.chain))
+
     posterior = {
-        name: np.stack([chain[name] for chain in chain_posteriors]) for name in chain_posteriors[0]
+        name: np.stack([result.posterior[name] for result in chain_results])
+        for name in chain_results[0].posterior
     }
     idata = az.from_dict(
         posterior=posterior,
-        sample_stats={"diverging": np.stack(chain_divergences).astype(np.int8)},
+        sample_stats={
+            "diverging": np.stack([result.divergences for result in chain_results]).astype(np.int8)
+        },
     )
     return idata, resolved
 
@@ -216,8 +335,8 @@ def sample_hqrc(
         for value in (draws, tune, chains, cores)
     ):
         raise ValueError("draws, tune, chains, and cores must be positive integers")
-    if backend == "pyro" and cores != 1:
-        raise ValueError("pyro sequential chains require cores=1")
+    if backend == "pyro" and cores not in {1, 4}:
+        raise ValueError("pyro requires cores=1 or cores=4")
     if cores > chains:
         raise ValueError("cores must not exceed chains")
     if isinstance(seed, bool) or not isinstance(seed, int):
@@ -227,7 +346,7 @@ def sample_hqrc(
     if paper_profile and (chains != 4 or draws < 1_000 or tune < 1_000):
         raise ValueError("paper_profile requires exactly 4 chains and at least 1000 tune/draws")
     if backend == "pyro" and chains != 4:
-        raise ValueError("pyro requires exactly 4 sequential chains")
+        raise ValueError("pyro requires exactly 4 chains")
     trusted_calibration = require_approved_calibration(calibration)
     model = None
     if backend in {"pymc", "nutpie"}:
@@ -287,6 +406,7 @@ def sample_hqrc(
             seed=seed,
             target_accept=resolved_target_accept,
             device=device,
+            cores=cores,
         )
     else:
         raise ValueError("backend must be 'pymc', 'nutpie', or 'pyro'")
@@ -355,7 +475,7 @@ def sample_hqrc(
         "draws": draws,
         "tune": tune,
         "chains": chains,
-        "cores": 1,
+        "cores": cores,
         "seed": seed,
         "target_accept": resolved_target_accept,
         "paper_profile": paper_profile,
@@ -365,7 +485,7 @@ def sample_hqrc(
         "logical_device": resolved.logical_device,
         "physical_device": resolved.physical_device,
         "dtype": "float64",
-        "chain_execution": "sequential",
+        "chain_execution": "parallel" if cores == 4 else "sequential",
         "capability_probe": asdict(resolved.probe),
         "fallback_reason": resolved.fallback_reason,
     }
@@ -407,7 +527,7 @@ def sample_hqrc(
             "hqrc_dtype": "float64",
             "hqrc_device_probe": resolved.probe.detail,
             "hqrc_device_fallback_reason": resolved.fallback_reason or "",
-            "hqrc_chain_execution": "sequential",
+            "hqrc_chain_execution": "parallel" if cores == 4 else "sequential",
         }
     )
     idata.attrs.update(attrs)

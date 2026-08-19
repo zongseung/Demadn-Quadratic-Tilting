@@ -10,6 +10,7 @@ import pymc as pm
 import pytest
 import torch
 
+import hqrc_v3.bayes.samplers as sampler_module
 from hqrc_v3.accelerators import DeviceProbe, ResolvedDevice
 from hqrc_v3.bayes.model import HQRCData
 from hqrc_v3.bayes.samplers import (
@@ -259,10 +260,171 @@ def test_paper_diagnostics_fail_closed_without_divergence_statistics():
         validate_inference_data(idata, paper_profile=True)
 
 
-@pytest.mark.parametrize("cores", [2, 5])
-def test_pyro_rejects_more_than_one_core_before_model_build(cores):
-    with pytest.raises(ValueError, match="cores=1"):
+@pytest.mark.parametrize("cores", [2, 3, 5])
+def test_pyro_rejects_unsupported_core_topology_before_model_build(cores):
+    with pytest.raises(ValueError, match="cores=1 or cores=4"):
         sample_hqrc(None, None, backend="pyro", chains=4, cores=cores)
+
+
+def test_pyro_runs_four_chains_through_spawn_pool_and_preserves_chain_order(tmp_path, monkeypatch):
+    data = HQRCData(
+        observations=np.linspace(-0.2, 0.2, 18),
+        occurrence_index=np.repeat(np.arange(9), 2),
+        holiday_type_index=np.repeat(np.arange(9) % 2, 2),
+        tau_days=np.tile(np.array([0.0, 1 / 24]), 9),
+        hour=np.tile(np.array([0, 1]), 9),
+        restriction=np.repeat(np.arange(9) % 2, 2),
+        occurrence_ids=tuple(f"event-{index}" for index in range(9)),
+    )
+    approved = SimpleNamespace(
+        artifact_path=tmp_path / "approved.json",
+        artifact_digest="digest",
+        residual_sha256="residual",
+        config_sha256="config",
+        event_sha256="event",
+        context=EventResidualContext("model", "B0", 5, ("oof-2020",)),
+        a=2.0,
+        b=3.0,
+    )
+    probe = DeviceProbe(success=True, detail="float64-gradient-lkj-ar")
+    resolved = ResolvedDevice(
+        kind="cpu",
+        logical_device="cpu",
+        physical_device=None,
+        probe=probe,
+    )
+    monkeypatch.setattr(sampler_module, "require_approved_calibration", lambda value: value)
+    monkeypatch.setattr(sampler_module, "resolve_device", lambda _request: resolved)
+    monkeypatch.setattr(
+        sampler_module,
+        "build_pyro_hqrc_model",
+        lambda *_args, **_kwargs: pytest.fail("parallel parent built the nested Pyro model"),
+    )
+    monkeypatch.setattr(
+        sampler_module,
+        "validate_inference_data",
+        lambda *_args, **_kwargs: SamplingDiagnostics(1.0, 800.0, 700.0, 0),
+    )
+    versions = {"arviz": "test-arviz", "torch": "test-torch", "pyro-ppl": "test-pyro"}
+    monkeypatch.setattr(sampler_module.importlib.metadata, "version", versions.__getitem__)
+    captured = {}
+
+    class FakeSpawnPool:
+        def __init__(self, **kwargs):
+            captured["executor"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def map(self, worker, requests):
+            captured["worker"] = worker
+            captured["requests"] = tuple(requests)
+            return tuple(
+                SimpleNamespace(
+                    chain=request.chain,
+                    posterior={
+                        "phi": np.full(request.draws, request.chain, dtype=float),
+                        "event_log_likelihood": np.full(
+                            (request.draws, 9), request.chain, dtype=float
+                        ),
+                    },
+                    divergences=np.zeros(request.draws, dtype=np.int8),
+                )
+                for request in captured["requests"]
+            )
+
+    monkeypatch.setattr(sampler_module, "ProcessPoolExecutor", FakeSpawnPool, raising=False)
+
+    idata = sample_hqrc(
+        data,
+        approved,
+        draws=4,
+        tune=3,
+        chains=4,
+        cores=4,
+        seed=17,
+        backend="pyro",
+        device="cpu",
+    )
+
+    assert captured["executor"]["max_workers"] == 4
+    assert captured["executor"]["mp_context"].get_start_method() == "spawn"
+    assert captured["executor"]["initializer"] is sampler_module._initialize_pyro_chain_worker
+    requests = captured["requests"]
+    assert [request.chain for request in requests] == [0, 1, 2, 3]
+    assert [request.seed for request in requests] == [17, 18, 19, 20]
+    assert all(request.approved_ar_path == approved.artifact_path for request in requests)
+    assert all(request.residual_sha256 == "residual" for request in requests)
+    assert all(request.config_sha256 == "config" for request in requests)
+    assert all(request.event_sha256 == "event" for request in requests)
+    np.testing.assert_array_equal(idata.posterior["phi"][:, 0], np.arange(4))
+    assert idata.posterior["event_log_likelihood"].shape == (4, 4, 9)
+    sampler = json.loads(idata.attrs["hqrc_sampler_json"])
+    assert sampler["cores"] == 4
+    assert sampler["chain_execution"] == "parallel"
+    assert idata.attrs["hqrc_chain_execution"] == "parallel"
+
+
+@pytest.mark.slow
+def test_pyro_four_chain_spawn_runs_real_model(tmp_path):
+    occurrence_ids = tuple(f"event-{index}" for index in range(9))
+    data = HQRCData(
+        observations=np.linspace(-0.2, 0.2, 18),
+        occurrence_index=np.repeat(np.arange(9), 2),
+        holiday_type_index=np.repeat(np.arange(9) % 2, 2),
+        tau_days=np.tile(np.array([0.0, 1 / 24]), 9),
+        hour=np.tile(np.array([0, 1]), 9),
+        restriction=np.repeat(np.arange(9) % 2, 2),
+        occurrence_ids=occurrence_ids,
+    )
+    calibration = calibrate_beta_prior(np.linspace(0.2, 0.4, 9), event_ids=occurrence_ids)
+    proposal = write_ar_diagnostics(
+        tmp_path / "proposal.json",
+        (),
+        calibration,
+        residual_sha256="residual-hash",
+        config_sha256="config-hash",
+        event_sha256="event-hash",
+        context=EventResidualContext("model", "B0", 5, ("oof-2020",)),
+    )
+    approved_path = approve_calibration(
+        proposal,
+        tmp_path / "approved.json",
+        current_residual_sha256="residual-hash",
+        current_config_sha256="config-hash",
+        current_event_sha256="event-hash",
+    )
+    approved = load_approved_calibration(
+        approved_path,
+        current_residual_sha256="residual-hash",
+        current_config_sha256="config-hash",
+        current_event_sha256="event-hash",
+    )
+
+    idata = sample_hqrc(
+        data,
+        approved,
+        variant="H1",
+        draws=4,
+        tune=4,
+        chains=4,
+        cores=4,
+        seed=17,
+        backend="pyro",
+        device="cpu",
+    )
+
+    assert idata.posterior.sizes["chain"] == 4
+    assert idata.posterior.sizes["draw"] == 4
+    assert all(np.isfinite(np.asarray(value)).all() for value in idata.posterior.data_vars.values())
+    assert idata.sample_stats["diverging"].dtype.kind in {"i", "u"}
+    sampler = json.loads(idata.attrs["hqrc_sampler_json"])
+    assert sampler["cores"] == 4
+    assert sampler["chain_execution"] == "parallel"
+    assert idata.attrs["hqrc_chain_execution"] == "parallel"
 
 
 def test_run_pyro_chain_constructs_one_chain_mcmc_and_integer_divergences(monkeypatch):
