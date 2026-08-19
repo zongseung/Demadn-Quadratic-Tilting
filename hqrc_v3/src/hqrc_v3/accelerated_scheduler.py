@@ -18,6 +18,13 @@ from typing import Any
 PAPER_MODELS = ("lightgbm", "svr", "seq2seq_lstm", "transformer")
 PAPER_FEATURE_SETS = ("B0", "B1")
 PAPER_VARIANTS = ("H1", "H2", "H3")
+CPU_THREAD_ENVIRONMENT_NAMES = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,13 +390,7 @@ def _build_job(
     else:
         suffix = device.replace(":", "-")
     if thread_budget is not None:
-        for name in (
-            "OMP_NUM_THREADS",
-            "MKL_NUM_THREADS",
-            "OPENBLAS_NUM_THREADS",
-            "NUMEXPR_NUM_THREADS",
-            "VECLIB_MAXIMUM_THREADS",
-        ):
+        for name in CPU_THREAD_ENVIRONMENT_NAMES:
             environment[name] = str(thread_budget)
     return _Job(
         model=model,
@@ -411,6 +412,10 @@ def _run_job(job: _Job) -> _JobOutcome:
     with job.log_path.open("a", encoding="utf-8", buffering=1) as log:
         if prior_evidence:
             log.write("\n=== HQRC WORKER ATTEMPT ===\n")
+        if job.command[-1] == "cpu":
+            log.write("=== HQRC CPU ENVIRONMENT ===\n")
+            for name in CPU_THREAD_ENVIRONMENT_NAMES:
+                log.write(f"{name}={job.environment[name]}\n")
         try:
             process = subprocess.Popen(
                 job.command,
@@ -442,6 +447,19 @@ def _restart_command(command: tuple[str, ...], *, platform_name: str | None = No
         if (os.name if platform_name is None else platform_name) == "nt"
         else shlex.join(command)
     )
+
+
+def _restart_environment(job: _Job) -> str:
+    if job.command[-1] == "cpu":
+        return ",".join(
+            f"{name}={job.environment[name]}" for name in CPU_THREAD_ENVIRONMENT_NAMES
+        )
+    if job.physical_device is not None:
+        return (
+            f"CUDA_VISIBLE_DEVICES={job.environment.get('CUDA_VISIBLE_DEVICES', 'unset')},"
+            f"HQRC_PHYSICAL_DEVICE={job.environment.get('HQRC_PHYSICAL_DEVICE', 'unset')}"
+        )
+    return "none"
 
 
 def _result(
@@ -526,9 +544,7 @@ def run_accelerated_loeo(request: AcceleratedRequest) -> AcceleratedResult:
             details.append(
                 f"{item.job.model} exit={item.returncode} "
                 f"physical_device={physical if physical is not None else 'none'} "
-                f"log={item.job.log_path} restart_env="
-                f"CUDA_VISIBLE_DEVICES={item.job.environment.get('CUDA_VISIBLE_DEVICES', 'unset')},"
-                f"HQRC_PHYSICAL_DEVICE={item.job.environment.get('HQRC_PHYSICAL_DEVICE', 'unset')} "
+                f"log={item.job.log_path} restart_env={_restart_environment(item.job)} "
                 f"restart_command={_restart_command(item.job.command)}"
             )
         detail = "; ".join(details)

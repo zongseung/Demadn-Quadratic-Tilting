@@ -8,6 +8,7 @@ accelerator=${HQRC_ACCELERATOR:-auto}
 for argument in "$@"; do
     case "$argument" in
         --profile|--profile=*) echo "profile is owned by the launcher action" >&2; exit 2 ;;
+        --accelerator|--accelerator=*) echo "accelerator is owned by the launcher control" >&2; exit 2 ;;
     esac
 done
 

@@ -22,9 +22,18 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ([Environment]::CommandLine -match '(^|[\s"])--accelerator(?=[\s"]|$)') {
+    [Console]::Error.WriteLine("accelerator is owned by the launcher control")
+    exit 2
+}
+
 foreach ($Argument in $ForwardArgs) {
     if ($Argument -eq "--profile" -or $Argument -like "--profile=*") {
         [Console]::Error.WriteLine("profile is owned by the launcher action")
+        exit 2
+    }
+    if ($Argument -eq "--accelerator" -or $Argument -like "--accelerator=*") {
+        [Console]::Error.WriteLine("accelerator is owned by the launcher control")
         exit 2
     }
 }

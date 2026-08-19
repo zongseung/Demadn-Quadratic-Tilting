@@ -68,6 +68,15 @@ def test_cpu_two_logical_cpus_create_ordered_one_thread_queues():
     )
 
 
+def test_cpu_ten_logical_cpus_divide_four_model_budgets_with_remainder():
+    assert scheduler._cpu_queue_specs(PAPER_MODELS, logical_cpus=10) == (
+        (("lightgbm",), 3),
+        (("svr",), 3),
+        (("seq2seq_lstm",), 2),
+        (("transformer",), 2),
+    )
+
+
 def test_cpu_scheduler_runs_all_models_concurrently_with_even_thread_budgets(
     tmp_path, monkeypatch
 ):
@@ -110,6 +119,71 @@ def test_cpu_scheduler_runs_all_models_concurrently_with_even_thread_budgets(
             "OPENBLAS_NUM_THREADS": "6",
             "NUMEXPR_NUM_THREADS": "6",
             "VECLIB_MAXIMUM_THREADS": "6",
+        }
+
+
+def test_cpu_scheduler_under_provisioning_uses_two_ordered_one_thread_queues(
+    tmp_path, monkeypatch
+):
+    request = _request(tmp_path, accelerator="cpu")
+    _validated(monkeypatch)
+    monkeypatch.setattr(
+        scheduler,
+        "_preflight_accelerator",
+        lambda *_args, **_kwargs: scheduler._ResolvedAccelerator("cpu", "cpu", None, "probe", None),
+    )
+    monkeypatch.setattr(scheduler.os, "cpu_count", lambda: 2)
+    first_jobs_started = threading.Barrier(2)
+    first_jobs_finished = {model: threading.Event() for model in ("lightgbm", "svr")}
+    lock = threading.Lock()
+    in_flight = 0
+    maximum_in_flight = 0
+    started = []
+    environments = {}
+
+    def run_job(job):
+        nonlocal in_flight, maximum_in_flight
+        with lock:
+            in_flight += 1
+            maximum_in_flight = max(maximum_in_flight, in_flight)
+            started.append(job.model)
+            environments[job.model] = job.environment
+        try:
+            if job.model in first_jobs_finished:
+                first_jobs_started.wait(timeout=2)
+                first_jobs_finished[job.model].set()
+            elif job.model == "seq2seq_lstm":
+                assert first_jobs_finished["lightgbm"].wait(timeout=2)
+            else:
+                assert first_jobs_finished["svr"].wait(timeout=2)
+            return scheduler._JobOutcome(job, 0)
+        finally:
+            with lock:
+                in_flight -= 1
+
+    monkeypatch.setattr(scheduler, "_run_job", run_job)
+    result = run_accelerated_loeo(request)
+
+    assert result.completed_models == PAPER_MODELS
+    assert started.count("lightgbm") == started.count("svr") == 1
+    assert started.count("seq2seq_lstm") == started.count("transformer") == 1
+    assert maximum_in_flight == 2
+    for environment in environments.values():
+        assert {
+            name: environment[name]
+            for name in (
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+                "VECLIB_MAXIMUM_THREADS",
+            )
+        } == {
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "VECLIB_MAXIMUM_THREADS": "1",
         }
 
 
@@ -317,7 +391,7 @@ def test_scheduler_module_does_not_import_torch_in_parent():
     assert result.stdout.strip() == "False"
 
 
-def test_auto_cuda_preflight_falls_back_to_sequential_cpu_with_provenance(monkeypatch):
+def test_auto_cuda_preflight_falls_back_to_cpu_with_provenance(monkeypatch):
     calls = []
 
     def probe(request, *, physical_device=None):
@@ -399,6 +473,14 @@ def test_failed_queue_stops_later_model_joins_peer_and_preserves_logs(tmp_path, 
 
 
 def test_worker_tees_stdout_and_stderr_to_console_and_durable_log(tmp_path, monkeypatch, capsys):
+    for name in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        monkeypatch.setenv(name, "99")
     request = _request(
         tmp_path,
         profile="smoke",
@@ -431,6 +513,68 @@ def test_worker_tees_stdout_and_stderr_to_console_and_durable_log(tmp_path, monk
     assert job.log_path.read_text() == expected
     assert calls[0][1]["stderr"] is subprocess.STDOUT
     assert calls[0][1]["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+
+
+def test_cpu_worker_writes_thread_budget_header_to_durable_log(tmp_path, monkeypatch):
+    request = _request(
+        tmp_path,
+        profile="smoke",
+        models=("svr",),
+        draws=4,
+        tune=4,
+        chains=4,
+        cores=1,
+        target_accept=0.9,
+    )
+    job = scheduler._build_job(
+        request, "svr", physical_device=None, device="cpu", thread_budget=6
+    )
+
+    class FakeProcess:
+        stdout = iter(("hello\n",))
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(scheduler.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+    scheduler._run_job(job)
+
+    assert job.log_path.read_text() == (
+        "=== HQRC CPU ENVIRONMENT ===\n"
+        "OMP_NUM_THREADS=6\n"
+        "MKL_NUM_THREADS=6\n"
+        "OPENBLAS_NUM_THREADS=6\n"
+        "NUMEXPR_NUM_THREADS=6\n"
+        "VECLIB_MAXIMUM_THREADS=6\n"
+        "[CPU svr] hello\n"
+    )
+
+
+def test_cpu_failure_provenance_includes_only_thread_budget_environment(tmp_path, monkeypatch):
+    request = _request(tmp_path, accelerator="cpu")
+    _validated(monkeypatch)
+    monkeypatch.setattr(
+        scheduler,
+        "_preflight_accelerator",
+        lambda *_args, **_kwargs: scheduler._ResolvedAccelerator("cpu", "cpu", None, "probe", None),
+    )
+    monkeypatch.setattr(scheduler.os, "cpu_count", lambda: 4)
+    monkeypatch.setattr(
+        scheduler,
+        "_run_job",
+        lambda job: scheduler._JobOutcome(job, 7 if job.model == "lightgbm" else 0),
+    )
+
+    with pytest.raises(AcceleratedRunError, match="lightgbm") as error:
+        run_accelerated_loeo(request)
+
+    failure = str(error.value)
+    assert (
+        "restart_env=OMP_NUM_THREADS=1,MKL_NUM_THREADS=1,OPENBLAS_NUM_THREADS=1,"
+        "NUMEXPR_NUM_THREADS=1,VECLIB_MAXIMUM_THREADS=1"
+    ) in failure
+    assert "CUDA_VISIBLE_DEVICES" not in failure
+    assert "HQRC_PHYSICAL_DEVICE" not in failure
 
 
 def test_worker_second_attempt_appends_delimiter_and_preserves_first_log(
@@ -621,6 +765,38 @@ def test_native_launchers_reject_raw_profile_override_before_uv_sync(
     result = subprocess.run(command, env=env, capture_output=True, text=True)
     assert result.returncode == 2
     assert "profile is owned by the launcher action" in result.stderr
+    assert not capture.exists()
+
+
+@pytest.mark.parametrize(
+    ("script", "shell"),
+    [
+        ("run_hqrc_windows.ps1", "powershell"),
+        ("run_hqrc_linux.sh", r"C:\Program Files\Git\bin\bash.exe"),
+        ("run_hqrc_macos.sh", r"C:\Program Files\Git\bin\bash.exe"),
+    ],
+)
+@pytest.mark.parametrize("override", (("--accelerator", "cpu"), ("--accelerator=cpu",)))
+def test_native_launchers_reject_raw_accelerator_override_before_uv_sync(
+    tmp_path, script, shell, override
+):
+    scripts = Path(__file__).parents[3] / "scripts"
+    capture = tmp_path / "calls.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv.cmd").write_text(f'@echo %*>>"{capture}"\n')
+    uv_sh = fake_bin / "uv"
+    uv_sh.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{capture.as_posix()}"\n')
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    command = (
+        [shell, "-NoProfile", "-File", str(scripts / script), "paper", *override]
+        if shell == "powershell"
+        else [shell, str(scripts / script), "paper", *override]
+    )
+    result = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "accelerator is owned by the launcher control" in result.stderr
     assert not capture.exists()
 
 

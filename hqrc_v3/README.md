@@ -204,8 +204,9 @@ HQRC_ACCELERATOR=cpu scripts/run_hqrc_linux.sh resume \
 The macOS launcher uses `--accelerator auto`. On Apple Silicon, `auto` selects
 MPS only after the HQRC float64/LKJ/AR gradient capability probe succeeds. If
 MPS is unavailable or fails that probe, the scheduler selects CPU and records
-the fallback reason. MPS executes the four models sequentially; explicit CPU
-selection uses bounded model-level parallelism.
+the fallback reason. MPS executes the four models sequentially. Any resolved
+CPU path, including automatic MPS/CUDA fallback, uses bounded model-level
+parallelism.
 
 ```bash
 SOURCE_ROOT="$(if [ -f artifacts.zip ]; then pwd -P; else cd ../.. && pwd -P; fi)"
