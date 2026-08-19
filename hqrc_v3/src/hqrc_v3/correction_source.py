@@ -152,7 +152,9 @@ def _resolve_source_paths(
     requested_config = Path(config_path)
     _require_real_file(requested_config, "requested experiment config")
     if paths["experiment_config"].resolve() != requested_config.resolve():
-        raise CorrectionSourceError("requested experiment config differs from residual source")
+        raise CorrectionSourceError(
+            "requested experiment config differs from residual source"
+        )
     return paths, hashes, raw_manifest
 
 
@@ -163,7 +165,9 @@ def _paper_bounds(profile: str, availability: object) -> dict[str, object]:
             "expected_end": FIXED_END,
             "expected_rows": FIXED_ROWS,
             "expected_public_holiday_dates": FIXED_PUBLIC_HOLIDAY_DATES,
-            "expected_substitute_or_temporary_dates": (FIXED_SUBSTITUTE_OR_TEMPORARY_DATES),
+            "expected_substitute_or_temporary_dates": (
+                FIXED_SUBSTITUTE_OR_TEMPORARY_DATES
+            ),
             "temporary_holiday_availability": availability,
         }
     return {
@@ -252,7 +256,9 @@ def _select_point_context(
 ) -> pl.DataFrame:
     key = _context_key(context)
     selected = frame.filter(
-        (pl.col("model") == key[0]) & (pl.col("feature_set") == key[1]) & (pl.col("seed") == key[2])
+        (pl.col("model") == key[0])
+        & (pl.col("feature_set") == key[1])
+        & (pl.col("seed") == key[2])
     )
     if selected.is_empty():
         raise CorrectionSourceError(f"requested context is absent from {description}")
@@ -261,7 +267,9 @@ def _select_point_context(
         for split_id in expected_split_ids:
             split = selected.filter(pl.col("split_id") == split_id)
             if split.is_empty():
-                raise CorrectionSourceError(f"requested context split is absent from {description}")
+                raise CorrectionSourceError(
+                    f"requested context split is absent from {description}"
+                )
             groups.append(validate_prediction_frame(split).sort("target_timestamp"))
     except (DataContractError, TypeError, ValueError) as error:
         if isinstance(error, CorrectionSourceError):
@@ -301,8 +309,12 @@ class ValidatedCorrectionSource:
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_dir", Path(self.run_dir))
         object.__setattr__(self, "events", tuple(self.events))
-        object.__setattr__(self, "source_paths", MappingProxyType(dict(self.source_paths)))
-        object.__setattr__(self, "source_hashes", MappingProxyType(dict(self.source_hashes)))
+        object.__setattr__(
+            self, "source_paths", MappingProxyType(dict(self.source_paths))
+        )
+        object.__setattr__(
+            self, "source_hashes", MappingProxyType(dict(self.source_hashes))
+        )
         contexts = tuple(self.available_contexts)
         for context in contexts:
             _require_canonical_context(context, description="available context")
@@ -324,7 +336,9 @@ class ValidatedCorrectionSource:
 
     def _require_context(self, context: EventResidualContext) -> tuple[str, str, int]:
         _require_exact_namespace(self.run_dir / "inputs", _INPUT_NAMESPACE, "residual")
-        _require_exact_namespace(self.run_dir / "predictions", _PREDICTION_NAMESPACE, "baseline")
+        _require_exact_namespace(
+            self.run_dir / "predictions", _PREDICTION_NAMESPACE, "baseline"
+        )
         _require_canonical_context(context, description="requested context")
         if context not in self.available_contexts:
             raise CorrectionSourceError("requested context is not present in validated sources")
@@ -402,7 +416,9 @@ def _manifest_artifact(
         or entry.get("path") != expected
         or not isinstance(entry.get("sha256"), str)
     ):
-        raise CorrectionSourceError(f"baseline {stage} {artifact} artifact binding is invalid")
+        raise CorrectionSourceError(
+            f"baseline {stage} {artifact} artifact binding is invalid"
+        )
     return Path(expected), str(entry["sha256"])
 
 
@@ -483,9 +499,9 @@ def _frame_contexts(frame: pl.DataFrame) -> set[tuple[str, str, int]]:
         raise CorrectionSourceError("point publication context columns are missing")
     return {
         (str(model), str(feature_set), int(seed))
-        for model, feature_set, seed in frame.select("model", "feature_set", "seed")
-        .unique()
-        .iter_rows()
+        for model, feature_set, seed in frame.select(
+            "model", "feature_set", "seed"
+        ).unique().iter_rows()
     }
 
 
@@ -527,7 +543,9 @@ def validate_correction_source(
     load_config(sources["experiment_config"])
     events = load_event_registry(sources["event_registry"])
     calendar = load_holiday_calendar(sources["holiday_calendar"])
-    availability = load_temporary_holiday_availability(sources["temporary_holiday_availability"])
+    availability = load_temporary_holiday_availability(
+        sources["temporary_holiday_availability"]
+    )
     residual_manifest_path = run / "inputs/standardized_residuals_manifest.json"
     residual_manifest = load_standardized_residual_manifest(
         residual_manifest_path,
@@ -561,7 +579,9 @@ def validate_correction_source(
         or any(feature not in {"B0", "B1"} for feature in feature_sets)
     ):
         raise CorrectionSourceError("baseline manifest model coverage is invalid")
-    if source_profile == "paper" and (tuple(models) != MODEL_NAMES or feature_sets != ["B0", "B1"]):
+    if source_profile == "paper" and (
+        tuple(models) != MODEL_NAMES or feature_sets != ["B0", "B1"]
+    ):
         raise CorrectionSourceError("paper correction requires all baseline contexts")
 
     artifacts, _ = _preflight_baseline_publication(run, baseline_manifest)
@@ -576,7 +596,9 @@ def validate_correction_source(
         feature_set: build_daily_forecast_matrix(featured, feature_set=feature_set)
         for feature_set in feature_sets
     }
-    artifact_hashes = {_SOURCE_TO_BASELINE_HASH[name]: source_hashes[name] for name in _SOURCE_KEYS}
+    artifact_hashes = {
+        _SOURCE_TO_BASELINE_HASH[name]: source_hashes[name] for name in _SOURCE_KEYS
+    }
     if set(artifact_hashes) != set(PAPER_HASH_KEYS):
         raise CorrectionSourceError("baseline source hash schema differs")
     execution_overrides = baseline_manifest.get("execution_overrides")
@@ -604,8 +626,10 @@ def validate_correction_source(
         raise CorrectionSourceError("final baseline validation unexpectedly fitted a model")
 
     if (
-        Path(final_result.members_path).resolve() != artifacts["final_members"][0].resolve()
-        or Path(final_result.point_path).resolve() != artifacts["final_point"][0].resolve()
+        Path(final_result.members_path).resolve()
+        != artifacts["final_members"][0].resolve()
+        or Path(final_result.point_path).resolve()
+        != artifacts["final_point"][0].resolve()
         or Path(final_result.manifest_path).resolve() != baseline_manifest_path.resolve()
     ):
         raise CorrectionSourceError("final baseline reuse returned substituted paths")
@@ -637,10 +661,9 @@ def validate_correction_source(
 
     available_contexts = _manifest_contexts(residual_manifest)
     expected_contexts = {_context_key(context) for context in available_contexts}
-    if (
-        _frame_contexts(oof_point) != expected_contexts
-        or _frame_contexts(final_point) != expected_contexts
-    ):
+    if _frame_contexts(oof_point) != expected_contexts or _frame_contexts(
+        final_point
+    ) != expected_contexts:
         raise CorrectionSourceError(
             "OOF/final context coverage differs from the residual publication"
         )

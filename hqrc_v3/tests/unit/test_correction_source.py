@@ -321,6 +321,28 @@ def test_residual_semantic_comparator_rejects_nonfinite_derived_values():
     assert not comparator(expected, actual)
 
 
+@pytest.mark.parametrize("column", ["sigma_n_mw", "standardized_residual"])
+def test_residual_semantic_comparator_rejects_null_in_derived_float64_column(column):
+    expected = _residual_semantic_frame()
+    actual = expected.with_columns(pl.Series(column, [None, expected[column][1]], dtype=pl.Float64))
+
+    comparator = getattr(source_module, "_residual_frames_semantically_equal", None)
+
+    assert comparator is not None
+    assert not comparator(expected, actual)
+
+
+@pytest.mark.parametrize("column", ["sigma_n_mw", "standardized_residual"])
+def test_residual_semantic_comparator_rejects_non_float64_derived_column(column):
+    expected = _residual_semantic_frame()
+    actual = expected.with_columns(pl.col(column).cast(pl.Float32))
+
+    comparator = getattr(source_module, "_residual_frames_semantically_equal", None)
+
+    assert comparator is not None
+    assert not comparator(expected, actual)
+
+
 @pytest.mark.parametrize(
     "actual",
     [
