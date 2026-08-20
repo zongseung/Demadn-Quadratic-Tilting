@@ -1839,6 +1839,94 @@ def test_retry_sampler_contract_is_immutable_and_divergence_only() -> None:
         )
 
 
+def test_retry_sampler_contract_rejects_a_base_for_another_variant_or_fold() -> None:
+    h1_base = loeo_publication_module.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        variant="H1",
+        draws=None,
+        tune=None,
+        chains=None,
+    )
+
+    with pytest.raises(LOEOFoldError, match="seed"):
+        loeo_publication_module.retry_sampler_contract(
+            h1_base,
+            variant="H3",
+            held_out_occurrence_id="seollal-2024",
+        )
+
+
+@pytest.mark.parametrize(
+    "diagnostics",
+    [
+        {"max_rhat": 1.02, "min_bulk_ess": 500.0, "min_tail_ess": 450.0, "divergences": "1"},
+        {"max_rhat": None, "min_bulk_ess": 500.0, "min_tail_ess": 450.0, "divergences": 1},
+    ],
+)
+def test_retry_failure_rejects_malformed_diagnostics_with_loeo_error(diagnostics) -> None:
+    base = loeo_publication_module.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        draws=None,
+        tune=None,
+        chains=None,
+    )
+    retry = loeo_publication_module.retry_sampler_contract(
+        base,
+        variant="H3",
+        held_out_occurrence_id="seollal-2024",
+    )
+    failure = {
+        "reason": "divergence-only",
+        "base_sampler_sha256": retry["retry"]["base_sampler_sha256"],
+        "diagnostics": diagnostics,
+    }
+
+    with pytest.raises(LOEOFoldError, match="diagnostics"):
+        loeo_publication_module.validate_retry_failure(retry, failure)
+
+
+def test_retry_sampler_contract_preserves_pyro_device_metadata_and_higher_tune(monkeypatch) -> None:
+    monkeypatch.setattr(
+        loeo_publication_module,
+        "resolve_device",
+        lambda _device: SimpleNamespace(kind="cpu", logical_device="cpu", physical_device=None),
+    )
+    base = loeo_publication_module.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        draws=1_000,
+        tune=2_500,
+        chains=4,
+        cores=1,
+        backend="pyro",
+        device="cpu",
+    )
+
+    retry = loeo_publication_module.retry_sampler_contract(
+        base,
+        variant="H3",
+        held_out_occurrence_id="seollal-2024",
+    )
+
+    assert retry["tune"] == 2_500
+    for field in (
+        "draws",
+        "chains",
+        "cores",
+        "backend",
+        "init",
+        "resolved_device_kind",
+        "logical_device",
+        "physical_device",
+    ):
+        assert retry[field] == base[field]
+
+
 def test_namespace_rejects_intermediate_symlink_without_touching_external_target(
     approved_fold, tmp_path: Path
 ) -> None:

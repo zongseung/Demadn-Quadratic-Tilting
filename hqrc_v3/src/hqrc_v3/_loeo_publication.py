@@ -98,6 +98,11 @@ def retry_sampler_contract(
         raise LOEOFoldError("LOEO retry requires a base paper sampler contract")
     if "retry" in base:
         raise LOEOFoldError("LOEO retry sampler cannot retry another retry")
+    root_seed = base.get("root_seed")
+    if base.get("seed") != derive_loeo_seed(
+        root_seed, f"{variant}-fold-sampler:{held_out_occurrence_id}"
+    ):
+        raise LOEOFoldError("LOEO retry base sampler seed does not match its fold")
     tune = base.get("tune")
     if isinstance(tune, bool) or not isinstance(tune, int) or tune <= 0:
         raise LOEOFoldError("LOEO retry base sampler tune is invalid")
@@ -105,7 +110,7 @@ def retry_sampler_contract(
     retry.update(
         {
             "seed": derive_loeo_seed(
-                base["root_seed"], f"{variant}-fold-sampler-retry-1:{held_out_occurrence_id}"
+                root_seed, f"{variant}-fold-sampler-retry-1:{held_out_occurrence_id}"
             ),
             "tune": max(2_000, tune),
             "target_accept": 0.999,
@@ -134,7 +139,7 @@ def _retry_metadata(retry_sampler: Mapping[str, object]) -> Mapping[str, object]
 
 
 def _retry_diagnostics_payload(diagnostics: SamplingDiagnostics) -> dict[str, object]:
-    if not isinstance(diagnostics, SamplingDiagnostics) or diagnostics.divergences <= 0:
+    if not isinstance(diagnostics, SamplingDiagnostics):
         raise LOEOFoldError("LOEO retry requires divergence diagnostics")
     values = {
         "max_rhat": diagnostics.max_rhat,
@@ -142,11 +147,15 @@ def _retry_diagnostics_payload(diagnostics: SamplingDiagnostics) -> dict[str, ob
         "min_tail_ess": diagnostics.min_tail_ess,
         "divergences": diagnostics.divergences,
     }
-    if (
-        any(not math.isfinite(float(values[name])) for name in values if name != "divergences")
-        or isinstance(values["divergences"], bool)
-        or not isinstance(values["divergences"], int)
-    ):
+    if isinstance(values["divergences"], bool) or not isinstance(values["divergences"], int):
+        raise LOEOFoldError("LOEO retry diagnostics are invalid")
+    if values["divergences"] <= 0:
+        raise LOEOFoldError("LOEO retry requires divergence diagnostics")
+    try:
+        valid = all(math.isfinite(float(values[name])) for name in values if name != "divergences")
+    except (TypeError, ValueError, OverflowError):
+        valid = False
+    if not valid:
         raise LOEOFoldError("LOEO retry diagnostics are invalid")
     return values
 
