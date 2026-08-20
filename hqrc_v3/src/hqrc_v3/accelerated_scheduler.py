@@ -120,10 +120,14 @@ def _cpu_queue_specs(
     models: tuple[str, ...], logical_cpus: int | None = None
 ) -> tuple[tuple[tuple[str, ...], int], ...]:
     available = max(1, logical_cpus if logical_cpus is not None else (os.cpu_count() or 1))
-    worker_count = min(len(models), available, 2)
+    worker_count = min(len(models), available)
     if not worker_count:
         return ()
-    return tuple((tuple(models[index::worker_count]), 1) for index in range(worker_count))
+    threads, remainder = divmod(available, worker_count)
+    return tuple(
+        (tuple(models[index::worker_count]), threads + (index < remainder))
+        for index in range(worker_count)
+    )
 
 
 def _ordered_subset(value: tuple[str, ...], complete: tuple[str, ...], description: str) -> None:
@@ -335,7 +339,7 @@ def _feature_argument(feature_sets: tuple[str, ...]) -> str:
 
 
 def _chain_workers(request: AcceleratedRequest, resolved: _ResolvedAccelerator) -> int:
-    required = 4 if resolved.kind == "cpu" else 1
+    required = 1
     if request.cores is not None and request.cores != required:
         raise AcceleratedRunError(
             f"resolved {resolved.kind} Pyro requires cores={required}, not cores={request.cores}"

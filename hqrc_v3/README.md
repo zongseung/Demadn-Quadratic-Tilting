@@ -79,27 +79,25 @@ runs `lightgbm` then `seq2seq_lstm`, while physical GPU 1 runs `svr` then
 `transformer`. The two model workers run concurrently, but every model fit
 runs its four NUTS chains sequentially inside its worker.
 
-CPU selection runs at most two model workers concurrently and gives each model
-four spawned, single-threaded Pyro chain processes. All four models remain in
-scope: one queue runs `lightgbm` then `seq2seq_lstm`, while the other runs `svr`
-then `transformer`. On the target Core i7-13700 host this is at most
-`2 models x 4 chains x 1 thread`; all OpenMP, MKL, OpenBLAS, NumExpr, and VecLib
-thread caps are `1`. Before a paper run, use the two-model smoke and require peak
-committed memory below 28 GiB on the 32 GiB host with no sustained paging. CPU parallel results use
-`cores=4` in their immutable identity and cannot reuse sequential `cores=1`
-posteriors, so use a new output root. Platform defaults remain CUDA on Windows
-and Linux, and `auto` on macOS.
+CPU selection runs at most one worker per requested model and divides the
+logical CPUs evenly between those workers. On the target Core i7-13700 host,
+the four paper models run concurrently with six numerical-library threads each.
+Every model runs its four Pyro chains sequentially (`cores=1`), avoiding the
+Windows-spawn memory duplication of process-parallel chains. Before a paper
+run, require peak committed memory below 28 GiB on the 32 GiB host with no
+sustained paging. Sequential CPU results retain their existing immutable
+identity and can resume earlier `cores=1` output roots. Platform defaults remain
+CUDA on Windows and Linux, and `auto` on macOS.
 
-The measured 2026-08-20 two-model/four-chain smoke on the 31.77 GiB target host
-reached 31.27 GiB committed memory and failed that gate. Do not start this CPU
-paper topology on this host. See the
-[two-model resource-gate report](../docs/superpowers/reports/2026-08-20-hqrc-two-model-four-chain-smoke.md).
-The earlier four-model measurement remains in its
-[historical report](../docs/superpowers/reports/2026-08-20-hqrc-four-model-four-chain-smoke.md).
-An experimental two-thread budget per chain reached only 28% host CPU
-(6.7 logical-core equivalents) while increasing committed memory to 31.68 GiB,
-so it was rejected and the checked-in chain budget remains one thread. See the
-[two-thread experiment report](../docs/superpowers/reports/2026-08-20-hqrc-two-model-four-chain-two-thread-smoke.md).
+The measured 2026-08-20 four-model/sequential-chain smoke completed all 40 H1
+fold posteriors, peaked at 27.50 GiB committed memory, and reached 45.1% host CPU
+(10.8 logical-core equivalents), so it passed the resource gate. See the
+[sequential-chain smoke report](../docs/superpowers/reports/2026-08-20-hqrc-four-model-sequential-chain-smoke.md).
+The rejected process-parallel and two-thread experiments remain documented in
+their [four-model](../docs/superpowers/reports/2026-08-20-hqrc-four-model-four-chain-smoke.md),
+[two-model](../docs/superpowers/reports/2026-08-20-hqrc-two-model-four-chain-smoke.md),
+and [two-thread](../docs/superpowers/reports/2026-08-20-hqrc-two-model-four-chain-two-thread-smoke.md)
+reports.
 
 Run the following commands from the repository root or linked worktree. The
 launchers perform a locked accelerator dependency sync before each action.
@@ -127,7 +125,7 @@ scripts\run_hqrc_windows.ps1 proposal `
   -OutputRoot artifacts/hqrc-v3-loeo-accelerated-20260819 `
   -Devices 0,1
 
-# Reduced two-model/B0/H1 hardware-path smoke. Without approval it remains proposal-only.
+# Reduced B0/H1 hardware-path smoke. Without approval it remains proposal-only.
 scripts\run_hqrc_windows.ps1 smoke `
   -SourceRunDir artifacts/hqrc-v3-paper-imported-20260819 `
   -Config artifacts/hqrc-v3-paper-imported-20260819/sources/experiment.toml `
@@ -222,8 +220,8 @@ The macOS launcher uses `--accelerator auto`. On Apple Silicon, `auto` selects
 MPS only after the HQRC float64/LKJ/AR gradient capability probe succeeds. If
 MPS is unavailable or fails that probe, the scheduler selects CPU and records
 the fallback reason. MPS executes the four models sequentially. Any resolved
-CPU path, including automatic MPS/CUDA fallback, uses at most two model queues
-with four chain processes per active model.
+CPU path, including automatic MPS/CUDA fallback, runs up to one worker per model,
+divides logical CPUs between them, and keeps four chains sequential per model.
 
 ```bash
 SOURCE_ROOT="$(if [ -f artifacts.zip ]; then pwd -P; else cd ../.. && pwd -P; fi)"

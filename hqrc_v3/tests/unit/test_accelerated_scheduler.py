@@ -72,14 +72,16 @@ def test_cpu_two_logical_cpus_create_ordered_one_thread_queues():
     )
 
 
-def test_cpu_ten_logical_cpus_cap_at_two_single_thread_model_queues():
+def test_cpu_ten_logical_cpus_divide_four_model_budgets_with_remainder():
     assert scheduler._cpu_queue_specs(PAPER_MODELS, logical_cpus=10) == (
-        (("lightgbm", "seq2seq_lstm"), 1),
-        (("svr", "transformer"), 1),
+        (("lightgbm",), 3),
+        (("svr",), 3),
+        (("seq2seq_lstm",), 2),
+        (("transformer",), 2),
     )
 
 
-def test_cpu_scheduler_caps_at_two_ordered_one_thread_queues(tmp_path, monkeypatch):
+def test_cpu_scheduler_runs_all_models_concurrently_with_even_thread_budgets(tmp_path, monkeypatch):
     request = _request(tmp_path, accelerator="cpu")
     _validated(monkeypatch)
     monkeypatch.setattr(
@@ -88,43 +90,23 @@ def test_cpu_scheduler_caps_at_two_ordered_one_thread_queues(tmp_path, monkeypat
         lambda *_args, **_kwargs: scheduler._ResolvedAccelerator("cpu", "cpu", None, "probe", None),
     )
     monkeypatch.setattr(scheduler.os, "cpu_count", lambda: 24)
-    first_jobs_started = threading.Barrier(2)
-    first_jobs_finished = {model: threading.Event() for model in ("lightgbm", "svr")}
-    lock = threading.Lock()
-    in_flight = 0
-    maximum_in_flight = 0
-    started = []
+    all_started = threading.Barrier(4)
     jobs = {}
 
     def run_job(job):
-        nonlocal in_flight, maximum_in_flight
-        with lock:
-            in_flight += 1
-            maximum_in_flight = max(maximum_in_flight, in_flight)
-            started.append(job.model)
-            jobs[job.model] = job
-        try:
-            if job.model in first_jobs_finished:
-                first_jobs_started.wait(timeout=2)
-                first_jobs_finished[job.model].set()
-            elif job.model == "seq2seq_lstm":
-                assert first_jobs_finished["lightgbm"].wait(timeout=2)
-            else:
-                assert first_jobs_finished["svr"].wait(timeout=2)
-            return scheduler._JobOutcome(job, 0)
-        finally:
-            with lock:
-                in_flight -= 1
+        jobs[job.model] = job
+        job.log_path.parent.mkdir(parents=True, exist_ok=True)
+        job.log_path.write_text(f"{job.model}\n")
+        all_started.wait(timeout=2)
+        return scheduler._JobOutcome(job, 0)
 
     monkeypatch.setattr(scheduler, "_run_job", run_job)
     result = run_accelerated_loeo(request)
 
     assert result.completed_models == PAPER_MODELS
-    assert started.count("lightgbm") == started.count("svr") == 1
-    assert started.count("seq2seq_lstm") == started.count("transformer") == 1
-    assert maximum_in_flight == 2
+    assert set(jobs) == set(PAPER_MODELS)
     for job in jobs.values():
-        assert _command_option(job.command, "--cores") == "4"
+        assert _command_option(job.command, "--cores") == "1"
         assert {
             name: job.environment[name]
             for name in (
@@ -135,11 +117,11 @@ def test_cpu_scheduler_caps_at_two_ordered_one_thread_queues(tmp_path, monkeypat
                 "VECLIB_MAXIMUM_THREADS",
             )
         } == {
-            "OMP_NUM_THREADS": "1",
-            "MKL_NUM_THREADS": "1",
-            "OPENBLAS_NUM_THREADS": "1",
-            "NUMEXPR_NUM_THREADS": "1",
-            "VECLIB_MAXIMUM_THREADS": "1",
+            "OMP_NUM_THREADS": "6",
+            "MKL_NUM_THREADS": "6",
+            "OPENBLAS_NUM_THREADS": "6",
+            "NUMEXPR_NUM_THREADS": "6",
+            "VECLIB_MAXIMUM_THREADS": "6",
         }
 
 
@@ -229,7 +211,7 @@ def test_invalid_smoke_sampler_contract_fails_before_validation_or_logs(
 @pytest.mark.parametrize(
     ("kind", "logical_device", "physical_device", "expected"),
     [
-        ("cpu", "cpu", None, 4),
+        ("cpu", "cpu", None, 1),
         ("cuda", "cuda:0", "0", 1),
         ("mps", "mps", None, 1),
     ],
@@ -245,7 +227,7 @@ def test_resolved_accelerator_selects_exact_chain_worker_count(
 
 @pytest.mark.parametrize(
     ("kind", "logical_device", "requested"),
-    [("cpu", "cpu", 1), ("cuda", "cuda:0", 4), ("mps", "mps", 4)],
+    [("cpu", "cpu", 4), ("cuda", "cuda:0", 4), ("mps", "mps", 4)],
 )
 def test_explicit_chain_worker_mismatch_fails_before_model_launch(
     tmp_path, monkeypatch, kind, logical_device, requested
