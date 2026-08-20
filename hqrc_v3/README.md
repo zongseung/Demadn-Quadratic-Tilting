@@ -96,6 +96,10 @@ paper topology on this host. See the
 [two-model resource-gate report](../docs/superpowers/reports/2026-08-20-hqrc-two-model-four-chain-smoke.md).
 The earlier four-model measurement remains in its
 [historical report](../docs/superpowers/reports/2026-08-20-hqrc-four-model-four-chain-smoke.md).
+An experimental two-thread budget per chain reached only 28% host CPU
+(6.7 logical-core equivalents) while increasing committed memory to 31.68 GiB,
+so it was rejected and the checked-in chain budget remains one thread. See the
+[two-thread experiment report](../docs/superpowers/reports/2026-08-20-hqrc-two-model-four-chain-two-thread-smoke.md).
 
 Run the following commands from the repository root or linked worktree. The
 launchers perform a locked accelerator dependency sync before each action.
