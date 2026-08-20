@@ -1758,6 +1758,87 @@ def test_paper_v2_jitter_sampler_contract_is_identity_bound(approved_fold) -> No
         )
 
 
+def test_retry_sampler_contract_is_immutable_and_divergence_only() -> None:
+    base = loeo_publication_module.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        draws=None,
+        tune=None,
+        chains=None,
+    )
+    expected_base = {
+        "backend": "pymc",
+        "root_seed": 71,
+        "seed": loeo_contract_module.derive_loeo_seed(71, "H3-fold-sampler:seollal-2024"),
+        "draws": 1_000,
+        "tune": 1_000,
+        "chains": 4,
+        "cores": 1,
+        "target_accept": 0.99,
+        "profile": "paper",
+        "init": "adapt_diag",
+        "geometry": "noncentered-cyclic-hour-rw1-v1",
+    }
+    assert base == expected_base
+
+    retry = loeo_publication_module.retry_sampler_contract(
+        base,
+        variant="H3",
+        held_out_occurrence_id="seollal-2024",
+    )
+
+    assert base == expected_base
+    assert retry["target_accept"] == 0.999
+    assert retry["tune"] == 2_000
+    assert retry["seed"] == loeo_contract_module.derive_loeo_seed(
+        71, "H3-fold-sampler-retry-1:seollal-2024"
+    )
+    assert retry["seed"] != base["seed"]
+    for field in ("draws", "chains", "cores", "backend", "init"):
+        assert retry[field] == base[field]
+    assert retry["retry"] == {
+        "attempt": 1,
+        "reason": "divergence-only",
+        "base_sampler_sha256": loeo_contract_module.sha_json(base),
+    }
+
+    diagnostics = SamplingDiagnostics(1.02, 500.0, 450.0, 1)
+    failure = loeo_publication_module.retry_failure_payload(retry, diagnostics)
+    assert failure == {
+        "reason": "divergence-only",
+        "base_sampler_sha256": loeo_contract_module.sha_json(base),
+        "diagnostics": {
+            "max_rhat": 1.02,
+            "min_bulk_ess": 500.0,
+            "min_tail_ess": 450.0,
+            "divergences": 1,
+        },
+    }
+    assert loeo_publication_module.validate_retry_failure(retry, failure) is None
+    with pytest.raises(LOEOFoldError, match="retry|divergence"):
+        loeo_publication_module.retry_failure_payload(
+            retry, SamplingDiagnostics(1.02, 500.0, 450.0, 0)
+        )
+    with pytest.raises(LOEOFoldError, match="retry"):
+        loeo_publication_module.retry_failure_payload(base, diagnostics)
+
+    smoke = loeo_publication_module.sampler_contract(
+        "smoke",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        draws=20,
+        tune=20,
+        chains=2,
+    )
+    with pytest.raises(LOEOFoldError, match="paper"):
+        loeo_publication_module.retry_sampler_contract(
+            smoke,
+            variant="H3",
+            held_out_occurrence_id="seollal-2024",
+        )
+
+
 def test_namespace_rejects_intermediate_symlink_without_touching_external_target(
     approved_fold, tmp_path: Path
 ) -> None:

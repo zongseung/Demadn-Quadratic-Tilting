@@ -36,6 +36,7 @@ from hqrc_v3.bayes.samplers import (
     PYMC_INITIALIZATION,
     SAMPLER_GEOMETRY,
     SamplingDiagnostics,
+    SamplingError,
     validate_inference_data,
 )
 from hqrc_v3.correction_source import ValidatedCorrectionSource
@@ -75,6 +76,117 @@ COMPLETE_TOP = {
     *DOWNSTREAM_TOP,
     "COMPLETE",
 }
+
+
+def retryable_divergence(error: BaseException) -> SamplingDiagnostics | None:
+    """Return diagnostics only for an eligible paper divergence failure."""
+
+    if not isinstance(error, SamplingError):
+        return None
+    diagnostics = error.diagnostics
+    return diagnostics if diagnostics is not None and diagnostics.divergences > 0 else None
+
+
+def retry_sampler_contract(
+    base: Mapping[str, object], *, variant: str, held_out_occurrence_id: str
+) -> dict[str, object]:
+    """Derive the one permitted paper divergence retry without mutating its base."""
+
+    if variant not in {"H1", "H2", "H3"}:
+        raise LOEOFoldError("LOEO sampler variant must be H1, H2, or H3")
+    if base.get("profile") != "paper" or base.get("target_accept") != 0.99:
+        raise LOEOFoldError("LOEO retry requires a base paper sampler contract")
+    if "retry" in base:
+        raise LOEOFoldError("LOEO retry sampler cannot retry another retry")
+    tune = base.get("tune")
+    if isinstance(tune, bool) or not isinstance(tune, int) or tune <= 0:
+        raise LOEOFoldError("LOEO retry base sampler tune is invalid")
+    retry = dict(base)
+    retry.update(
+        {
+            "seed": derive_loeo_seed(
+                base["root_seed"], f"{variant}-fold-sampler-retry-1:{held_out_occurrence_id}"
+            ),
+            "tune": max(2_000, tune),
+            "target_accept": 0.999,
+            "retry": {
+                "attempt": 1,
+                "reason": "divergence-only",
+                "base_sampler_sha256": sha_json(base),
+            },
+        }
+    )
+    return retry
+
+
+def _retry_metadata(retry_sampler: Mapping[str, object]) -> Mapping[str, object]:
+    retry = retry_sampler.get("retry")
+    if (
+        not isinstance(retry, Mapping)
+        or set(retry) != {"attempt", "reason", "base_sampler_sha256"}
+        or retry.get("attempt") != 1
+        or retry.get("reason") != "divergence-only"
+        or not isinstance(retry.get("base_sampler_sha256"), str)
+        or len(retry["base_sampler_sha256"]) != 64
+    ):
+        raise LOEOFoldError("LOEO retry sampler contract is invalid")
+    return retry
+
+
+def _retry_diagnostics_payload(diagnostics: SamplingDiagnostics) -> dict[str, object]:
+    if not isinstance(diagnostics, SamplingDiagnostics) or diagnostics.divergences <= 0:
+        raise LOEOFoldError("LOEO retry requires divergence diagnostics")
+    values = {
+        "max_rhat": diagnostics.max_rhat,
+        "min_bulk_ess": diagnostics.min_bulk_ess,
+        "min_tail_ess": diagnostics.min_tail_ess,
+        "divergences": diagnostics.divergences,
+    }
+    if (
+        any(not math.isfinite(float(values[name])) for name in values if name != "divergences")
+        or isinstance(values["divergences"], bool)
+        or not isinstance(values["divergences"], int)
+    ):
+        raise LOEOFoldError("LOEO retry diagnostics are invalid")
+    return values
+
+
+def retry_failure_payload(
+    retry_sampler: Mapping[str, object], diagnostics: SamplingDiagnostics
+) -> dict[str, object]:
+    """Build the signed first-failure record required by a retry publication."""
+
+    retry = _retry_metadata(retry_sampler)
+    return {
+        "reason": "divergence-only",
+        "base_sampler_sha256": retry["base_sampler_sha256"],
+        "diagnostics": _retry_diagnostics_payload(diagnostics),
+    }
+
+
+def validate_retry_failure(retry_sampler: Mapping[str, object], retry_failure: object) -> None:
+    """Reject a retry manifest record unless it is a divergence-only first failure."""
+
+    retry = _retry_metadata(retry_sampler)
+    if (
+        not isinstance(retry_failure, Mapping)
+        or set(retry_failure) != {"reason", "base_sampler_sha256", "diagnostics"}
+        or retry_failure.get("reason") != "divergence-only"
+        or retry_failure.get("base_sampler_sha256") != retry["base_sampler_sha256"]
+        or not isinstance(retry_failure.get("diagnostics"), Mapping)
+    ):
+        raise LOEOFoldError("LOEO retry failure record is invalid")
+    diagnostics = retry_failure["diagnostics"]
+    if set(diagnostics) != {"max_rhat", "min_bulk_ess", "min_tail_ess", "divergences"}:
+        raise LOEOFoldError("LOEO retry failure diagnostics are invalid")
+    _retry_diagnostics_payload(
+        SamplingDiagnostics(
+            max_rhat=diagnostics["max_rhat"],
+            min_bulk_ess=diagnostics["min_bulk_ess"],
+            min_tail_ess=diagnostics["min_tail_ess"],
+            divergences=diagnostics["divergences"],
+        )
+    )
 
 
 def same_hqrc_data(left: HQRCData, right: HQRCData) -> bool:
@@ -151,13 +263,16 @@ def sampler_contract(
         else ("nutpie-default" if backend == "nutpie" else "pyro-default")
     )
     resolved_target_accept = 0.99 if profile == "paper" else 0.9
+    approved_target_accepts = {0.99, 0.999} if profile == "paper" else {0.9}
     if target_accept is not None and (
         isinstance(target_accept, bool)
         or not isinstance(target_accept, (int, float))
         or not math.isfinite(float(target_accept))
-        or float(target_accept) != resolved_target_accept
+        or float(target_accept) not in approved_target_accepts
     ):
         raise LOEOFoldError("LOEO target_accept differs from the approved profile setting")
+    if target_accept is not None:
+        resolved_target_accept = float(target_accept)
     contract: dict[str, object] = {
         "backend": backend,
         "root_seed": root_seed,

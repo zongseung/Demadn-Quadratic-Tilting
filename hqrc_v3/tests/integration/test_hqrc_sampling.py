@@ -10,6 +10,7 @@ import pymc as pm
 import pytest
 import torch
 
+import hqrc_v3._loeo_publication as loeo_publication_module
 import hqrc_v3.bayes.samplers as sampler_module
 from hqrc_v3.accelerators import DeviceProbe, ResolvedDevice
 from hqrc_v3.bayes.model import HQRCData
@@ -196,7 +197,9 @@ def test_sampler_records_requested_cores_and_rejects_invalid_values(tmp_path, mo
             sample_hqrc(data, approved, draws=2, tune=2, chains=2, cores=invalid)
 
 
-def test_sample_hqrc_records_explicit_jitter_initialization(tmp_path, monkeypatch):
+def test_sample_hqrc_allows_paper_target_accept_0999_with_jitter_initialization(
+    tmp_path, monkeypatch
+):
     data = HQRCData(
         observations=np.array([0.1, 0.2]),
         occurrence_index=np.array([0, 0]),
@@ -246,11 +249,11 @@ def test_sample_hqrc_records_explicit_jitter_initialization(tmp_path, monkeypatc
         chains=4,
         cores=2,
         init="jitter+adapt_diag",
-        target_accept=0.99,
+        target_accept=0.999,
         paper_profile=True,
     )
     assert captured["init"] == "jitter+adapt_diag"
-    assert captured["target_accept"] == 0.99
+    assert captured["target_accept"] == 0.999
     assert json.loads(idata.attrs["hqrc_sampler_json"])["init"] == "jitter+adapt_diag"
 
 
@@ -258,6 +261,38 @@ def test_paper_diagnostics_fail_closed_without_divergence_statistics():
     idata = az.from_dict(posterior={"phi": np.zeros((4, 8))})
     with pytest.raises(SamplingError, match="diverging"):
         validate_inference_data(idata, paper_profile=True)
+
+
+def test_paper_diagnostic_failure_preserves_exact_diagnostics_and_only_divergences_retry(
+    monkeypatch,
+):
+    expected = SamplingDiagnostics(1.02, 500.0, 450.0, 1)
+    monkeypatch.setattr(
+        sampler_module.az,
+        "summary",
+        lambda *_args, **_kwargs: {
+            "r_hat": np.array([expected.max_rhat]),
+            "ess_bulk": np.array([expected.min_bulk_ess]),
+            "ess_tail": np.array([expected.min_tail_ess]),
+        },
+    )
+    idata = az.from_dict(
+        posterior={"phi": np.zeros((4, 8))},
+        sample_stats={"diverging": np.array([[1]], dtype=np.int8)},
+    )
+
+    with pytest.raises(SamplingError) as raised:
+        validate_inference_data(idata, paper_profile=True)
+
+    assert raised.value.diagnostics == expected
+    assert loeo_publication_module.retryable_divergence(raised.value) is raised.value.diagnostics
+    assert loeo_publication_module.retryable_divergence(SamplingError("missing")) is None
+    assert (
+        loeo_publication_module.retryable_divergence(
+            SamplingError("rhat", diagnostics=SamplingDiagnostics(1.02, 500.0, 450.0, 0))
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("cores", [2, 3, 5])

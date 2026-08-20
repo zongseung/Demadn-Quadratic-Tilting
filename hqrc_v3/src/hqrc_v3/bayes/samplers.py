@@ -34,6 +34,10 @@ from hqrc_v3.diagnostics.ar import (
 class SamplingError(RuntimeError):
     """Raised when an unavailable sampler or paper-profile diagnostic gate fails."""
 
+    def __init__(self, message: str, *, diagnostics: SamplingDiagnostics | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
 
 PYMC_INITIALIZATION = "adapt_diag"
 PYMC_INITIALIZATION_CHOICES = frozenset({"adapt_diag", "jitter+adapt_diag"})
@@ -118,7 +122,7 @@ def validate_inference_data(idata: az.InferenceData, *, paper_profile: bool) -> 
         or diagnostics.min_tail_ess < 400
         or diagnostics.divergences
     ):
-        raise SamplingError(str(diagnostics))
+        raise SamplingError(str(diagnostics), diagnostics=diagnostics)
     return diagnostics
 
 
@@ -382,13 +386,15 @@ def sample_hqrc(
     started = time.perf_counter()
     resolved_target_accept = 0.99 if paper_profile else 0.9
     if target_accept is not None:
+        approved_target_accepts = {0.99, 0.999} if paper_profile else {0.9}
         if (
             isinstance(target_accept, bool)
             or not isinstance(target_accept, (int, float))
             or not math.isfinite(float(target_accept))
-            or float(target_accept) != resolved_target_accept
+            or float(target_accept) not in approved_target_accepts
         ):
             raise ValueError("target_accept differs from the approved profile setting")
+        resolved_target_accept = float(target_accept)
     resolved = None
     if backend == "pymc":
         import pymc as pm
