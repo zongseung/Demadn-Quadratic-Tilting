@@ -72,16 +72,14 @@ def test_cpu_two_logical_cpus_create_ordered_one_thread_queues():
     )
 
 
-def test_cpu_ten_logical_cpus_create_four_single_thread_model_queues():
+def test_cpu_ten_logical_cpus_cap_at_two_single_thread_model_queues():
     assert scheduler._cpu_queue_specs(PAPER_MODELS, logical_cpus=10) == (
-        (("lightgbm",), 1),
-        (("svr",), 1),
-        (("seq2seq_lstm",), 1),
-        (("transformer",), 1),
+        (("lightgbm", "seq2seq_lstm"), 1),
+        (("svr", "transformer"), 1),
     )
 
 
-def test_cpu_scheduler_runs_all_models_concurrently_with_even_thread_budgets(tmp_path, monkeypatch):
+def test_cpu_scheduler_caps_at_two_ordered_one_thread_queues(tmp_path, monkeypatch):
     request = _request(tmp_path, accelerator="cpu")
     _validated(monkeypatch)
     monkeypatch.setattr(
@@ -90,50 +88,6 @@ def test_cpu_scheduler_runs_all_models_concurrently_with_even_thread_budgets(tmp
         lambda *_args, **_kwargs: scheduler._ResolvedAccelerator("cpu", "cpu", None, "probe", None),
     )
     monkeypatch.setattr(scheduler.os, "cpu_count", lambda: 24)
-    all_started = threading.Barrier(4)
-    jobs = {}
-
-    def run_job(job):
-        jobs[job.model] = job
-        job.log_path.parent.mkdir(parents=True, exist_ok=True)
-        job.log_path.write_text(f"{job.model}\n")
-        all_started.wait(timeout=2)
-        return scheduler._JobOutcome(job, 0)
-
-    monkeypatch.setattr(scheduler, "_run_job", run_job)
-    result = run_accelerated_loeo(request)
-
-    assert result.completed_models == PAPER_MODELS
-    assert set(jobs) == set(PAPER_MODELS)
-    for job in jobs.values():
-        assert _command_option(job.command, "--cores") == "4"
-        assert {
-            name: job.environment[name]
-            for name in (
-                "OMP_NUM_THREADS",
-                "MKL_NUM_THREADS",
-                "OPENBLAS_NUM_THREADS",
-                "NUMEXPR_NUM_THREADS",
-                "VECLIB_MAXIMUM_THREADS",
-            )
-        } == {
-            "OMP_NUM_THREADS": "1",
-            "MKL_NUM_THREADS": "1",
-            "OPENBLAS_NUM_THREADS": "1",
-            "NUMEXPR_NUM_THREADS": "1",
-            "VECLIB_MAXIMUM_THREADS": "1",
-        }
-
-
-def test_cpu_scheduler_under_provisioning_uses_two_ordered_one_thread_queues(tmp_path, monkeypatch):
-    request = _request(tmp_path, accelerator="cpu")
-    _validated(monkeypatch)
-    monkeypatch.setattr(
-        scheduler,
-        "_preflight_accelerator",
-        lambda *_args, **_kwargs: scheduler._ResolvedAccelerator("cpu", "cpu", None, "probe", None),
-    )
-    monkeypatch.setattr(scheduler.os, "cpu_count", lambda: 2)
     first_jobs_started = threading.Barrier(2)
     first_jobs_finished = {model: threading.Event() for model in ("lightgbm", "svr")}
     lock = threading.Lock()

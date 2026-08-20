@@ -79,20 +79,23 @@ runs `lightgbm` then `seq2seq_lstm`, while physical GPU 1 runs `svr` then
 `transformer`. The two model workers run concurrently, but every model fit
 runs its four NUTS chains sequentially inside its worker.
 
-CPU selection runs up to four model workers concurrently and gives each model
-four spawned, single-threaded Pyro chain processes. On the target Core i7-13700
-host this is `4 models x 4 chains x 1 thread`, matching its 16 physical cores;
-all OpenMP, MKL, OpenBLAS, NumExpr, and VecLib thread caps are `1`. Before a
-paper run, use the four-model smoke and require peak committed memory below
-28 GiB on the 32 GiB host with no sustained paging. CPU parallel results use
+CPU selection runs at most two model workers concurrently and gives each model
+four spawned, single-threaded Pyro chain processes. All four models remain in
+scope: one queue runs `lightgbm` then `seq2seq_lstm`, while the other runs `svr`
+then `transformer`. On the target Core i7-13700 host this is at most
+`2 models x 4 chains x 1 thread`; all OpenMP, MKL, OpenBLAS, NumExpr, and VecLib
+thread caps are `1`. Before a paper run, use the two-model smoke and require peak
+committed memory below 28 GiB on the 32 GiB host with no sustained paging. CPU parallel results use
 `cores=4` in their immutable identity and cannot reuse sequential `cores=1`
 posteriors, so use a new output root. Platform defaults remain CUDA on Windows
 and Linux, and `auto` on macOS.
 
-The measured 2026-08-20 smoke on the 31.77 GiB target host reached 31.20 GiB
-committed memory and failed that gate. Do not start the four-model/four-chain
-paper run on this host. See the
-[resource-gate report](../docs/superpowers/reports/2026-08-20-hqrc-four-model-four-chain-smoke.md).
+The measured 2026-08-20 two-model/four-chain smoke on the 31.77 GiB target host
+reached 31.27 GiB committed memory and failed that gate. Do not start this CPU
+paper topology on this host. See the
+[two-model resource-gate report](../docs/superpowers/reports/2026-08-20-hqrc-two-model-four-chain-smoke.md).
+The earlier four-model measurement remains in its
+[historical report](../docs/superpowers/reports/2026-08-20-hqrc-four-model-four-chain-smoke.md).
 
 Run the following commands from the repository root or linked worktree. The
 launchers perform a locked accelerator dependency sync before each action.
@@ -215,8 +218,8 @@ The macOS launcher uses `--accelerator auto`. On Apple Silicon, `auto` selects
 MPS only after the HQRC float64/LKJ/AR gradient capability probe succeeds. If
 MPS is unavailable or fails that probe, the scheduler selects CPU and records
 the fallback reason. MPS executes the four models sequentially. Any resolved
-CPU path, including automatic MPS/CUDA fallback, uses the four-model/four-chain
-process topology when at least four model queues are available.
+CPU path, including automatic MPS/CUDA fallback, uses at most two model queues
+with four chain processes per active model.
 
 ```bash
 SOURCE_ROOT="$(if [ -f artifacts.zip ]; then pwd -P; else cd ../.. && pwd -P; fi)"

@@ -120,7 +120,7 @@ def _cpu_queue_specs(
     models: tuple[str, ...], logical_cpus: int | None = None
 ) -> tuple[tuple[tuple[str, ...], int], ...]:
     available = max(1, logical_cpus if logical_cpus is not None else (os.cpu_count() or 1))
-    worker_count = min(len(models), available)
+    worker_count = min(len(models), available, 2)
     if not worker_count:
         return ()
     return tuple((tuple(models[index::worker_count]), 1) for index in range(worker_count))
