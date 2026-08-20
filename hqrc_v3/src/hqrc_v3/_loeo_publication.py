@@ -78,13 +78,34 @@ COMPLETE_TOP = {
 }
 
 
+def _eligible_divergence_diagnostics(diagnostics: object) -> bool:
+    if not isinstance(diagnostics, SamplingDiagnostics):
+        return False
+    continuous = (diagnostics.max_rhat, diagnostics.min_bulk_ess, diagnostics.min_tail_ess)
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        for value in continuous
+    ):
+        return False
+    return (
+        not isinstance(diagnostics.divergences, bool)
+        and isinstance(diagnostics.divergences, int)
+        and diagnostics.divergences > 0
+        and diagnostics.max_rhat <= 1.01
+        and diagnostics.min_bulk_ess >= 400
+        and diagnostics.min_tail_ess >= 400
+    )
+
+
 def retryable_divergence(error: BaseException) -> SamplingDiagnostics | None:
     """Return diagnostics only for an eligible paper divergence failure."""
 
     if not isinstance(error, SamplingError):
         return None
     diagnostics = error.diagnostics
-    return diagnostics if diagnostics is not None and diagnostics.divergences > 0 else None
+    return diagnostics if _eligible_divergence_diagnostics(diagnostics) else None
 
 
 def retry_sampler_contract(
@@ -139,24 +160,14 @@ def _retry_metadata(retry_sampler: Mapping[str, object]) -> Mapping[str, object]
 
 
 def _retry_diagnostics_payload(diagnostics: SamplingDiagnostics) -> dict[str, object]:
-    if not isinstance(diagnostics, SamplingDiagnostics):
-        raise LOEOFoldError("LOEO retry requires divergence diagnostics")
+    if not _eligible_divergence_diagnostics(diagnostics):
+        raise LOEOFoldError("LOEO retry diagnostics are not divergence-only")
     values = {
         "max_rhat": diagnostics.max_rhat,
         "min_bulk_ess": diagnostics.min_bulk_ess,
         "min_tail_ess": diagnostics.min_tail_ess,
         "divergences": diagnostics.divergences,
     }
-    if isinstance(values["divergences"], bool) or not isinstance(values["divergences"], int):
-        raise LOEOFoldError("LOEO retry diagnostics are invalid")
-    if values["divergences"] <= 0:
-        raise LOEOFoldError("LOEO retry requires divergence diagnostics")
-    try:
-        valid = all(math.isfinite(float(values[name])) for name in values if name != "divergences")
-    except (TypeError, ValueError, OverflowError):
-        valid = False
-    if not valid:
-        raise LOEOFoldError("LOEO retry diagnostics are invalid")
     return values
 
 
@@ -272,7 +283,7 @@ def sampler_contract(
         else ("nutpie-default" if backend == "nutpie" else "pyro-default")
     )
     resolved_target_accept = 0.99 if profile == "paper" else 0.9
-    approved_target_accepts = {0.99, 0.999} if profile == "paper" else {0.9}
+    approved_target_accepts = {0.99} if profile == "paper" else {0.9}
     if target_accept is not None and (
         isinstance(target_accept, bool)
         or not isinstance(target_accept, (int, float))

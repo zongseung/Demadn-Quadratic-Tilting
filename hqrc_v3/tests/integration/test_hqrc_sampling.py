@@ -266,7 +266,7 @@ def test_paper_diagnostics_fail_closed_without_divergence_statistics():
 def test_paper_diagnostic_failure_preserves_exact_diagnostics_and_only_divergences_retry(
     monkeypatch,
 ):
-    expected = SamplingDiagnostics(1.02, 500.0, 450.0, 1)
+    expected = SamplingDiagnostics(1.01, 500.0, 450.0, 1)
     monkeypatch.setattr(
         sampler_module.az,
         "summary",

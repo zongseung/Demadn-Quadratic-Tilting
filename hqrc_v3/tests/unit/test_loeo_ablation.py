@@ -325,6 +325,70 @@ def _paper_ablation_kwargs(tmp_path: Path, variant: str) -> dict[str, object]:
     }
 
 
+def _published_ablation_folds(
+    approved_fold,
+    root: Path,
+    variant: str,
+    *,
+    retry_index: int | None = None,
+) -> tuple[Path, ...]:
+    source, publication, approved = approved_fold
+    directories = []
+    for index, held_out in enumerate(publication.occurrence_ids):
+        base = fold_contract.sampler_contract(
+            "paper",
+            root_seed=71,
+            held_out_occurrence_id=held_out,
+            variant=variant,
+            draws=1_000,
+            tune=1_000,
+            chains=4,
+            cores=1,
+        )
+        sampler = (
+            fold_contract.retry_sampler_contract(
+                base, variant=variant, held_out_occurrence_id=held_out
+            )
+            if index == retry_index
+            else base
+        )
+        identity = ablation_module._fold_identity(
+            source,
+            publication,
+            approved,
+            held_out=held_out,
+            variant=variant,
+            sampler=sampler,
+        )
+        directory = root / held_out
+
+        def write(temporary: Path) -> None:
+            (temporary / "posterior.nc").write_bytes(b"posterior")
+            _ablation_products().hourly_predictions.write_parquet(
+                temporary / "hourly_predictions.parquet"
+            )
+            _ablation_products().metrics.write_parquet(temporary / "metrics.parquet")
+            ablation_module._write_json(
+                temporary / "posterior_summary.json", {"summary": "test"}
+            )
+
+        ablation_module._publish_directory(
+            directory,
+            identity=identity,
+            files=ablation_module._FOLD_FILES,
+            writer=write,
+            retry_failure=(
+                fold_contract.retry_failure_payload(
+                    sampler, SamplingDiagnostics(1.01, 400.0, 400.0, 1)
+                )
+                if index == retry_index
+                else None
+            ),
+        )
+        directories.append(directory)
+    return tuple(directories)
+
+
 def test_aggregate_publication_allows_primary_identity_without_sampler(tmp_path: Path) -> None:
     directory = tmp_path / "primary"
     identity = {
@@ -354,6 +418,155 @@ def test_aggregate_publication_allows_primary_identity_without_sampler(tmp_path:
     )
 
 
+def test_mixed_ablation_aggregate_records_ordered_validated_fold_references(
+    approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    fold_dirs = _published_ablation_folds(approved_fold, tmp_path / "folds", "H1", retry_index=3)
+    by_held = dict(zip(publication.occurrence_ids, fold_dirs, strict=True))
+    monkeypatch.setattr(
+        ablation_module,
+        "_fit_fold",
+        lambda *_args, **kwargs: (by_held[kwargs["held_out"]], 0, True),
+    )
+    monkeypatch.setattr(
+        ablation_module,
+        "_aggregate_products",
+        lambda *_args, **_kwargs: (
+            pl.DataFrame({"hour": [0]}),
+            pl.DataFrame({"event": ["seollal-2024"]}),
+            pl.DataFrame({"group": ["pooled"]}),
+        ),
+    )
+
+    result = ablation_module.fit_loeo_ablation(
+        source,
+        publication,
+        approved,
+        variant="H1",
+        held_out_occurrence_ids=publication.occurrence_ids,
+        root_seed=71,
+        profile="paper",
+        draws=1_000,
+        tune=1_000,
+        chains=4,
+        cores=1,
+        output_root=(tmp_path / "aggregate").resolve(),
+    )
+
+    identity = json.loads((result.output_dir / "manifest.json").read_bytes())["identity"]
+    assert [reference["held_out_occurrence_id"] for reference in identity["folds"]] == list(
+        publication.occurrence_ids
+    )
+    for held_out, directory, reference in zip(
+        publication.occurrence_ids, fold_dirs, identity["folds"], strict=True
+    ):
+        manifest = json.loads((directory / "manifest.json").read_bytes())
+        assert reference == {
+            "held_out_occurrence_id": held_out,
+            "output_dir": directory.resolve().as_posix(),
+            "identity_sha256": fold_contract.sha_json(manifest["identity"]),
+            "manifest_sha256": file_sha256(directory / "manifest.json"),
+            "manifest_digest": manifest["manifest_digest"],
+            "sampler": manifest["identity"]["sampler"],
+        }
+
+
+def test_all_base_ablation_aggregate_identity_remains_byte_compatible(
+    approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    fold_dirs = _published_ablation_folds(approved_fold, tmp_path / "folds", "H2")
+    by_held = dict(zip(publication.occurrence_ids, fold_dirs, strict=True))
+    monkeypatch.setattr(
+        ablation_module,
+        "_fit_fold",
+        lambda *_args, **kwargs: (by_held[kwargs["held_out"]], 0, True),
+    )
+    monkeypatch.setattr(
+        ablation_module,
+        "_aggregate_products",
+        lambda *_args, **_kwargs: (
+            pl.DataFrame({"hour": [0]}),
+            pl.DataFrame({"event": ["seollal-2024"]}),
+            pl.DataFrame({"group": ["pooled"]}),
+        ),
+    )
+
+    result = ablation_module.fit_loeo_ablation(
+        source,
+        publication,
+        approved,
+        variant="H2",
+        held_out_occurrence_ids=publication.occurrence_ids,
+        root_seed=71,
+        profile="paper",
+        draws=1_000,
+        tune=1_000,
+        chains=4,
+        cores=1,
+        output_root=(tmp_path / "aggregate").resolve(),
+    )
+
+    identity = json.loads((result.output_dir / "manifest.json").read_bytes())["identity"]
+    assert identity == {
+        "schema_version": 1,
+        "evaluation": "retrospective-loeo-ablation-primary",
+        "causal": False,
+        "variant": "H2",
+        "context": {
+            "model": publication.context.model,
+            "feature_set": publication.context.feature_set,
+            "seed": publication.context.seed,
+        },
+        "selected_occurrence_ids": list(publication.occurrence_ids),
+        "root_seed": 71,
+        "fold_manifest_sha256": [file_sha256(path / "manifest.json") for path in fold_dirs],
+    }
+
+
+def test_mixed_ablation_aggregate_rejects_a_tampered_fold_manifest(
+    approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    fold_dirs = _published_ablation_folds(approved_fold, tmp_path / "folds", "H1", retry_index=3)
+    manifest_path = fold_dirs[0] / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["manifest_digest"] = "0" * 64
+    ablation_module._write_json(manifest_path, manifest)
+    by_held = dict(zip(publication.occurrence_ids, fold_dirs, strict=True))
+    monkeypatch.setattr(
+        ablation_module,
+        "_fit_fold",
+        lambda *_args, **kwargs: (by_held[kwargs["held_out"]], 0, True),
+    )
+    monkeypatch.setattr(
+        ablation_module,
+        "_aggregate_products",
+        lambda *_args, **_kwargs: (
+            pl.DataFrame({"hour": [0]}),
+            pl.DataFrame({"event": ["seollal-2024"]}),
+            pl.DataFrame({"group": ["pooled"]}),
+        ),
+    )
+
+    with pytest.raises(ablation_module.LOEOAblationError, match="manifest digest"):
+        ablation_module.fit_loeo_ablation(
+            source,
+            publication,
+            approved,
+            variant="H1",
+            held_out_occurrence_ids=publication.occurrence_ids,
+            root_seed=71,
+            profile="paper",
+            draws=1_000,
+            tune=1_000,
+            chains=4,
+            cores=1,
+            output_root=(tmp_path / "aggregate").resolve(),
+        )
+
+
 @pytest.mark.parametrize("variant", ["H1", "H2"])
 def test_ablation_retries_paper_divergence_once_with_signed_provenance_and_reuses_retry(
     variant: str,
@@ -363,7 +576,7 @@ def test_ablation_retries_paper_divergence_once_with_signed_provenance_and_reuse
 ) -> None:
     source, publication, approved = approved_fold
     calls: list[dict[str, object]] = []
-    diagnostics = SamplingDiagnostics(1.02, 500.0, 450.0, 3)
+    diagnostics = SamplingDiagnostics(1.01, 500.0, 450.0, 3)
 
     def sample(*_args, **kwargs):
         calls.append(kwargs)
@@ -412,7 +625,7 @@ def test_ablation_retries_paper_divergence_once_with_signed_provenance_and_reuse
         "reason": "divergence-only",
         "base_sampler_sha256": fold_contract.sha_json(base_sampler),
         "diagnostics": {
-            "max_rhat": 1.02,
+            "max_rhat": 1.01,
             "min_bulk_ess": 500.0,
             "min_tail_ess": 450.0,
             "divergences": 3,
@@ -490,7 +703,7 @@ def test_ablation_prefers_a_valid_base_publication_over_retry(
         files=ablation_module._FOLD_FILES,
         writer=write,
         retry_failure=fold_contract.retry_failure_payload(
-            retry_sampler, SamplingDiagnostics(1.02, 500.0, 450.0, 1)
+            retry_sampler, SamplingDiagnostics(1.01, 500.0, 450.0, 1)
         ),
     )
     monkeypatch.setattr(
@@ -555,7 +768,7 @@ def test_ablation_propagates_retry_failure_after_exactly_two_attempts(
     def sample(*_args, **_kwargs):
         nonlocal calls
         calls += 1
-        raise SamplingError("divergences", diagnostics=SamplingDiagnostics(1.02, 500.0, 450.0, 1))
+        raise SamplingError("divergences", diagnostics=SamplingDiagnostics(1.01, 500.0, 450.0, 1))
 
     monkeypatch.setattr(ablation_module, "sample_hqrc", sample)
 

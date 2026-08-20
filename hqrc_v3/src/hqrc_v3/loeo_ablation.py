@@ -583,6 +583,30 @@ def _aggregate_products(
     return hourly, per_event, pl.DataFrame(aggregate_rows)
 
 
+def _aggregate_fold_reference(directory: Path, held_out: str) -> dict[str, object]:
+    manifest = _read_json(directory / "manifest.json", "ablation fold manifest")
+    identity = manifest.get("identity")
+    if not isinstance(identity, Mapping):
+        raise LOEOAblationError("ablation fold identity differs")
+    _validate_complete(directory, identity=identity, files=_FOLD_FILES)
+    loeo = identity.get("loeo")
+    sampler = identity.get("sampler")
+    if (
+        not isinstance(loeo, Mapping)
+        or loeo.get("held_out_occurrence_id") != held_out
+        or not isinstance(sampler, Mapping)
+    ):
+        raise LOEOAblationError("ablation fold identity differs")
+    return {
+        "held_out_occurrence_id": held_out,
+        "output_dir": directory.resolve().as_posix(),
+        "identity_sha256": sha_json(identity),
+        "manifest_sha256": file_sha256(directory / "manifest.json"),
+        "manifest_digest": manifest["manifest_digest"],
+        "sampler": dict(sampler),
+    }
+
+
 def fit_loeo_ablation(
     source: ValidatedCorrectionSource,
     publication: LOEOPublication,
@@ -638,7 +662,11 @@ def fit_loeo_ablation(
         fit_count += fitted
         all_reused = all_reused and reused
     context = publication.context
-    fold_manifest_hashes = [file_sha256(path / "manifest.json") for path in fold_dirs]
+    fold_references = [
+        _aggregate_fold_reference(path, held_out)
+        for path, held_out in zip(fold_dirs, held_out_occurrence_ids, strict=True)
+    ]
+    fold_manifest_hashes = [reference["manifest_sha256"] for reference in fold_references]
     identity: dict[str, object] = {
         "schema_version": 1,
         "evaluation": "retrospective-loeo-ablation-primary",
@@ -653,6 +681,8 @@ def fit_loeo_ablation(
         "root_seed": root_seed,
         "fold_manifest_sha256": fold_manifest_hashes,
     }
+    if any("retry" in reference["sampler"] for reference in fold_references):
+        identity["folds"] = fold_references
     primary = (
         Path(output_root)
         / f"loeo-ablation-primary-{selected_variant.lower()}"

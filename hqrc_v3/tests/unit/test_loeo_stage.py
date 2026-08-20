@@ -1831,6 +1831,17 @@ def test_paper_v2_jitter_sampler_contract_is_identity_bound(approved_fold) -> No
             cores=4,
             target_accept=0.95,
         )
+    with pytest.raises(LOEOFoldError, match="target_accept"):
+        loeo_publication_module.sampler_contract(
+            "paper",
+            root_seed=71,
+            held_out_occurrence_id="seollal-2024",
+            draws=5000,
+            tune=5000,
+            chains=4,
+            cores=4,
+            target_accept=0.999,
+        )
 
 
 def test_retry_sampler_contract_is_immutable_and_divergence_only() -> None:
@@ -1878,13 +1889,13 @@ def test_retry_sampler_contract_is_immutable_and_divergence_only() -> None:
         "base_sampler_sha256": loeo_contract_module.sha_json(base),
     }
 
-    diagnostics = SamplingDiagnostics(1.02, 500.0, 450.0, 1)
+    diagnostics = SamplingDiagnostics(1.01, 500.0, 450.0, 1)
     failure = loeo_publication_module.retry_failure_payload(retry, diagnostics)
     assert failure == {
         "reason": "divergence-only",
         "base_sampler_sha256": loeo_contract_module.sha_json(base),
         "diagnostics": {
-            "max_rhat": 1.02,
+            "max_rhat": 1.01,
             "min_bulk_ess": 500.0,
             "min_tail_ess": 450.0,
             "divergences": 1,
@@ -1893,7 +1904,7 @@ def test_retry_sampler_contract_is_immutable_and_divergence_only() -> None:
     assert loeo_publication_module.validate_retry_failure(retry, failure) is None
     with pytest.raises(LOEOFoldError, match="retry|divergence"):
         loeo_publication_module.retry_failure_payload(
-            retry, SamplingDiagnostics(1.02, 500.0, 450.0, 0)
+            retry, SamplingDiagnostics(1.01, 500.0, 450.0, 0)
         )
     with pytest.raises(LOEOFoldError, match="retry"):
         loeo_publication_module.retry_failure_payload(base, diagnostics)
@@ -1912,6 +1923,97 @@ def test_retry_sampler_contract_is_immutable_and_divergence_only() -> None:
             variant="H3",
             held_out_occurrence_id="seollal-2024",
         )
+
+
+def test_divergence_retry_accepts_exact_diagnostic_boundaries_for_live_and_signed_data() -> None:
+    diagnostics = SamplingDiagnostics(1.01, 400.0, 400.0, 1)
+    error = SamplingError("divergences", diagnostics=diagnostics)
+    base = loeo_publication_module.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        draws=None,
+        tune=None,
+        chains=None,
+    )
+    retry = loeo_publication_module.retry_sampler_contract(
+        base, variant="H3", held_out_occurrence_id="seollal-2024"
+    )
+
+    assert loeo_publication_module.retryable_divergence(error) is diagnostics
+    failure = loeo_publication_module.retry_failure_payload(retry, diagnostics)
+    assert loeo_publication_module.validate_retry_failure(retry, failure) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_rhat", 1.0100001),
+        ("min_bulk_ess", 399.999),
+        ("min_tail_ess", 399.999),
+        ("divergences", 0),
+    ],
+)
+def test_divergence_retry_rejects_each_non_divergence_diagnostic_failure(
+    field: str, value: object
+) -> None:
+    diagnostics = replace(
+        SamplingDiagnostics(1.01, 400.0, 400.0, 1),
+        **{field: value},
+    )
+    error = SamplingError("diagnostics", diagnostics=diagnostics)
+    base = loeo_publication_module.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        draws=None,
+        tune=None,
+        chains=None,
+    )
+    retry = loeo_publication_module.retry_sampler_contract(
+        base, variant="H3", held_out_occurrence_id="seollal-2024"
+    )
+    failure = {
+        "reason": "divergence-only",
+        "base_sampler_sha256": retry["retry"]["base_sampler_sha256"],
+        "diagnostics": asdict(diagnostics),
+    }
+
+    assert loeo_publication_module.retryable_divergence(error) is None
+    with pytest.raises(LOEOFoldError, match="diagnostics"):
+        loeo_publication_module.validate_retry_failure(retry, failure)
+
+
+@pytest.mark.parametrize("field", ["max_rhat", "min_bulk_ess", "min_tail_ess", "divergences"])
+@pytest.mark.parametrize("value", [True, "1", float("nan"), float("inf")])
+def test_divergence_retry_rejects_non_finite_and_non_numeric_diagnostic_values(
+    field: str, value: object
+) -> None:
+    diagnostics = replace(
+        SamplingDiagnostics(1.01, 400.0, 400.0, 1),
+        **{field: value},
+    )
+    error = SamplingError("diagnostics", diagnostics=diagnostics)
+    base = loeo_publication_module.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        draws=None,
+        tune=None,
+        chains=None,
+    )
+    retry = loeo_publication_module.retry_sampler_contract(
+        base, variant="H3", held_out_occurrence_id="seollal-2024"
+    )
+    failure = {
+        "reason": "divergence-only",
+        "base_sampler_sha256": retry["retry"]["base_sampler_sha256"],
+        "diagnostics": asdict(diagnostics),
+    }
+
+    assert loeo_publication_module.retryable_divergence(error) is None
+    with pytest.raises(LOEOFoldError, match="diagnostics"):
+        loeo_publication_module.validate_retry_failure(retry, failure)
 
 
 def test_retry_sampler_contract_rejects_a_base_for_another_variant_or_fold() -> None:
@@ -1936,7 +2038,7 @@ def test_retry_sampler_contract_rejects_a_base_for_another_variant_or_fold() -> 
 @pytest.mark.parametrize(
     "diagnostics",
     [
-        {"max_rhat": 1.02, "min_bulk_ess": 500.0, "min_tail_ess": 450.0, "divergences": "1"},
+        {"max_rhat": 1.01, "min_bulk_ess": 500.0, "min_tail_ess": 450.0, "divergences": "1"},
         {"max_rhat": None, "min_bulk_ess": 500.0, "min_tail_ess": 450.0, "divergences": 1},
     ],
 )
@@ -2006,7 +2108,7 @@ def test_h3_divergence_retry_publishes_signed_failure_and_reuses_without_base_re
     approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source, publication, approved = approved_fold
-    diagnostics = SamplingDiagnostics(1.02, 500.0, 450.0, 3)
+    diagnostics = SamplingDiagnostics(1.01, 500.0, 450.0, 3)
     calls = _install_paper_retry_sampler(
         monkeypatch,
         source,
@@ -2038,7 +2140,7 @@ def test_h3_divergence_retry_publishes_signed_failure_and_reuses_without_base_re
         "reason": "divergence-only",
         "base_sampler_sha256": loeo_contract_module.sha_json(base_sampler),
         "diagnostics": {
-            "max_rhat": 1.02,
+            "max_rhat": 1.01,
             "min_bulk_ess": 500.0,
             "min_tail_ess": 450.0,
             "divergences": 3,
@@ -2067,7 +2169,7 @@ def test_h3_divergence_retry_prefers_valid_base_over_valid_retry(
         [
             SamplingError(
                 "divergences",
-                diagnostics=SamplingDiagnostics(1.02, 500.0, 450.0, 1),
+                diagnostics=SamplingDiagnostics(1.01, 500.0, 450.0, 1),
             ),
             None,
         ],
@@ -2130,7 +2232,7 @@ def test_h3_divergence_retry_propagates_retry_failure_after_two_attempts(
 ) -> None:
     source, publication, approved = approved_fold
     failure = SamplingError(
-        "divergences", diagnostics=SamplingDiagnostics(1.02, 500.0, 450.0, 1)
+        "divergences", diagnostics=SamplingDiagnostics(1.01, 500.0, 450.0, 1)
     )
     calls = _install_paper_retry_sampler(
         monkeypatch, source, publication, approved, [failure, failure]
@@ -2159,7 +2261,7 @@ def test_h3_retry_manifest_rejects_resigned_malformed_failure_provenance(
         [
             SamplingError(
                 "divergences",
-                diagnostics=SamplingDiagnostics(1.02, 500.0, 450.0, 1),
+                diagnostics=SamplingDiagnostics(1.01, 500.0, 450.0, 1),
             ),
             None,
         ],

@@ -123,14 +123,16 @@ def _matrix_identity(
     selected_occurrence_ids: tuple[str, ...],
     root_seed: int,
     profile: str,
+    draws: int | None = None,
+    tune: int | None = None,
+    chains: int | None = None,
+    cores: int | None = None,
+    init: str | None = None,
+    target_accept: float | None = None,
+    backend: str = "pymc",
+    device: str = "cpu",
 ) -> dict[str, object]:
     first = dict(materials[0].identity)
-    base_template = next(
-        (dict(material.sampler) for material in materials if "retry" not in material.sampler),
-        None,
-    )
-    if base_template is None:
-        raise LOEOPrimaryError("LOEO primary requires one recorded base sampler setting")
     common_keys = ("source", "context", "model")
     for material in materials:
         identity = dict(material.identity)
@@ -140,14 +142,14 @@ def _matrix_identity(
             profile,
             root_seed=root_seed,
             held_out_occurrence_id=held,
-            draws=int(base_template["draws"]),
-            tune=int(base_template["tune"]),
-            chains=int(base_template["chains"]),
-            cores=int(base_template["cores"]),
-            init=(str(base_template["init"]) if base_template["backend"] == "pymc" else None),
-            target_accept=float(base_template["target_accept"]),
-            backend=str(base_template["backend"]),
-            device=str(base_template.get("logical_device", "cpu")),
+            draws=draws,
+            tune=tune,
+            chains=chains,
+            cores=cores,
+            init=init,
+            target_accept=target_accept,
+            backend=backend,
+            device=device,
         )
         candidates = [base]
         if profile == "paper" and base["target_accept"] == 0.99:
@@ -305,6 +307,14 @@ def fit_loeo_primary(
             selected_occurrence_ids=selected,
             root_seed=root_seed,
             profile=profile,
+            draws=draws,
+            tune=tune,
+            chains=chains,
+            cores=cores,
+            init=init,
+            target_accept=target_accept,
+            backend=backend,
+            device=device,
         )
         matrix_namespace = matrix_publication_io.namespace(
             Path(output_root),

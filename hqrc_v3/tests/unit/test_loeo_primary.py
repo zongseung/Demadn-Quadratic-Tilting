@@ -32,7 +32,9 @@ base_source = base_source_fixture
 source = source_fixture
 
 
-def _fake_material(approved_fold, held_out: str, root: Path) -> LOEOFoldMaterial:
+def _fake_material(
+    approved_fold, held_out: str, root: Path, *, backend: str = "pymc"
+) -> LOEOFoldMaterial:
     source, publication, approved = approved_fold
     inputs = prepare_loeo_fold_inputs(
         source, publication, approved, held_out_occurrence_id=held_out
@@ -44,6 +46,7 @@ def _fake_material(approved_fold, held_out: str, root: Path) -> LOEOFoldMaterial
         draws=4,
         tune=3,
         chains=2,
+        backend=backend,
     )
     identity = fold_publication_module.input_identity(inputs, sampler)
     idata = _fake_idata(
@@ -139,7 +142,7 @@ def _paper_material(
     if retry:
         unsigned["retry_failure"] = fold_publication_module.retry_failure_payload(
             sampler,
-            SamplingDiagnostics(1.02, 500.0, 450.0, 1),
+            SamplingDiagnostics(1.01, 500.0, 450.0, 1),
         )
     return replace(
         material,
@@ -248,6 +251,27 @@ def test_matrix_identity_accepts_one_exact_retry_and_records_each_effective_samp
             )
         ),
     }
+
+
+def test_matrix_identity_accepts_all_retry_folds_from_requested_sampler_settings(
+    approved_fold, tmp_path: Path
+) -> None:
+    _, publication, _ = approved_fold
+    selected = publication.occurrence_ids
+    materials = tuple(
+        _paper_material(approved_fold, held, tmp_path, retry=True) for held in selected
+    )
+
+    identity = primary_module._matrix_identity(
+        materials,
+        selected_occurrence_ids=selected,
+        root_seed=71,
+        profile="paper",
+    )
+
+    assert [fold["sampler"] for fold in identity["folds"]] == [
+        dict(material.sampler) for material in materials
+    ]
 
 
 def test_matrix_identity_rejects_each_mutated_retry_contract(
@@ -468,7 +492,10 @@ def test_fake_ten_fold_matrix_calls_only_reviewed_kernel_and_aggregates_exactly(
 ) -> None:
     source, publication, approved = approved_fold
     selected = publication.occurrence_ids
-    materials = {held: _fake_material(approved_fold, held, tmp_path) for held in selected}
+    materials = {
+        held: _fake_material(approved_fold, held, tmp_path, backend="nutpie")
+        for held in selected
+    }
     calls = _install_fake_matrix_kernel(monkeypatch, materials)
     result = fit_loeo_primary(
         source,
