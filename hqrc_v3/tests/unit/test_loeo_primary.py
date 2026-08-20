@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ import hqrc_v3._loeo_publication as fold_publication_module
 import hqrc_v3.loeo_primary as primary_module
 from hqrc_v3._loeo_contract import sha_json
 from hqrc_v3._loeo_types import LOEOFoldMaterial, LOEOFoldResult
+from hqrc_v3.bayes.samplers import SamplingDiagnostics
 from hqrc_v3.loeo_primary import LOEOPrimaryError, fit_loeo_primary
 from hqrc_v3.loeo_stage import generate_loeo_fold_products, prepare_loeo_fold_inputs
 
@@ -103,6 +105,50 @@ def _fake_material(approved_fold, held_out: str, root: Path) -> LOEOFoldMaterial
     return LOEOFoldMaterial(result, inputs, identity, sampler, products, manifest, idata)
 
 
+def _paper_material(
+    approved_fold,
+    held_out: str,
+    root: Path,
+    *,
+    retry: bool = False,
+) -> LOEOFoldMaterial:
+    material = _fake_material(approved_fold, held_out, root)
+    base = fold_publication_module.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id=held_out,
+        draws=1_000,
+        tune=1_000,
+        chains=4,
+        cores=1,
+    )
+    sampler = (
+        fold_publication_module.retry_sampler_contract(
+            base, variant="H3", held_out_occurrence_id=held_out
+        )
+        if retry
+        else base
+    )
+    identity = fold_publication_module.input_identity(material.inputs, sampler)
+    unsigned = {
+        key: value
+        for key, value in material.manifest.items()
+        if key not in {"identity", "manifest_digest"}
+    }
+    unsigned["identity"] = identity
+    if retry:
+        unsigned["retry_failure"] = fold_publication_module.retry_failure_payload(
+            sampler,
+            SamplingDiagnostics(1.02, 500.0, 450.0, 1),
+        )
+    return replace(
+        material,
+        identity=identity,
+        sampler=sampler,
+        manifest={**unsigned, "manifest_digest": sha_json(unsigned)},
+    )
+
+
 def _install_fake_matrix_kernel(
     monkeypatch: pytest.MonkeyPatch,
     materials: dict[str, LOEOFoldMaterial],
@@ -159,6 +205,93 @@ def _snapshot(root: Path) -> dict[str, tuple[int, bytes]]:
         for path in root.rglob("*")
         if path.is_file() and not path.is_symlink()
     }
+
+
+def test_matrix_identity_accepts_one_exact_retry_and_records_each_effective_sampler(
+    approved_fold, tmp_path: Path
+) -> None:
+    _, publication, _ = approved_fold
+    selected = publication.occurrence_ids
+    retry_index = 3
+    materials = tuple(
+        _paper_material(
+            approved_fold,
+            held,
+            tmp_path,
+            retry=index == retry_index,
+        )
+        for index, held in enumerate(selected)
+    )
+
+    identity = primary_module._matrix_identity(
+        materials,
+        selected_occurrence_ids=selected,
+        root_seed=71,
+        profile="paper",
+    )
+
+    assert [fold["sampler"] for fold in identity["folds"]] == [
+        dict(material.sampler) for material in materials
+    ]
+    assert identity["folds"][retry_index]["sampler"]["retry"] == {
+        "attempt": 1,
+        "reason": "divergence-only",
+        "base_sampler_sha256": sha_json(
+            fold_publication_module.sampler_contract(
+                "paper",
+                root_seed=71,
+                held_out_occurrence_id=selected[retry_index],
+                draws=1_000,
+                tune=1_000,
+                chains=4,
+                cores=1,
+            )
+        ),
+    }
+
+
+def test_matrix_identity_rejects_each_mutated_retry_contract(
+    approved_fold, tmp_path: Path
+) -> None:
+    _, publication, _ = approved_fold
+    selected = publication.occurrence_ids
+    retry_index = 3
+    materials = tuple(
+        _paper_material(
+            approved_fold,
+            held,
+            tmp_path,
+            retry=index == retry_index,
+        )
+        for index, held in enumerate(selected)
+    )
+    original = dict(materials[retry_index].sampler)
+    mutations = {
+        "seed": lambda sampler: sampler.__setitem__("seed", int(sampler["seed"]) + 1),
+        "target_accept": lambda sampler: sampler.__setitem__("target_accept", 0.998),
+        "tune": lambda sampler: sampler.__setitem__("tune", int(sampler["tune"]) + 1),
+        "base_digest": lambda sampler: sampler["retry"].__setitem__(
+            "base_sampler_sha256", "0" * 64
+        ),
+    }
+    for mutate in mutations.values():
+        sampler = deepcopy(original)
+        mutate(sampler)
+        material = materials[retry_index]
+        changed = replace(
+            material,
+            sampler=sampler,
+            identity=fold_publication_module.input_identity(material.inputs, sampler),
+        )
+        candidate = (*materials[:retry_index], changed, *materials[retry_index + 1 :])
+
+        with pytest.raises(LOEOPrimaryError, match="sampler|identity|seeds"):
+            primary_module._matrix_identity(
+                candidate,
+                selected_occurrence_ids=selected,
+                root_seed=71,
+                profile="paper",
+            )
 
 
 @pytest.mark.parametrize(

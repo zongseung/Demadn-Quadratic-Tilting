@@ -51,6 +51,7 @@ from hqrc_v3.loeo_stage import (
     derive_loeo_seed,
     fit_loeo_fold,
     generate_loeo_fold_products,
+    load_loeo_fold_material,
     load_loeo_fold_result,
     prepare_loeo_fold_inputs,
 )
@@ -397,6 +398,80 @@ def _smoke_fit_kwargs(output_root: Path, *, seed: int = 71) -> dict[str, object]
         "cores": 1,
         "output_root": output_root,
     }
+
+
+def _paper_fit_kwargs(output_root: Path) -> dict[str, object]:
+    return {
+        "held_out_occurrence_id": "seollal-2024",
+        "sampler_seed": 71,
+        "profile": "paper",
+        "draws": 1_000,
+        "tune": 1_000,
+        "chains": 4,
+        "cores": 1,
+        "output_root": output_root,
+    }
+
+
+def _install_paper_retry_sampler(
+    monkeypatch: pytest.MonkeyPatch,
+    source,
+    publication,
+    approved,
+    failures: list[SamplingError | None],
+) -> list[dict[str, object]]:
+    calls: list[dict[str, object]] = []
+
+    def sample(data, calibration, **kwargs):
+        held_out = (set(publication.occurrence_ids) - set(data.occurrence_ids)).pop()
+        current_inputs = prepare_loeo_fold_inputs(
+            source,
+            publication,
+            approved,
+            held_out_occurrence_id=held_out,
+        )
+        assert calibration.artifact_digest == current_inputs.approved.artifact_digest
+        calls.append(kwargs)
+        failure = failures[len(calls) - 1] if len(calls) <= len(failures) else None
+        if failure is not None:
+            raise failure
+        return _fake_idata(
+            current_inputs,
+            chains=kwargs["chains"],
+            draws=kwargs["draws"],
+            sampler={
+                "draws": kwargs["draws"],
+                "tune": kwargs["tune"],
+                "chains": kwargs["chains"],
+                "cores": kwargs["cores"],
+                "seed": kwargs["seed"],
+                "target_accept": kwargs["target_accept"],
+                "paper_profile": True,
+                "init": kwargs["init"],
+                "geometry": "noncentered-cyclic-hour-rw1-v1",
+            },
+        )
+
+    products = LOEOFoldProducts(
+        loeo_products_module.pl.DataFrame({"occurrence_id": ["seollal-2024"]}),
+        loeo_products_module.pl.DataFrame({"occurrence_id": ["seollal-2024"]}),
+        {"summary": "test"},
+    )
+    monkeypatch.setattr(loeo_stage_module, "sample_hqrc", sample)
+    monkeypatch.setattr(
+        loeo_publication_module,
+        "validate_inference_data",
+        lambda *_args, **_kwargs: SamplingDiagnostics(1.0, 800.0, 700.0, 0),
+    )
+    monkeypatch.setattr(
+        loeo_stage_module, "generate_loeo_fold_products", lambda *_args, **_kwargs: products
+    )
+    monkeypatch.setattr(
+        loeo_publication_module,
+        "generate_loeo_fold_products",
+        lambda *_args, **_kwargs: products,
+    )
+    return calls
 
 
 @pytest.fixture
@@ -1925,6 +2000,190 @@ def test_retry_sampler_contract_preserves_pyro_device_metadata_and_higher_tune(m
         "physical_device",
     ):
         assert retry[field] == base[field]
+
+
+def test_h3_divergence_retry_publishes_signed_failure_and_reuses_without_base_replay(
+    approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    diagnostics = SamplingDiagnostics(1.02, 500.0, 450.0, 3)
+    calls = _install_paper_retry_sampler(
+        monkeypatch,
+        source,
+        publication,
+        approved,
+        [SamplingError("divergences", diagnostics=diagnostics), None],
+    )
+    kwargs = _paper_fit_kwargs(tmp_path / "h3-retry")
+
+    fitted = fit_loeo_fold(source, publication, approved, **kwargs)
+
+    assert fitted.sampler_fit_count == 2 and fitted.reused is False
+    assert [call["target_accept"] for call in calls] == [0.99, 0.999]
+    assert [call["tune"] for call in calls] == [1_000, 2_000]
+    assert calls[1]["seed"] == derive_loeo_seed(
+        71, "H3-fold-sampler-retry-1:seollal-2024"
+    )
+    manifest = json.loads(fitted.manifest_path.read_bytes())
+    base_sampler = loeo_publication_module.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        draws=1_000,
+        tune=1_000,
+        chains=4,
+        cores=1,
+    )
+    assert manifest["retry_failure"] == {
+        "reason": "divergence-only",
+        "base_sampler_sha256": loeo_contract_module.sha_json(base_sampler),
+        "diagnostics": {
+            "max_rhat": 1.02,
+            "min_bulk_ess": 500.0,
+            "min_tail_ess": 450.0,
+            "divergences": 3,
+        },
+    }
+
+    reused = fit_loeo_fold(source, publication, approved, **kwargs)
+    material = load_loeo_fold_material(source, publication, approved, **kwargs)
+
+    assert reused.output_dir == fitted.output_dir
+    assert reused.reused is True and reused.sampler_fit_count == 0
+    assert material.result.output_dir == fitted.output_dir
+    assert material.sampler["retry"]["attempt"] == 1
+    assert len(calls) == 2
+
+
+def test_h3_divergence_retry_prefers_valid_base_over_valid_retry(
+    approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    calls = _install_paper_retry_sampler(
+        monkeypatch,
+        source,
+        publication,
+        approved,
+        [
+            SamplingError(
+                "divergences",
+                diagnostics=SamplingDiagnostics(1.02, 500.0, 450.0, 1),
+            ),
+            None,
+        ],
+    )
+    kwargs = _paper_fit_kwargs(tmp_path / "base-preferred")
+    retry = fit_loeo_fold(source, publication, approved, **kwargs)
+    retry_stash = tmp_path / "retry-stash"
+    retry.output_dir.rename(retry_stash)
+
+    base = fit_loeo_fold(source, publication, approved, **kwargs)
+    assert {entry.name for entry in retry.output_dir.iterdir()} == {".loeo-fold.lock"}
+    (retry.output_dir / ".loeo-fold.lock").unlink()
+    retry.output_dir.rmdir()
+    retry_stash.rename(retry.output_dir)
+    monkeypatch.setattr(
+        loeo_stage_module,
+        "sample_hqrc",
+        lambda *_args, **_kwargs: pytest.fail("sampled despite complete base"),
+    )
+
+    selected = fit_loeo_fold(source, publication, approved, **kwargs)
+
+    assert selected.output_dir == base.output_dir
+    assert selected.output_dir != retry.output_dir
+    assert selected.reused is True and len(calls) == 3
+
+
+@pytest.mark.parametrize(
+    "diagnostics",
+    [SamplingDiagnostics(1.02, 500.0, 450.0, 0), None],
+)
+def test_h3_divergence_retry_rejects_ineligible_base_failure(
+    diagnostics: SamplingDiagnostics | None,
+    approved_fold,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, publication, approved = approved_fold
+    calls = _install_paper_retry_sampler(
+        monkeypatch,
+        source,
+        publication,
+        approved,
+        [SamplingError("ineligible", diagnostics=diagnostics)],
+    )
+
+    with pytest.raises(SamplingError, match="ineligible"):
+        fit_loeo_fold(
+            source,
+            publication,
+            approved,
+            **_paper_fit_kwargs(tmp_path / f"ineligible-{diagnostics is None}"),
+        )
+
+    assert len(calls) == 1
+
+
+def test_h3_divergence_retry_propagates_retry_failure_after_two_attempts(
+    approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    failure = SamplingError(
+        "divergences", diagnostics=SamplingDiagnostics(1.02, 500.0, 450.0, 1)
+    )
+    calls = _install_paper_retry_sampler(
+        monkeypatch, source, publication, approved, [failure, failure]
+    )
+
+    with pytest.raises(SamplingError, match="divergences"):
+        fit_loeo_fold(
+            source,
+            publication,
+            approved,
+            **_paper_fit_kwargs(tmp_path / "retry-failure"),
+        )
+
+    assert len(calls) == 2
+
+
+def test_h3_retry_manifest_rejects_resigned_malformed_failure_provenance(
+    approved_fold, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, publication, approved = approved_fold
+    calls = _install_paper_retry_sampler(
+        monkeypatch,
+        source,
+        publication,
+        approved,
+        [
+            SamplingError(
+                "divergences",
+                diagnostics=SamplingDiagnostics(1.02, 500.0, 450.0, 1),
+            ),
+            None,
+        ],
+    )
+    kwargs = _paper_fit_kwargs(tmp_path / "malformed-retry")
+    fitted = fit_loeo_fold(source, publication, approved, **kwargs)
+    manifest = json.loads(fitted.manifest_path.read_bytes())
+    manifest["retry_failure"]["base_sampler_sha256"] = "0" * 64
+    unsigned = {key: value for key, value in manifest.items() if key != "manifest_digest"}
+    manifest["manifest_digest"] = loeo_contract_module.sha_json(unsigned)
+    _attacker_rewrite_json(fitted.manifest_path, manifest)
+    _attacker_rewrite_json(
+        fitted.output_dir / "COMPLETE",
+        {
+            "manifest_sha256": file_sha256(fitted.manifest_path),
+            "state": "COMPLETE",
+            "causal": False,
+        },
+    )
+
+    with pytest.raises(LOEOFoldError, match="retry|provenance|manifest"):
+        load_loeo_fold_material(source, publication, approved, **kwargs)
+
+    assert len(calls) == 2
 
 
 def test_namespace_rejects_intermediate_symlink_without_touching_external_target(

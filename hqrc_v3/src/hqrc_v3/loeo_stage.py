@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -24,7 +26,7 @@ from hqrc_v3._loeo_types import (
     LOEOFoldResult,
 )
 from hqrc_v3.bayes.model import HQRCData
-from hqrc_v3.bayes.samplers import PYMC_INITIALIZATION, sample_hqrc
+from hqrc_v3.bayes.samplers import PYMC_INITIALIZATION, SamplingError, sample_hqrc
 from hqrc_v3.correction_source import ValidatedCorrectionSource
 from hqrc_v3.diagnostics.ar import ApprovedARCalibration, validate_event_residual_context
 from hqrc_v3.diagnostics.loeo import (
@@ -242,7 +244,7 @@ def prepare_loeo_fold_inputs(
     )
 
 
-def fit_loeo_fold(
+def _fit_loeo_fold_attempt(
     source: ValidatedCorrectionSource,
     publication: LOEOPublication,
     approved_set: ApprovedLOEOARSet,
@@ -259,8 +261,10 @@ def fit_loeo_fold(
     backend: str = "pymc",
     device: str = "cpu",
     output_root: Path,
+    _sampler: Mapping[str, object] | None = None,
+    _retry_failure: Mapping[str, object] | None = None,
 ) -> LOEOFoldResult:
-    """Fit or strictly reuse exactly one immutable H3 partial-pooling LOEO fold."""
+    """Fit or strictly reuse one already-resolved H3 sampler contract."""
 
     inputs = prepare_loeo_fold_inputs(
         source,
@@ -268,18 +272,22 @@ def fit_loeo_fold(
         approved_set,
         held_out_occurrence_id=held_out_occurrence_id,
     )
-    sampler = publication_io.sampler_contract(
-        profile,
-        root_seed=sampler_seed,
-        held_out_occurrence_id=held_out_occurrence_id,
-        draws=draws,
-        tune=tune,
-        chains=chains,
-        cores=cores,
-        init=init,
-        target_accept=target_accept,
-        backend=backend,
-        device=device,
+    sampler = (
+        dict(_sampler)
+        if _sampler is not None
+        else publication_io.sampler_contract(
+            profile,
+            root_seed=sampler_seed,
+            held_out_occurrence_id=held_out_occurrence_id,
+            draws=draws,
+            tune=tune,
+            chains=chains,
+            cores=cores,
+            init=init,
+            target_accept=target_accept,
+            backend=backend,
+            device=device,
+        )
     )
     if profile == "paper" and inputs.source.source_profile != "paper":
         raise LOEOFoldError("paper sampler requires a paper-profile correction source")
@@ -344,6 +352,7 @@ def fit_loeo_fold(
                     identity=identity,
                     inputs=inputs,
                     sampler=sampler,
+                    retry_failure=_retry_failure,
                 )
                 fit_count = 0
         else:
@@ -397,7 +406,10 @@ def fit_loeo_fold(
             )
         publication_io.write_products(publication_handle, products, preserve=preserved)
         payload = publication_io.manifest_payload(
-            publication_handle, identity=identity, products=products
+            publication_handle,
+            identity=identity,
+            products=products,
+            retry_failure=_retry_failure,
         )
         if "manifest.json" not in preserved:
             publication_io.publish_json(
@@ -423,6 +435,242 @@ def fit_loeo_fold(
     return publication_io.result(directory, reused=False, sampler_fit_count=fit_count)
 
 
+def _resolved_samplers(
+    *,
+    held_out_occurrence_id: str,
+    sampler_seed: int,
+    profile: str,
+    draws: int | None,
+    tune: int | None,
+    chains: int | None,
+    cores: int | None,
+    init: str | None,
+    target_accept: float | None,
+    backend: str,
+    device: str,
+) -> tuple[dict[str, object], ...]:
+    base = publication_io.sampler_contract(
+        profile,
+        root_seed=sampler_seed,
+        held_out_occurrence_id=held_out_occurrence_id,
+        draws=draws,
+        tune=tune,
+        chains=chains,
+        cores=cores,
+        init=init,
+        target_accept=target_accept,
+        backend=backend,
+        device=device,
+    )
+    if profile != "paper" or base["target_accept"] != 0.99:
+        return (base,)
+    return (
+        base,
+        publication_io.retry_sampler_contract(
+            base,
+            variant="H3",
+            held_out_occurrence_id=held_out_occurrence_id,
+        ),
+    )
+
+
+def _is_complete_candidate(
+    output_root: Path,
+    inputs: LOEOFoldInputs,
+    sampler: Mapping[str, object],
+) -> bool:
+    identity = publication_io.input_identity(inputs, sampler)
+    namespace = publication_io.namespace(Path(output_root), inputs, sampler, identity)
+    with publication_io.fold_lock(namespace) as publication_handle:
+        publication_io.guard_namespace(publication_handle)
+        return publication_io.publication_has(publication_handle, "COMPLETE")
+
+
+def fit_loeo_fold(
+    source: ValidatedCorrectionSource,
+    publication: LOEOPublication,
+    approved_set: ApprovedLOEOARSet,
+    *,
+    held_out_occurrence_id: str,
+    sampler_seed: int,
+    profile: str,
+    draws: int | None = None,
+    tune: int | None = None,
+    chains: int | None = None,
+    cores: int | None = None,
+    init: str | None = None,
+    target_accept: float | None = None,
+    backend: str = "pymc",
+    device: str = "cpu",
+    output_root: Path,
+) -> LOEOFoldResult:
+    """Fit or strictly reuse exactly one immutable H3 partial-pooling LOEO fold."""
+
+    inputs = prepare_loeo_fold_inputs(
+        source,
+        publication,
+        approved_set,
+        held_out_occurrence_id=held_out_occurrence_id,
+    )
+    samplers = _resolved_samplers(
+        held_out_occurrence_id=held_out_occurrence_id,
+        sampler_seed=sampler_seed,
+        profile=profile,
+        draws=draws,
+        tune=tune,
+        chains=chains,
+        cores=cores,
+        init=init,
+        target_accept=target_accept,
+        backend=backend,
+        device=device,
+    )
+    if profile == "paper" and inputs.source.source_profile != "paper":
+        raise LOEOFoldError("paper sampler requires a paper-profile correction source")
+    common = {
+        "held_out_occurrence_id": held_out_occurrence_id,
+        "sampler_seed": sampler_seed,
+        "profile": profile,
+        "draws": draws,
+        "tune": tune,
+        "chains": chains,
+        "cores": cores,
+        "init": init,
+        "target_accept": target_accept,
+        "backend": backend,
+        "device": device,
+        "output_root": output_root,
+    }
+    for sampler in samplers:
+        if _is_complete_candidate(output_root, inputs, sampler):
+            return _load_loeo_fold_result_attempt(
+                source, publication, approved_set, **common, _sampler=sampler
+            )
+    try:
+        return _fit_loeo_fold_attempt(
+            source, publication, approved_set, **common, _sampler=samplers[0]
+        )
+    except SamplingError as error:
+        diagnostics = publication_io.retryable_divergence(error)
+        if diagnostics is None or len(samplers) != 2:
+            raise
+        retry_failure = publication_io.retry_failure_payload(samplers[1], diagnostics)
+        retried = _fit_loeo_fold_attempt(
+            source,
+            publication,
+            approved_set,
+            **common,
+            _sampler=samplers[1],
+            _retry_failure=retry_failure,
+        )
+        return replace(retried, sampler_fit_count=retried.sampler_fit_count + 1)
+
+
+def _load_loeo_fold_result_attempt(
+    source: ValidatedCorrectionSource,
+    publication: LOEOPublication,
+    approved_set: ApprovedLOEOARSet,
+    *,
+    held_out_occurrence_id: str,
+    sampler_seed: int,
+    profile: str,
+    draws: int | None = None,
+    tune: int | None = None,
+    chains: int | None = None,
+    cores: int | None = None,
+    init: str | None = None,
+    target_accept: float | None = None,
+    backend: str = "pymc",
+    device: str = "cpu",
+    output_root: Path,
+    _sampler: Mapping[str, object] | None = None,
+) -> LOEOFoldResult:
+    """Load and semantically revalidate one completed result without fitting."""
+
+    inputs = prepare_loeo_fold_inputs(
+        source,
+        publication,
+        approved_set,
+        held_out_occurrence_id=held_out_occurrence_id,
+    )
+    sampler = (
+        dict(_sampler)
+        if _sampler is not None
+        else publication_io.sampler_contract(
+            profile,
+            root_seed=sampler_seed,
+            held_out_occurrence_id=held_out_occurrence_id,
+            draws=draws,
+            tune=tune,
+            chains=chains,
+            cores=cores,
+            init=init,
+            target_accept=target_accept,
+            backend=backend,
+            device=device,
+        )
+    )
+    identity = publication_io.input_identity(inputs, sampler)
+    namespace = publication_io.namespace(Path(output_root), inputs, sampler, identity)
+    directory = namespace.path
+    publication_io.require_real_directory(directory, "completed LOEO fold result")
+    with publication_io.fold_lock(namespace) as publication_handle:
+        publication_io.guard_namespace(publication_handle)
+        completed = publication_io.validate_complete(
+            publication_handle, identity=identity, inputs=inputs, sampler=sampler
+        )
+        publication_io.guard_namespace(publication_handle)
+        return completed
+
+
+def _load_samplers(
+    inputs: LOEOFoldInputs,
+    *,
+    held_out_occurrence_id: str,
+    sampler_seed: int,
+    profile: str,
+    draws: int | None,
+    tune: int | None,
+    chains: int | None,
+    cores: int | None,
+    init: str | None,
+    target_accept: float | None,
+    backend: str,
+    device: str,
+    output_root: Path,
+) -> tuple[dict[str, object], dict[str, object]]:
+    samplers = _resolved_samplers(
+        held_out_occurrence_id=held_out_occurrence_id,
+        sampler_seed=sampler_seed,
+        profile=profile,
+        draws=draws,
+        tune=tune,
+        chains=chains,
+        cores=cores,
+        init=init,
+        target_accept=target_accept,
+        backend=backend,
+        device=device,
+    )
+    for sampler in samplers:
+        if _is_complete_candidate(output_root, inputs, sampler):
+            return dict(sampler), {
+                "held_out_occurrence_id": held_out_occurrence_id,
+                "sampler_seed": sampler_seed,
+                "profile": profile,
+                "draws": draws,
+                "tune": tune,
+                "chains": chains,
+                "cores": cores,
+                "init": init,
+                "target_accept": target_accept,
+                "backend": backend,
+                "device": device,
+                "output_root": output_root,
+            }
+    raise LOEOFoldError("completed LOEO fold result does not exist")
+
+
 def load_loeo_fold_result(
     source: ValidatedCorrectionSource,
     publication: LOEOPublication,
@@ -441,7 +689,7 @@ def load_loeo_fold_result(
     device: str = "cpu",
     output_root: Path,
 ) -> LOEOFoldResult:
-    """Load and semantically revalidate one completed result without fitting."""
+    """Load the valid base result, or its one deterministic retry."""
 
     inputs = prepare_loeo_fold_inputs(
         source,
@@ -449,10 +697,11 @@ def load_loeo_fold_result(
         approved_set,
         held_out_occurrence_id=held_out_occurrence_id,
     )
-    sampler = publication_io.sampler_contract(
-        profile,
-        root_seed=sampler_seed,
+    sampler, common = _load_samplers(
+        inputs,
         held_out_occurrence_id=held_out_occurrence_id,
+        sampler_seed=sampler_seed,
+        profile=profile,
         draws=draws,
         tune=tune,
         chains=chains,
@@ -461,18 +710,72 @@ def load_loeo_fold_result(
         target_accept=target_accept,
         backend=backend,
         device=device,
+        output_root=output_root,
     )
+    return _load_loeo_fold_result_attempt(
+        source, publication, approved_set, **common, _sampler=sampler
+    )
+
+
+def _load_loeo_fold_material_attempt(
+    source: ValidatedCorrectionSource,
+    publication: LOEOPublication,
+    approved_set: ApprovedLOEOARSet,
+    *,
+    held_out_occurrence_id: str,
+    sampler_seed: int,
+    profile: str,
+    draws: int | None = None,
+    tune: int | None = None,
+    chains: int | None = None,
+    cores: int | None = None,
+    init: str | None = None,
+    target_accept: float | None = None,
+    backend: str = "pymc",
+    device: str = "cpu",
+    output_root: Path,
+    _sampler: Mapping[str, object] | None = None,
+) -> LOEOFoldMaterial:
+    """Securely load one completed fold's products and in-memory posterior."""
+
+    inputs = prepare_loeo_fold_inputs(
+        source,
+        publication,
+        approved_set,
+        held_out_occurrence_id=held_out_occurrence_id,
+    )
+    sampler = (
+        dict(_sampler)
+        if _sampler is not None
+        else publication_io.sampler_contract(
+            profile,
+            root_seed=sampler_seed,
+            held_out_occurrence_id=held_out_occurrence_id,
+            draws=draws,
+            tune=tune,
+            chains=chains,
+            cores=cores,
+            init=init,
+            target_accept=target_accept,
+            backend=backend,
+            device=device,
+        )
+    )
+    if profile == "paper" and inputs.source.source_profile != "paper":
+        raise LOEOFoldError("paper sampler requires a paper-profile correction source")
     identity = publication_io.input_identity(inputs, sampler)
     namespace = publication_io.namespace(Path(output_root), inputs, sampler, identity)
-    directory = namespace.path
-    publication_io.require_real_directory(directory, "completed LOEO fold result")
+    publication_io.require_real_directory(namespace.path, "completed LOEO fold result")
     with publication_io.fold_lock(namespace) as publication_handle:
         publication_io.guard_namespace(publication_handle)
-        completed = publication_io.validate_complete(
-            publication_handle, identity=identity, inputs=inputs, sampler=sampler
+        material = publication_io.load_complete_material(
+            publication_handle,
+            identity=identity,
+            inputs=inputs,
+            sampler=sampler,
         )
         publication_io.guard_namespace(publication_handle)
-        return completed
+        return material
 
 
 def load_loeo_fold_material(
@@ -493,7 +796,7 @@ def load_loeo_fold_material(
     device: str = "cpu",
     output_root: Path,
 ) -> LOEOFoldMaterial:
-    """Securely load one completed fold's products and in-memory posterior."""
+    """Securely load the valid base material, or its deterministic retry."""
 
     inputs = prepare_loeo_fold_inputs(
         source,
@@ -501,10 +804,13 @@ def load_loeo_fold_material(
         approved_set,
         held_out_occurrence_id=held_out_occurrence_id,
     )
-    sampler = publication_io.sampler_contract(
-        profile,
-        root_seed=sampler_seed,
+    if profile == "paper" and inputs.source.source_profile != "paper":
+        raise LOEOFoldError("paper sampler requires a paper-profile correction source")
+    sampler, common = _load_samplers(
+        inputs,
         held_out_occurrence_id=held_out_occurrence_id,
+        sampler_seed=sampler_seed,
+        profile=profile,
         draws=draws,
         tune=tune,
         chains=chains,
@@ -513,22 +819,11 @@ def load_loeo_fold_material(
         target_accept=target_accept,
         backend=backend,
         device=device,
+        output_root=output_root,
     )
-    if profile == "paper" and inputs.source.source_profile != "paper":
-        raise LOEOFoldError("paper sampler requires a paper-profile correction source")
-    identity = publication_io.input_identity(inputs, sampler)
-    namespace = publication_io.namespace(Path(output_root), inputs, sampler, identity)
-    publication_io.require_real_directory(namespace.path, "completed LOEO fold result")
-    with publication_io.fold_lock(namespace) as publication_handle:
-        publication_io.guard_namespace(publication_handle)
-        material = publication_io.load_complete_material(
-            publication_handle,
-            identity=identity,
-            inputs=inputs,
-            sampler=sampler,
-        )
-        publication_io.guard_namespace(publication_handle)
-        return material
+    return _load_loeo_fold_material_attempt(
+        source, publication, approved_set, **common, _sampler=sampler
+    )
 
 
 __all__ = [

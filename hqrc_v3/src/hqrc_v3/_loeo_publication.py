@@ -1232,6 +1232,7 @@ def validate_downstream_prefix(
     entries: frozenset[str],
     products: LOEOFoldProducts,
     identity: Mapping[str, Any],
+    retry_failure: Mapping[str, object] | None = None,
 ) -> frozenset[str]:
     """Validate an immutable ordered downstream prefix before any recovery write."""
 
@@ -1247,7 +1248,12 @@ def validate_downstream_prefix(
     if present != expected_present:
         raise LOEOFoldError("partial LOEO downstream artifacts are not a valid prefix")
     expected_manifest = (
-        manifest_payload(publication, identity=identity, products=products)
+        manifest_payload(
+            publication,
+            identity=identity,
+            products=products,
+            retry_failure=retry_failure,
+        )
         if prefix_length == len(order)
         else None
     )
@@ -1334,7 +1340,15 @@ def manifest_payload(
     *,
     identity: Mapping[str, Any],
     products: LOEOFoldProducts,
+    retry_failure: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
+    sampler = identity.get("sampler")
+    if not isinstance(sampler, Mapping):
+        raise LOEOFoldError("LOEO fold sampler identity differs")
+    if "retry" in sampler:
+        validate_retry_failure(sampler, retry_failure)
+    elif retry_failure is not None:
+        raise LOEOFoldError("base LOEO fold publication cannot record retry failure")
     unsigned: dict[str, Any] = {
         "schema_version": 1,
         "state": "COMPLETE",
@@ -1346,6 +1360,8 @@ def manifest_payload(
             "metrics": products.metrics.height,
         },
     }
+    if retry_failure is not None:
+        unsigned["retry_failure"] = dict(retry_failure)
     return {**unsigned, "manifest_digest": sha_json(unsigned)}
 
 
@@ -1361,22 +1377,23 @@ def load_complete_material(
         raise LOEOFoldError("completed LOEO fold directory contains unknown or partial entries")
     manifest = _relative_json(publication.directory, "manifest.json", "LOEO fold manifest")
     complete = _relative_json(publication.directory, "COMPLETE", "LOEO fold completion marker")
-    unsigned = {
-        key: manifest[key]
-        for key in ("schema_version", "state", "causal", "identity", "outputs", "rows")
-        if key in manifest
+    unsigned = {key: value for key, value in manifest.items() if key != "manifest_digest"}
+    expected_keys = {
+        "schema_version",
+        "state",
+        "causal",
+        "identity",
+        "outputs",
+        "rows",
+        "manifest_digest",
     }
+    if "retry" in sampler:
+        validate_retry_failure(sampler, manifest.get("retry_failure"))
+        expected_keys.add("retry_failure")
+    elif "retry_failure" in manifest:
+        raise LOEOFoldError("base LOEO fold publication cannot record retry failure")
     if (
-        set(manifest)
-        != {
-            "schema_version",
-            "state",
-            "causal",
-            "identity",
-            "outputs",
-            "rows",
-            "manifest_digest",
-        }
+        set(manifest) != expected_keys
         or manifest.get("schema_version") != 1
         or manifest.get("state") != "COMPLETE"
         or manifest.get("causal") is not False
@@ -1460,6 +1477,7 @@ def load_resumable_checkpoint(
     identity: Mapping[str, Any],
     inputs: LOEOFoldInputs,
     sampler: Mapping[str, object],
+    retry_failure: Mapping[str, object] | None = None,
 ):
     entries = publication_entries(publication) - {".loeo-fold.lock"}
     if set(entries) - (CHECKPOINT_TOP | DOWNSTREAM_TOP) or not CHECKPOINT_TOP.issubset(entries):
@@ -1493,6 +1511,7 @@ def load_resumable_checkpoint(
         entries=entries,
         products=products,
         identity=identity,
+        retry_failure=retry_failure,
     )
     return idata, products, preserved
 

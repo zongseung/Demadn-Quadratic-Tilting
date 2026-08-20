@@ -125,23 +125,44 @@ def _matrix_identity(
     profile: str,
 ) -> dict[str, object]:
     first = dict(materials[0].identity)
-    first_sampler = dict(materials[0].sampler)
+    base_template = next(
+        (dict(material.sampler) for material in materials if "retry" not in material.sampler),
+        None,
+    )
+    if base_template is None:
+        raise LOEOPrimaryError("LOEO primary requires one recorded base sampler setting")
     common_keys = ("source", "context", "model")
     for material in materials:
         identity = dict(material.identity)
         held = material.inputs.held_out_occurrence_id
         sampler = dict(material.sampler)
-        sampler_without_fold_seed = {key: value for key, value in sampler.items() if key != "seed"}
-        first_without_fold_seed = {
-            key: value for key, value in first_sampler.items() if key != "seed"
-        }
+        base = fold_publication_io.sampler_contract(
+            profile,
+            root_seed=root_seed,
+            held_out_occurrence_id=held,
+            draws=int(base_template["draws"]),
+            tune=int(base_template["tune"]),
+            chains=int(base_template["chains"]),
+            cores=int(base_template["cores"]),
+            init=(str(base_template["init"]) if base_template["backend"] == "pymc" else None),
+            target_accept=float(base_template["target_accept"]),
+            backend=str(base_template["backend"]),
+            device=str(base_template.get("logical_device", "cpu")),
+        )
+        candidates = [base]
+        if profile == "paper" and base["target_accept"] == 0.99:
+            candidates.append(
+                fold_publication_io.retry_sampler_contract(
+                    base,
+                    variant="H3",
+                    held_out_occurrence_id=held,
+                )
+            )
         if (
             any(identity.get(key) != first.get(key) for key in common_keys)
             or identity.get("causal") is not False
-            or sampler.get("root_seed") != root_seed
-            or sampler.get("profile") != profile
-            or sampler.get("seed") != derive_loeo_seed(root_seed, f"H3-fold-sampler:{held}")
-            or sampler_without_fold_seed != first_without_fold_seed
+            or identity.get("sampler") != sampler
+            or sampler not in candidates
             or identity.get("predictive_seed")
             != derive_loeo_seed(root_seed, f"H3-fold-predictive:{held}")
         ):
