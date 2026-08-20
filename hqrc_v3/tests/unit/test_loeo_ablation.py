@@ -20,6 +20,7 @@ from test_loeo_stage import source as source_fixture
 import hqrc_v3._loeo_publication as fold_contract
 import hqrc_v3.loeo_ablation as ablation_module
 from hqrc_v3._loeo_types import LOEOFoldError
+from hqrc_v3.bayes.samplers import SamplingDiagnostics, SamplingError
 from hqrc_v3.loeo_ablation import _aggregate_products
 from hqrc_v3.loeo_stage import prepare_loeo_fold_inputs
 from hqrc_v3.provenance import file_sha256
@@ -296,3 +297,242 @@ def test_ablation_rejects_fresh_and_reused_posterior_metadata_without_rewriting_
         ablation_module._fit_fold(source, publication, approved, **kwargs)
 
     assert _tree_snapshot(directory) == before
+
+
+def _ablation_products() -> SimpleNamespace:
+    return SimpleNamespace(
+        hourly_predictions=pl.DataFrame({"value": [1.0]}),
+        metrics=pl.DataFrame({"metric": ["rmse"], "value": [1.0]}),
+        posterior_summary={"summary": "test"},
+    )
+
+
+def _paper_ablation_kwargs(tmp_path: Path, variant: str) -> dict[str, object]:
+    return {
+        "held_out": "seollal-2024",
+        "variant": variant,
+        "root_seed": 71,
+        "profile": "paper",
+        "draws": 1_000,
+        "tune": 1_000,
+        "chains": 4,
+        "cores": 1,
+        "init": None,
+        "target_accept": None,
+        "backend": "pymc",
+        "device": "cpu",
+        "output_root": tmp_path / "ablation",
+    }
+
+
+@pytest.mark.parametrize("variant", ["H1", "H2"])
+def test_ablation_retries_paper_divergence_once_with_signed_provenance_and_reuses_retry(
+    variant: str,
+    approved_fold,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, publication, approved = approved_fold
+    calls: list[dict[str, object]] = []
+    diagnostics = SamplingDiagnostics(1.02, 500.0, 450.0, 3)
+
+    def sample(*_args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise SamplingError("divergences", diagnostics=diagnostics)
+        return az.InferenceData()
+
+    monkeypatch.setattr(ablation_module, "sample_hqrc", sample)
+    monkeypatch.setattr(
+        ablation_module, "_validate_posterior_metadata", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        ablation_module,
+        "generate_loeo_fold_products",
+        lambda *_args, **_kwargs: _ablation_products(),
+    )
+    kwargs = _paper_ablation_kwargs(tmp_path, variant)
+
+    directory, fitted, reused = ablation_module._fit_fold(source, publication, approved, **kwargs)
+
+    assert (fitted, reused) == (2, False)
+    assert len(calls) == 2
+    assert calls[0]["target_accept"] == 0.99
+    assert calls[0]["tune"] == 1_000
+    assert calls[1]["target_accept"] == 0.999
+    assert calls[1]["tune"] == 2_000
+    assert calls[1]["seed"] == fold_contract.derive_loeo_seed(
+        71, f"{variant}-fold-sampler-retry-1:seollal-2024"
+    )
+    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    base_sampler = fold_contract.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        variant=variant,
+        draws=1_000,
+        tune=1_000,
+        chains=4,
+        cores=1,
+        init=None,
+        target_accept=None,
+        backend="pymc",
+        device="cpu",
+    )
+    assert manifest["retry_failure"] == {
+        "reason": "divergence-only",
+        "base_sampler_sha256": fold_contract.sha_json(base_sampler),
+        "diagnostics": {
+            "max_rhat": 1.02,
+            "min_bulk_ess": 500.0,
+            "min_tail_ess": 450.0,
+            "divergences": 3,
+        },
+    }
+
+    reused_directory, reused_fitted, reused = ablation_module._fit_fold(
+        source, publication, approved, **kwargs
+    )
+
+    assert reused_directory == directory
+    assert (reused_fitted, reused) == (0, True)
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("variant", ["H1", "H2"])
+def test_ablation_prefers_a_valid_base_publication_over_retry(
+    variant: str,
+    approved_fold,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, publication, approved = approved_fold
+    monkeypatch.setattr(
+        ablation_module, "_validate_posterior_metadata", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        ablation_module,
+        "generate_loeo_fold_products",
+        lambda *_args, **_kwargs: _ablation_products(),
+    )
+    monkeypatch.setattr(
+        ablation_module, "sample_hqrc", lambda *_args, **_kwargs: az.InferenceData()
+    )
+    kwargs = _paper_ablation_kwargs(tmp_path, variant)
+    directory, _, _ = ablation_module._fit_fold(source, publication, approved, **kwargs)
+    base_sampler = fold_contract.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        variant=variant,
+        draws=1_000,
+        tune=1_000,
+        chains=4,
+        cores=1,
+        init=None,
+        target_accept=None,
+        backend="pymc",
+        device="cpu",
+    )
+    retry_sampler = fold_contract.retry_sampler_contract(
+        base_sampler, variant=variant, held_out_occurrence_id="seollal-2024"
+    )
+    retry_identity = ablation_module._fold_identity(
+        source,
+        publication,
+        approved,
+        held_out="seollal-2024",
+        variant=variant,
+        sampler=retry_sampler,
+    )
+    retry_directory = directory.parent / f"identity-{fold_contract.sha_json(retry_identity)}"
+
+    def write(temporary: Path) -> None:
+        az.to_netcdf(az.InferenceData(), temporary / "posterior.nc")
+        _ablation_products().hourly_predictions.write_parquet(
+            temporary / "hourly_predictions.parquet"
+        )
+        _ablation_products().metrics.write_parquet(temporary / "metrics.parquet")
+        ablation_module._write_json(temporary / "posterior_summary.json", {"summary": "test"})
+
+    ablation_module._publish_directory(
+        retry_directory,
+        identity=retry_identity,
+        files=ablation_module._FOLD_FILES,
+        writer=write,
+        retry_failure=fold_contract.retry_failure_payload(
+            retry_sampler, SamplingDiagnostics(1.02, 500.0, 450.0, 1)
+        ),
+    )
+    monkeypatch.setattr(
+        ablation_module,
+        "sample_hqrc",
+        lambda *_args, **_kwargs: pytest.fail("sampled despite base reuse"),
+    )
+
+    reused_directory, fitted, reused = ablation_module._fit_fold(
+        source, publication, approved, **kwargs
+    )
+
+    assert reused_directory == directory
+    assert (fitted, reused) == (0, True)
+
+
+@pytest.mark.parametrize(
+    ("profile", "diagnostics"),
+    [
+        ("smoke", SamplingDiagnostics(1.02, 500.0, 450.0, 1)),
+        ("paper", SamplingDiagnostics(1.02, 500.0, 450.0, 0)),
+        ("paper", SamplingDiagnostics(1.0, 1.0, 1.0, 0)),
+        ("paper", None),
+    ],
+)
+def test_ablation_does_not_retry_ineligible_sampling_failure(
+    profile: str,
+    diagnostics: SamplingDiagnostics | None,
+    approved_fold,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, publication, approved = approved_fold
+    calls = 0
+
+    def sample(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise SamplingError("ineligible", diagnostics=diagnostics)
+
+    monkeypatch.setattr(ablation_module, "sample_hqrc", sample)
+    kwargs = _paper_ablation_kwargs(tmp_path, "H1")
+    if profile == "smoke":
+        kwargs.update({"profile": "smoke", "draws": 4, "tune": 3, "chains": 2})
+
+    with pytest.raises(SamplingError, match="ineligible"):
+        ablation_module._fit_fold(source, publication, approved, **kwargs)
+
+    assert calls == 1
+
+
+@pytest.mark.parametrize("variant", ["H1", "H2"])
+def test_ablation_propagates_retry_failure_after_exactly_two_attempts(
+    variant: str,
+    approved_fold,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, publication, approved = approved_fold
+    calls = 0
+
+    def sample(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise SamplingError("divergences", diagnostics=SamplingDiagnostics(1.02, 500.0, 450.0, 1))
+
+    monkeypatch.setattr(ablation_module, "sample_hqrc", sample)
+
+    with pytest.raises(SamplingError, match="divergences"):
+        ablation_module._fit_fold(
+            source, publication, approved, **_paper_ablation_kwargs(tmp_path, variant)
+        )
+
+    assert calls == 2

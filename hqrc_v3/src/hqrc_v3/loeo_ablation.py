@@ -19,7 +19,7 @@ import hqrc_v3._loeo_publication as fold_contract
 from hqrc_v3._loeo_contract import MODEL_OPTIONS, derive_loeo_seed, sha_json
 from hqrc_v3._loeo_products import generate_loeo_fold_products
 from hqrc_v3._loeo_types import LOEOFoldError
-from hqrc_v3.bayes.samplers import PYMC_INITIALIZATION, sample_hqrc
+from hqrc_v3.bayes.samplers import PYMC_INITIALIZATION, SamplingError, sample_hqrc
 from hqrc_v3.correction_source import ValidatedCorrectionSource
 from hqrc_v3.diagnostics.loeo import LOEOPublication
 from hqrc_v3.diagnostics.loeo_ar import ApprovedLOEOARSet
@@ -102,6 +102,17 @@ def _validate_complete(
     manifest = _read_json(directory / "manifest.json", "ablation manifest")
     if manifest.get("identity") != dict(identity):
         raise LOEOAblationError("ablation publication identity differs")
+    sampler = identity.get("sampler")
+    if not isinstance(sampler, Mapping):
+        raise LOEOAblationError("ablation sampler identity differs")
+    retry_failure = manifest.get("retry_failure")
+    try:
+        if "retry" in sampler:
+            fold_contract.validate_retry_failure(sampler, retry_failure)
+        elif "retry_failure" in manifest:
+            raise LOEOFoldError("base ablation publication cannot record retry failure")
+    except LOEOFoldError as error:
+        raise LOEOAblationError("ablation retry provenance differs") from error
     outputs = manifest.get("outputs")
     if not isinstance(outputs, dict) or set(outputs) != set(files):
         raise LOEOAblationError("ablation publication output registry differs")
@@ -130,7 +141,18 @@ def _publish_directory(
     identity: Mapping[str, object],
     files: tuple[str, ...],
     writer,
+    retry_failure: Mapping[str, object] | None = None,
 ) -> None:
+    sampler = identity.get("sampler")
+    if not isinstance(sampler, Mapping):
+        raise LOEOAblationError("ablation sampler identity differs")
+    try:
+        if "retry" in sampler:
+            fold_contract.validate_retry_failure(sampler, retry_failure)
+        elif retry_failure is not None:
+            raise LOEOFoldError("base ablation publication cannot record retry failure")
+    except LOEOFoldError as error:
+        raise LOEOAblationError("ablation retry provenance differs") from error
     final.parent.mkdir(parents=True, exist_ok=True)
     if final.exists():
         _validate_complete(final, identity=identity, files=files)
@@ -145,6 +167,8 @@ def _publish_directory(
             "identity": dict(identity),
             "outputs": _output_records(temporary, files),
         }
+        if retry_failure is not None:
+            unsigned["retry_failure"] = dict(retry_failure)
         _write_json(
             temporary / "manifest.json",
             {**unsigned, "manifest_digest": sha_json(unsigned)},
@@ -224,6 +248,101 @@ def _validate_posterior_metadata(idata, inputs, sampler, *, variant: AblationVar
         raise LOEOAblationError("ablation posterior metadata differs") from error
 
 
+def _fold_directory(
+    output_root: Path,
+    publication: LOEOPublication,
+    *,
+    held_out: str,
+    variant: AblationVariant,
+    profile: str,
+    identity: Mapping[str, object],
+) -> Path:
+    context = publication.context
+    return (
+        output_root
+        / f"loeo-ablation-{variant.lower()}"
+        / context.model
+        / context.feature_set
+        / f"seed-{context.seed}"
+        / held_out
+        / profile
+        / f"identity-{sha_json(identity)}"
+    )
+
+
+def _fit_fold_attempt(
+    inputs,
+    *,
+    variant: AblationVariant,
+    sampler: Mapping[str, object],
+    identity: Mapping[str, object],
+    directory: Path,
+    retry_failure: Mapping[str, object] | None = None,
+) -> tuple[Path, int, bool]:
+    if directory.exists():
+        _validate_complete(directory, identity=identity, files=_FOLD_FILES)
+        try:
+            idata = az.from_netcdf(directory / "posterior.nc")
+        except (OSError, ValueError) as error:
+            raise LOEOAblationError("ablation posterior metadata is unreadable") from error
+        try:
+            _validate_posterior_metadata(idata, inputs, sampler, variant=variant)
+        finally:
+            idata.close()
+        return directory, 0, True
+
+    idata = sample_hqrc(
+        inputs.hqrc_data,
+        inputs.approved,
+        variant=variant,
+        pooling="partial",
+        options=MODEL_OPTIONS,
+        draws=int(sampler["draws"]),
+        tune=int(sampler["tune"]),
+        chains=int(sampler["chains"]),
+        cores=int(sampler["cores"]),
+        seed=int(sampler["seed"]),
+        init=(str(sampler["init"]) if sampler["backend"] == "pymc" else PYMC_INITIALIZATION),
+        target_accept=float(sampler["target_accept"]),
+        backend=str(sampler["backend"]),
+        device=str(sampler.get("logical_device", "cpu")),
+        paper_profile=sampler["profile"] == "paper",
+    )
+    try:
+        idata.attrs["hqrc_causal"] = "false"
+        _validate_posterior_metadata(idata, inputs, sampler, variant=variant)
+        products = generate_loeo_fold_products(
+            inputs,
+            idata,
+            variant=variant,
+            predictive_seed=int(identity["predictive_seed"]),
+            predictive_draws=int(sampler["draws"]) * int(sampler["chains"]),
+        )
+
+        def write(temporary: Path) -> None:
+            az.to_netcdf(idata, temporary / "posterior.nc")
+            products.hourly_predictions.with_columns(
+                pl.lit(variant).alias("variant")
+            ).write_parquet(temporary / "hourly_predictions.parquet")
+            products.metrics.with_columns(pl.lit(variant).alias("variant")).write_parquet(
+                temporary / "metrics.parquet"
+            )
+            _write_json(temporary / "posterior_summary.json", products.posterior_summary)
+
+        _publish_directory(
+            directory,
+            identity=identity,
+            files=_FOLD_FILES,
+            writer=write,
+            retry_failure=retry_failure,
+        )
+    finally:
+        close = getattr(idata, "close", None)
+        if callable(close):
+            close()
+    return directory, 1, False
+
+
 def _fit_fold(
     source: ValidatedCorrectionSource,
     publication: LOEOPublication,
@@ -270,73 +389,72 @@ def _fit_fold(
         variant=variant,
         sampler=sampler,
     )
-    context = publication.context
-    directory = (
-        output_root
-        / f"loeo-ablation-{variant.lower()}"
-        / context.model
-        / context.feature_set
-        / f"seed-{context.seed}"
-        / held_out
-        / profile
-        / f"identity-{sha_json(identity)}"
-    )
-    if directory.exists():
-        _validate_complete(directory, identity=identity, files=_FOLD_FILES)
-        try:
-            idata = az.from_netcdf(directory / "posterior.nc")
-        except (OSError, ValueError) as error:
-            raise LOEOAblationError("ablation posterior metadata is unreadable") from error
-        try:
-            _validate_posterior_metadata(idata, inputs, sampler, variant=variant)
-        finally:
-            idata.close()
-        return directory, 0, True
-
-    idata = sample_hqrc(
-        inputs.hqrc_data,
-        inputs.approved,
+    directory = _fold_directory(
+        output_root,
+        publication,
+        held_out=held_out,
         variant=variant,
-        pooling="partial",
-        options=MODEL_OPTIONS,
-        draws=int(sampler["draws"]),
-        tune=int(sampler["tune"]),
-        chains=int(sampler["chains"]),
-        cores=int(sampler["cores"]),
-        seed=int(sampler["seed"]),
-        init=(str(sampler["init"]) if sampler["backend"] == "pymc" else PYMC_INITIALIZATION),
-        target_accept=float(sampler["target_accept"]),
-        backend=str(sampler["backend"]),
-        device=str(sampler.get("logical_device", "cpu")),
-        paper_profile=profile == "paper",
+        profile=profile,
+        identity=identity,
     )
-    try:
-        idata.attrs["hqrc_causal"] = "false"
-        _validate_posterior_metadata(idata, inputs, sampler, variant=variant)
-        products = generate_loeo_fold_products(
-            inputs,
-            idata,
-            variant=variant,
-            predictive_seed=int(identity["predictive_seed"]),
-            predictive_draws=int(sampler["draws"]) * int(sampler["chains"]),
+    retry_sampler: dict[str, object] | None = None
+    retry_identity: dict[str, object] | None = None
+    retry_directory: Path | None = None
+    if profile == "paper":
+        retry_sampler = fold_contract.retry_sampler_contract(
+            sampler, variant=variant, held_out_occurrence_id=held_out
         )
-
-        def write(temporary: Path) -> None:
-            az.to_netcdf(idata, temporary / "posterior.nc")
-            products.hourly_predictions.with_columns(
-                pl.lit(variant).alias("variant")
-            ).write_parquet(temporary / "hourly_predictions.parquet")
-            products.metrics.with_columns(pl.lit(variant).alias("variant")).write_parquet(
-                temporary / "metrics.parquet"
-            )
-            _write_json(temporary / "posterior_summary.json", products.posterior_summary)
-
-        _publish_directory(directory, identity=identity, files=_FOLD_FILES, writer=write)
-    finally:
-        close = getattr(idata, "close", None)
-        if callable(close):
-            close()
-    return directory, 1, False
+        retry_identity = _fold_identity(
+            source,
+            publication,
+            approved_set,
+            held_out=held_out,
+            variant=variant,
+            sampler=retry_sampler,
+        )
+        retry_directory = _fold_directory(
+            output_root,
+            publication,
+            held_out=held_out,
+            variant=variant,
+            profile=profile,
+            identity=retry_identity,
+        )
+    if directory.exists():
+        return _fit_fold_attempt(
+            inputs, variant=variant, sampler=sampler, identity=identity, directory=directory
+        )
+    if retry_directory is not None and retry_directory.exists():
+        return _fit_fold_attempt(
+            inputs,
+            variant=variant,
+            sampler=retry_sampler,
+            identity=retry_identity,
+            directory=retry_directory,
+        )
+    try:
+        return _fit_fold_attempt(
+            inputs, variant=variant, sampler=sampler, identity=identity, directory=directory
+        )
+    except SamplingError as error:
+        diagnostics = fold_contract.retryable_divergence(error)
+        if (
+            diagnostics is None
+            or retry_sampler is None
+            or retry_identity is None
+            or retry_directory is None
+        ):
+            raise
+        retry_failure = fold_contract.retry_failure_payload(retry_sampler, diagnostics)
+        retry_path, retry_fitted, retry_reused = _fit_fold_attempt(
+            inputs,
+            variant=variant,
+            sampler=retry_sampler,
+            identity=retry_identity,
+            directory=retry_directory,
+            retry_failure=retry_failure,
+        )
+        return retry_path, retry_fitted + 1, retry_reused
 
 
 def _point_row(event_id: str, observed: np.ndarray, forecast: np.ndarray) -> dict[str, object]:
