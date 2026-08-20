@@ -325,6 +325,35 @@ def _paper_ablation_kwargs(tmp_path: Path, variant: str) -> dict[str, object]:
     }
 
 
+def test_aggregate_publication_allows_primary_identity_without_sampler(tmp_path: Path) -> None:
+    directory = tmp_path / "primary"
+    identity = {
+        "schema_version": 1,
+        "evaluation": "retrospective-loeo-ablation-primary",
+        "causal": False,
+        "variant": "H1",
+        "fold_identities": ["base-fold", "retry-fold"],
+    }
+
+    def write(temporary: Path) -> None:
+        pl.DataFrame({"hour": [0]}).write_parquet(temporary / "hourly_predictions.parquet")
+        pl.DataFrame({"event": ["seollal-2024"]}).write_parquet(
+            temporary / "per_event_metrics.parquet"
+        )
+        pl.DataFrame({"group": ["pooled"]}).write_parquet(temporary / "aggregate_metrics.parquet")
+
+    ablation_module._publish_directory(
+        directory,
+        identity=identity,
+        files=ablation_module._PRIMARY_FILES,
+        writer=write,
+    )
+
+    ablation_module._validate_complete(
+        directory, identity=identity, files=ablation_module._PRIMARY_FILES
+    )
+
+
 @pytest.mark.parametrize("variant", ["H1", "H2"])
 def test_ablation_retries_paper_divergence_once_with_signed_provenance_and_reuses_retry(
     variant: str,

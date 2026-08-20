@@ -102,17 +102,20 @@ def _validate_complete(
     manifest = _read_json(directory / "manifest.json", "ablation manifest")
     if manifest.get("identity") != dict(identity):
         raise LOEOAblationError("ablation publication identity differs")
-    sampler = identity.get("sampler")
-    if not isinstance(sampler, Mapping):
-        raise LOEOAblationError("ablation sampler identity differs")
     retry_failure = manifest.get("retry_failure")
-    try:
-        if "retry" in sampler:
-            fold_contract.validate_retry_failure(sampler, retry_failure)
-        elif "retry_failure" in manifest:
-            raise LOEOFoldError("base ablation publication cannot record retry failure")
-    except LOEOFoldError as error:
-        raise LOEOAblationError("ablation retry provenance differs") from error
+    if files == _FOLD_FILES:
+        sampler = identity.get("sampler")
+        if not isinstance(sampler, Mapping):
+            raise LOEOAblationError("ablation sampler identity differs")
+        try:
+            if "retry" in sampler:
+                fold_contract.validate_retry_failure(sampler, retry_failure)
+            elif "retry_failure" in manifest:
+                raise LOEOFoldError("base ablation publication cannot record retry failure")
+        except LOEOFoldError as error:
+            raise LOEOAblationError("ablation retry provenance differs") from error
+    elif "retry_failure" in manifest:
+        raise LOEOAblationError("aggregate ablation publication cannot record retry failure")
     outputs = manifest.get("outputs")
     if not isinstance(outputs, dict) or set(outputs) != set(files):
         raise LOEOAblationError("ablation publication output registry differs")
@@ -143,16 +146,19 @@ def _publish_directory(
     writer,
     retry_failure: Mapping[str, object] | None = None,
 ) -> None:
-    sampler = identity.get("sampler")
-    if not isinstance(sampler, Mapping):
-        raise LOEOAblationError("ablation sampler identity differs")
-    try:
-        if "retry" in sampler:
-            fold_contract.validate_retry_failure(sampler, retry_failure)
-        elif retry_failure is not None:
-            raise LOEOFoldError("base ablation publication cannot record retry failure")
-    except LOEOFoldError as error:
-        raise LOEOAblationError("ablation retry provenance differs") from error
+    if files == _FOLD_FILES:
+        sampler = identity.get("sampler")
+        if not isinstance(sampler, Mapping):
+            raise LOEOAblationError("ablation sampler identity differs")
+        try:
+            if "retry" in sampler:
+                fold_contract.validate_retry_failure(sampler, retry_failure)
+            elif retry_failure is not None:
+                raise LOEOFoldError("base ablation publication cannot record retry failure")
+        except LOEOFoldError as error:
+            raise LOEOAblationError("ablation retry provenance differs") from error
+    elif retry_failure is not None:
+        raise LOEOAblationError("aggregate ablation publication cannot record retry failure")
     final.parent.mkdir(parents=True, exist_ok=True)
     if final.exists():
         _validate_complete(final, identity=identity, files=files)
