@@ -602,7 +602,8 @@ def test_ablation_retries_paper_divergence_once_with_signed_provenance_and_reuse
     assert calls[0]["target_accept"] == 0.99
     assert calls[0]["tune"] == 1_000
     assert calls[1]["target_accept"] == 0.999
-    assert calls[1]["tune"] == 2_000
+    assert calls[1]["draws"] == 2_000
+    assert calls[1]["tune"] == 3_000
     assert calls[1]["seed"] == fold_contract.derive_loeo_seed(
         71, f"{variant}-fold-sampler-retry-1:seollal-2024"
     )
@@ -622,7 +623,7 @@ def test_ablation_retries_paper_divergence_once_with_signed_provenance_and_reuse
         device="cpu",
     )
     assert manifest["retry_failure"] == {
-        "reason": "divergence-only",
+        "reason": "diagnostic-rescue",
         "base_sampler_sha256": fold_contract.sha_json(base_sampler),
         "diagnostics": {
             "max_rhat": 1.01,
@@ -720,12 +721,58 @@ def test_ablation_prefers_a_valid_base_publication_over_retry(
     assert (fitted, reused) == (0, True)
 
 
+def test_legacy_retry_candidate_is_reuse_only_if_directory_disappears(
+    approved_fold,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, publication, approved = approved_fold
+    inputs = prepare_loeo_fold_inputs(
+        source, publication, approved, held_out_occurrence_id="seollal-2024"
+    )
+    base = fold_contract.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        variant="H1",
+        draws=1_000,
+        tune=1_000,
+        chains=4,
+        cores=1,
+    )
+    legacy = fold_contract.legacy_retry_sampler_contract(
+        base, variant="H1", held_out_occurrence_id="seollal-2024"
+    )
+    identity = ablation_module._fold_identity(
+        source,
+        publication,
+        approved,
+        held_out="seollal-2024",
+        variant="H1",
+        sampler=legacy,
+    )
+    monkeypatch.setattr(
+        ablation_module,
+        "sample_hqrc",
+        lambda *_args, **_kwargs: pytest.fail("sampled a read-only legacy retry"),
+    )
+
+    with pytest.raises(ablation_module.LOEOAblationError, match="reuse-only"):
+        ablation_module._fit_fold_attempt(
+            inputs,
+            variant="H1",
+            sampler=legacy,
+            identity=identity,
+            directory=tmp_path / "missing-legacy",
+            reuse_only=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("profile", "diagnostics"),
     [
         ("smoke", SamplingDiagnostics(1.02, 500.0, 450.0, 1)),
-        ("paper", SamplingDiagnostics(1.02, 500.0, 450.0, 0)),
-        ("paper", SamplingDiagnostics(1.0, 1.0, 1.0, 0)),
+        ("paper", SamplingDiagnostics(1.0, 500.0, 450.0, 0)),
         ("paper", None),
     ],
 )

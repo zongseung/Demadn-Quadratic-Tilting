@@ -331,6 +331,7 @@ def _fit_loeo_fold_attempt(
                         else PYMC_INITIALIZATION
                     ),
                     target_accept=float(sampler["target_accept"]),
+                    full_mass=bool(sampler.get("full_mass", False)),
                     backend=str(sampler["backend"]),
                     device=str(sampler.get("logical_device", "cpu")),
                     paper_profile=profile == "paper",
@@ -381,6 +382,7 @@ def _fit_loeo_fold_attempt(
                     str(sampler["init"]) if sampler["backend"] == "pymc" else PYMC_INITIALIZATION
                 ),
                 target_accept=float(sampler["target_accept"]),
+                full_mass=bool(sampler.get("full_mass", False)),
                 backend=str(sampler["backend"]),
                 device=str(sampler.get("logical_device", "cpu")),
                 paper_profile=profile == "paper",
@@ -471,6 +473,11 @@ def _resolved_samplers(
             variant="H3",
             held_out_occurrence_id=held_out_occurrence_id,
         ),
+        publication_io.legacy_retry_sampler_contract(
+            base,
+            variant="H3",
+            held_out_occurrence_id=held_out_occurrence_id,
+        ),
     )
 
 
@@ -551,8 +558,8 @@ def fit_loeo_fold(
             source, publication, approved_set, **common, _sampler=samplers[0]
         )
     except SamplingError as error:
-        diagnostics = publication_io.retryable_divergence(error)
-        if diagnostics is None or len(samplers) != 2:
+        diagnostics = publication_io.retryable_diagnostics(error)
+        if diagnostics is None or len(samplers) < 2:
             raise
         retry_failure = publication_io.retry_failure_payload(samplers[1], diagnostics)
         retried = _fit_loeo_fold_attempt(

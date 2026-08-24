@@ -284,6 +284,7 @@ def _fit_fold_attempt(
     identity: Mapping[str, object],
     directory: Path,
     retry_failure: Mapping[str, object] | None = None,
+    reuse_only: bool = False,
 ) -> tuple[Path, int, bool]:
     if directory.exists():
         _validate_complete(directory, identity=identity, files=_FOLD_FILES)
@@ -296,6 +297,11 @@ def _fit_fold_attempt(
         finally:
             idata.close()
         return directory, 0, True
+
+    if reuse_only:
+        raise LOEOAblationError(
+            "reuse-only retry publication disappeared before it could be loaded"
+        )
 
     idata = sample_hqrc(
         inputs.hqrc_data,
@@ -310,6 +316,7 @@ def _fit_fold_attempt(
         seed=int(sampler["seed"]),
         init=(str(sampler["init"]) if sampler["backend"] == "pymc" else PYMC_INITIALIZATION),
         target_accept=float(sampler["target_accept"]),
+        full_mass=bool(sampler.get("full_mass", False)),
         backend=str(sampler["backend"]),
         device=str(sampler.get("logical_device", "cpu")),
         paper_profile=sampler["profile"] == "paper",
@@ -406,6 +413,7 @@ def _fit_fold(
     retry_sampler: dict[str, object] | None = None
     retry_identity: dict[str, object] | None = None
     retry_directory: Path | None = None
+    legacy_retry: tuple[dict[str, object], dict[str, object], Path] | None = None
     if profile == "paper":
         retry_sampler = fold_contract.retry_sampler_contract(
             sampler, variant=variant, held_out_occurrence_id=held_out
@@ -426,6 +434,29 @@ def _fit_fold(
             profile=profile,
             identity=retry_identity,
         )
+        legacy_sampler = fold_contract.legacy_retry_sampler_contract(
+            sampler, variant=variant, held_out_occurrence_id=held_out
+        )
+        legacy_identity = _fold_identity(
+            source,
+            publication,
+            approved_set,
+            held_out=held_out,
+            variant=variant,
+            sampler=legacy_sampler,
+        )
+        legacy_retry = (
+            legacy_sampler,
+            legacy_identity,
+            _fold_directory(
+                output_root,
+                publication,
+                held_out=held_out,
+                variant=variant,
+                profile=profile,
+                identity=legacy_identity,
+            ),
+        )
     if directory.exists():
         return _fit_fold_attempt(
             inputs, variant=variant, sampler=sampler, identity=identity, directory=directory
@@ -437,13 +468,23 @@ def _fit_fold(
             sampler=retry_sampler,
             identity=retry_identity,
             directory=retry_directory,
+            reuse_only=True,
+        )
+    if legacy_retry is not None and legacy_retry[2].exists():
+        return _fit_fold_attempt(
+            inputs,
+            variant=variant,
+            sampler=legacy_retry[0],
+            identity=legacy_retry[1],
+            directory=legacy_retry[2],
+            reuse_only=True,
         )
     try:
         return _fit_fold_attempt(
             inputs, variant=variant, sampler=sampler, identity=identity, directory=directory
         )
     except SamplingError as error:
-        diagnostics = fold_contract.retryable_divergence(error)
+        diagnostics = fold_contract.retryable_diagnostics(error)
         if (
             diagnostics is None
             or retry_sampler is None

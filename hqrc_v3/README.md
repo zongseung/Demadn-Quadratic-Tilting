@@ -283,6 +283,14 @@ same `paper` or `resume` command revalidates completed immutable artifacts and
 continues at the first incomplete identity; it does not delete mismatched or
 partial evidence.
 
+LOEO paper fits keep the statistical model, likelihood, and priors fixed. If a
+base fit fails the pre-specified gate (zero divergences, maximum rank-normalized
+R-hat 1.01, and minimum bulk/tail ESS 400), the fold receives exactly one
+deterministic diagnostic rescue with 3,000 warm-up iterations and 2,000 retained
+draws per chain, target acceptance 0.999, and a dense Pyro mass matrix. The
+signed retry manifest records the complete first-attempt diagnostics; only a
+rescue that passes the same strict gate is published or used in aggregates.
+
 ## One-command manuscript runner
 
 `run-paper` is the portable operator entry point.  It first completes the shared

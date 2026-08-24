@@ -1844,7 +1844,7 @@ def test_paper_v2_jitter_sampler_contract_is_identity_bound(approved_fold) -> No
         )
 
 
-def test_retry_sampler_contract_is_immutable_and_divergence_only() -> None:
+def test_retry_sampler_contract_is_immutable_and_diagnostic_only() -> None:
     base = loeo_publication_module.sampler_contract(
         "paper",
         root_seed=71,
@@ -1876,23 +1876,24 @@ def test_retry_sampler_contract_is_immutable_and_divergence_only() -> None:
 
     assert base == expected_base
     assert retry["target_accept"] == 0.999
-    assert retry["tune"] == 2_000
+    assert retry["draws"] == 2_000
+    assert retry["tune"] == 3_000
     assert retry["seed"] == loeo_contract_module.derive_loeo_seed(
         71, "H3-fold-sampler-retry-1:seollal-2024"
     )
     assert retry["seed"] != base["seed"]
-    for field in ("draws", "chains", "cores", "backend", "init"):
+    for field in ("chains", "cores", "backend", "init"):
         assert retry[field] == base[field]
     assert retry["retry"] == {
         "attempt": 1,
-        "reason": "divergence-only",
+        "reason": "diagnostic-rescue",
         "base_sampler_sha256": loeo_contract_module.sha_json(base),
     }
 
     diagnostics = SamplingDiagnostics(1.01, 500.0, 450.0, 1)
     failure = loeo_publication_module.retry_failure_payload(retry, diagnostics)
     assert failure == {
-        "reason": "divergence-only",
+        "reason": "diagnostic-rescue",
         "base_sampler_sha256": loeo_contract_module.sha_json(base),
         "diagnostics": {
             "max_rhat": 1.01,
@@ -1902,7 +1903,7 @@ def test_retry_sampler_contract_is_immutable_and_divergence_only() -> None:
         },
     }
     assert loeo_publication_module.validate_retry_failure(retry, failure) is None
-    with pytest.raises(LOEOFoldError, match="retry|divergence"):
+    with pytest.raises(LOEOFoldError, match="retry|gate"):
         loeo_publication_module.retry_failure_payload(
             retry, SamplingDiagnostics(1.01, 500.0, 450.0, 0)
         )
@@ -1925,7 +1926,93 @@ def test_retry_sampler_contract_is_immutable_and_divergence_only() -> None:
         )
 
 
-def test_divergence_retry_accepts_exact_diagnostic_boundaries_for_live_and_signed_data() -> None:
+@pytest.mark.parametrize(
+    "diagnostics",
+    [
+        SamplingDiagnostics(1.01, 853.0, 361.0, 19),
+        SamplingDiagnostics(1.02, 813.0, 822.0, 0),
+    ],
+)
+def test_paper_rescue_accepts_observed_transformer_and_seq2seq_diagnostic_failures(
+    diagnostics: SamplingDiagnostics,
+) -> None:
+    error = SamplingError("diagnostics", diagnostics=diagnostics)
+    base = loeo_publication_module.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        draws=None,
+        tune=None,
+        chains=None,
+        backend="pyro",
+    )
+
+    assert loeo_publication_module.retryable_diagnostics(error) is diagnostics
+    retry = loeo_publication_module.retry_sampler_contract(
+        base,
+        variant="H3",
+        held_out_occurrence_id="seollal-2024",
+    )
+
+    assert retry["draws"] == 2_000
+    assert retry["tune"] == 3_000
+    assert retry["target_accept"] == 0.999
+    assert retry["full_mass"] is True
+    assert retry["retry"]["reason"] == "diagnostic-rescue"
+    failure = loeo_publication_module.retry_failure_payload(retry, diagnostics)
+    assert failure["reason"] == "diagnostic-rescue"
+    assert loeo_publication_module.validate_retry_failure(retry, failure) is None
+
+
+def test_legacy_divergence_retry_remains_valid_for_read_only_resume() -> None:
+    base = loeo_publication_module.sampler_contract(
+        "paper",
+        root_seed=71,
+        held_out_occurrence_id="seollal-2024",
+        draws=None,
+        tune=None,
+        chains=None,
+        backend="pyro",
+    )
+
+    legacy = loeo_publication_module.legacy_retry_sampler_contract(
+        base,
+        variant="H3",
+        held_out_occurrence_id="seollal-2024",
+    )
+
+    assert legacy["draws"] == 1_000
+    assert legacy["tune"] == 2_000
+    assert legacy["target_accept"] == 0.999
+    assert "full_mass" not in legacy
+    assert legacy["retry"]["reason"] == "divergence-only"
+    failure = loeo_publication_module.retry_failure_payload(
+        legacy, SamplingDiagnostics(1.01, 500.0, 450.0, 1)
+    )
+    assert failure["reason"] == "divergence-only"
+    assert loeo_publication_module.validate_retry_failure(legacy, failure) is None
+
+    candidates = loeo_stage_module._resolved_samplers(
+        held_out_occurrence_id="seollal-2024",
+        sampler_seed=71,
+        profile="paper",
+        draws=None,
+        tune=None,
+        chains=None,
+        cores=1,
+        init=None,
+        target_accept=None,
+        backend="pyro",
+        device="cpu",
+    )
+    assert [candidate.get("retry", {}).get("reason") for candidate in candidates] == [
+        None,
+        "diagnostic-rescue",
+        "divergence-only",
+    ]
+
+
+def test_diagnostic_retry_accepts_exact_divergence_boundary_for_live_and_signed_data() -> None:
     diagnostics = SamplingDiagnostics(1.01, 400.0, 400.0, 1)
     error = SamplingError("divergences", diagnostics=diagnostics)
     base = loeo_publication_module.sampler_contract(
@@ -1940,7 +2027,7 @@ def test_divergence_retry_accepts_exact_diagnostic_boundaries_for_live_and_signe
         base, variant="H3", held_out_occurrence_id="seollal-2024"
     )
 
-    assert loeo_publication_module.retryable_divergence(error) is diagnostics
+    assert loeo_publication_module.retryable_diagnostics(error) is diagnostics
     failure = loeo_publication_module.retry_failure_payload(retry, diagnostics)
     assert loeo_publication_module.validate_retry_failure(retry, failure) is None
 
@@ -1951,10 +2038,9 @@ def test_divergence_retry_accepts_exact_diagnostic_boundaries_for_live_and_signe
         ("max_rhat", 1.0100001),
         ("min_bulk_ess", 399.999),
         ("min_tail_ess", 399.999),
-        ("divergences", 0),
     ],
 )
-def test_divergence_retry_rejects_each_non_divergence_diagnostic_failure(
+def test_diagnostic_retry_accepts_each_strict_gate_failure(
     field: str, value: object
 ) -> None:
     diagnostics = replace(
@@ -1973,15 +2059,19 @@ def test_divergence_retry_rejects_each_non_divergence_diagnostic_failure(
     retry = loeo_publication_module.retry_sampler_contract(
         base, variant="H3", held_out_occurrence_id="seollal-2024"
     )
-    failure = {
-        "reason": "divergence-only",
-        "base_sampler_sha256": retry["retry"]["base_sampler_sha256"],
-        "diagnostics": asdict(diagnostics),
-    }
+    assert loeo_publication_module.retryable_diagnostics(error) is diagnostics
+    failure = loeo_publication_module.retry_failure_payload(retry, diagnostics)
+    assert loeo_publication_module.validate_retry_failure(retry, failure) is None
 
-    assert loeo_publication_module.retryable_divergence(error) is None
-    with pytest.raises(LOEOFoldError, match="diagnostics"):
-        loeo_publication_module.validate_retry_failure(retry, failure)
+
+def test_diagnostic_retry_rejects_passing_diagnostics() -> None:
+    diagnostics = SamplingDiagnostics(1.01, 400.0, 400.0, 0)
+    assert (
+        loeo_publication_module.retryable_diagnostics(
+            SamplingError("passing", diagnostics=diagnostics)
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("field", ["max_rhat", "min_bulk_ess", "min_tail_ess", "divergences"])
@@ -2006,12 +2096,12 @@ def test_divergence_retry_rejects_non_finite_and_non_numeric_diagnostic_values(
         base, variant="H3", held_out_occurrence_id="seollal-2024"
     )
     failure = {
-        "reason": "divergence-only",
+        "reason": "diagnostic-rescue",
         "base_sampler_sha256": retry["retry"]["base_sampler_sha256"],
         "diagnostics": asdict(diagnostics),
     }
 
-    assert loeo_publication_module.retryable_divergence(error) is None
+    assert loeo_publication_module.retryable_diagnostics(error) is None
     with pytest.raises(LOEOFoldError, match="diagnostics"):
         loeo_publication_module.validate_retry_failure(retry, failure)
 
@@ -2057,7 +2147,7 @@ def test_retry_failure_rejects_malformed_diagnostics_with_loeo_error(diagnostics
         held_out_occurrence_id="seollal-2024",
     )
     failure = {
-        "reason": "divergence-only",
+        "reason": "diagnostic-rescue",
         "base_sampler_sha256": retry["retry"]["base_sampler_sha256"],
         "diagnostics": diagnostics,
     }
@@ -2090,9 +2180,10 @@ def test_retry_sampler_contract_preserves_pyro_device_metadata_and_higher_tune(m
         held_out_occurrence_id="seollal-2024",
     )
 
-    assert retry["tune"] == 2_500
+    assert retry["draws"] == 2_000
+    assert retry["tune"] == 3_000
+    assert retry["full_mass"] is True
     for field in (
-        "draws",
         "chains",
         "cores",
         "backend",
@@ -2122,7 +2213,8 @@ def test_h3_divergence_retry_publishes_signed_failure_and_reuses_without_base_re
 
     assert fitted.sampler_fit_count == 2 and fitted.reused is False
     assert [call["target_accept"] for call in calls] == [0.99, 0.999]
-    assert [call["tune"] for call in calls] == [1_000, 2_000]
+    assert [call["draws"] for call in calls] == [1_000, 2_000]
+    assert [call["tune"] for call in calls] == [1_000, 3_000]
     assert calls[1]["seed"] == derive_loeo_seed(
         71, "H3-fold-sampler-retry-1:seollal-2024"
     )
@@ -2137,7 +2229,7 @@ def test_h3_divergence_retry_publishes_signed_failure_and_reuses_without_base_re
         cores=1,
     )
     assert manifest["retry_failure"] == {
-        "reason": "divergence-only",
+        "reason": "diagnostic-rescue",
         "base_sampler_sha256": loeo_contract_module.sha_json(base_sampler),
         "diagnostics": {
             "max_rhat": 1.01,
@@ -2199,7 +2291,7 @@ def test_h3_divergence_retry_prefers_valid_base_over_valid_retry(
 
 @pytest.mark.parametrize(
     "diagnostics",
-    [SamplingDiagnostics(1.02, 500.0, 450.0, 0), None],
+    [SamplingDiagnostics(1.0, 500.0, 450.0, 0), None],
 )
 def test_h3_divergence_retry_rejects_ineligible_base_failure(
     diagnostics: SamplingDiagnostics | None,

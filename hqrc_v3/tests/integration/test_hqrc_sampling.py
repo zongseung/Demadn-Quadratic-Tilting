@@ -263,7 +263,7 @@ def test_paper_diagnostics_fail_closed_without_divergence_statistics():
         validate_inference_data(idata, paper_profile=True)
 
 
-def test_paper_diagnostic_failure_preserves_exact_diagnostics_and_only_divergences_retry(
+def test_paper_diagnostic_failure_preserves_exact_diagnostics_for_rescue(
     monkeypatch,
 ):
     expected = SamplingDiagnostics(1.01, 500.0, 450.0, 1)
@@ -285,14 +285,36 @@ def test_paper_diagnostic_failure_preserves_exact_diagnostics_and_only_divergenc
         validate_inference_data(idata, paper_profile=True)
 
     assert raised.value.diagnostics == expected
-    assert loeo_publication_module.retryable_divergence(raised.value) is raised.value.diagnostics
-    assert loeo_publication_module.retryable_divergence(SamplingError("missing")) is None
-    assert (
-        loeo_publication_module.retryable_divergence(
-            SamplingError("rhat", diagnostics=SamplingDiagnostics(1.02, 500.0, 450.0, 0))
-        )
-        is None
+    assert loeo_publication_module.retryable_diagnostics(raised.value) is raised.value.diagnostics
+    assert loeo_publication_module.retryable_diagnostics(SamplingError("missing")) is None
+    rhat = SamplingError(
+        "rhat", diagnostics=SamplingDiagnostics(1.02, 500.0, 450.0, 0)
     )
+    assert loeo_publication_module.retryable_diagnostics(rhat) is rhat.diagnostics
+
+
+@pytest.mark.parametrize(
+    "bulk_ess",
+    [pytest.param(None, id="missing"), pytest.param(np.nan, id="non-finite")],
+)
+def test_malformed_ess_fails_paper_gate_without_authorizing_rescue(monkeypatch, bulk_ess):
+    summary = {
+        "r_hat": np.array([1.0]),
+        "ess_tail": np.array([500.0]),
+    }
+    if bulk_ess is not None:
+        summary["ess_bulk"] = np.array([bulk_ess])
+    monkeypatch.setattr(sampler_module.az, "summary", lambda *_args, **_kwargs: summary)
+    idata = az.from_dict(
+        posterior={"phi": np.zeros((4, 8))},
+        sample_stats={"diverging": np.zeros((4, 8), dtype=np.int8)},
+    )
+
+    with pytest.raises(SamplingError) as raised:
+        validate_inference_data(idata, paper_profile=True)
+
+    assert not np.isfinite(raised.value.diagnostics.min_bulk_ess)
+    assert loeo_publication_module.retryable_diagnostics(raised.value) is None
 
 
 @pytest.mark.parametrize("cores", [2, 3, 5])
@@ -563,8 +585,8 @@ def test_run_pyro_chain_constructs_one_chain_mcmc_and_integer_divergences(monkey
     model = object()
 
     class FakeNUTS:
-        def __init__(self, selected_model, *, target_accept_prob):
-            captured["nuts"] = (selected_model, target_accept_prob)
+        def __init__(self, selected_model, *, target_accept_prob, full_mass):
+            captured["nuts"] = (selected_model, target_accept_prob, full_mass)
 
     class FakeMCMC:
         def __init__(self, kernel, **kwargs):
@@ -591,13 +613,14 @@ def test_run_pyro_chain_constructs_one_chain_mcmc_and_integer_divergences(monkey
         tune=3,
         seed=17,
         target_accept=0.9,
+        full_mass=True,
         num_chains=1,
     )
 
     kernel, mcmc_kwargs = captured["mcmc"]
     assert isinstance(kernel, FakeNUTS)
     assert captured["seed"] == 17
-    assert captured["nuts"] == (model, 0.9)
+    assert captured["nuts"] == (model, 0.9, True)
     assert mcmc_kwargs == {
         "num_samples": 4,
         "warmup_steps": 3,

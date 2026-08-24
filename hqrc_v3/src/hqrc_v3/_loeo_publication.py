@@ -78,7 +78,7 @@ COMPLETE_TOP = {
 }
 
 
-def _eligible_divergence_diagnostics(diagnostics: object) -> bool:
+def _eligible_retry_diagnostics(diagnostics: object) -> bool:
     if not isinstance(diagnostics, SamplingDiagnostics):
         return False
     continuous = (diagnostics.max_rhat, diagnostics.min_bulk_ess, diagnostics.min_tail_ess)
@@ -89,9 +89,23 @@ def _eligible_divergence_diagnostics(diagnostics: object) -> bool:
         for value in continuous
     ):
         return False
+    if (
+        isinstance(diagnostics.divergences, bool)
+        or not isinstance(diagnostics.divergences, int)
+        or diagnostics.divergences < 0
+    ):
+        return False
     return (
-        not isinstance(diagnostics.divergences, bool)
-        and isinstance(diagnostics.divergences, int)
+        diagnostics.divergences > 0
+        or diagnostics.max_rhat > 1.01
+        or diagnostics.min_bulk_ess < 400
+        or diagnostics.min_tail_ess < 400
+    )
+
+
+def _eligible_legacy_divergence(diagnostics: object) -> bool:
+    return (
+        _eligible_retry_diagnostics(diagnostics)
         and diagnostics.divergences > 0
         and diagnostics.max_rhat <= 1.01
         and diagnostics.min_bulk_ess >= 400
@@ -99,20 +113,18 @@ def _eligible_divergence_diagnostics(diagnostics: object) -> bool:
     )
 
 
-def retryable_divergence(error: BaseException) -> SamplingDiagnostics | None:
-    """Return diagnostics only for an eligible paper divergence failure."""
+def retryable_diagnostics(error: BaseException) -> SamplingDiagnostics | None:
+    """Return finite diagnostics only when the strict paper gate failed."""
 
     if not isinstance(error, SamplingError):
         return None
     diagnostics = error.diagnostics
-    return diagnostics if _eligible_divergence_diagnostics(diagnostics) else None
+    return diagnostics if _eligible_retry_diagnostics(diagnostics) else None
 
 
-def retry_sampler_contract(
-    base: Mapping[str, object], *, variant: str, held_out_occurrence_id: str
+def _retry_sampler_contract(
+    base: Mapping[str, object], *, variant: str, held_out_occurrence_id: str, legacy: bool
 ) -> dict[str, object]:
-    """Derive the one permitted paper divergence retry without mutating its base."""
-
     if variant not in {"H1", "H2", "H3"}:
         raise LOEOFoldError("LOEO sampler variant must be H1, H2, or H3")
     if base.get("profile") != "paper" or base.get("target_accept") != 0.99:
@@ -127,22 +139,54 @@ def retry_sampler_contract(
     tune = base.get("tune")
     if isinstance(tune, bool) or not isinstance(tune, int) or tune <= 0:
         raise LOEOFoldError("LOEO retry base sampler tune is invalid")
+    draws = base.get("draws")
+    if isinstance(draws, bool) or not isinstance(draws, int) or draws <= 0:
+        raise LOEOFoldError("LOEO retry base sampler draws are invalid")
     retry = dict(base)
     retry.update(
         {
             "seed": derive_loeo_seed(
                 root_seed, f"{variant}-fold-sampler-retry-1:{held_out_occurrence_id}"
             ),
-            "tune": max(2_000, tune),
+            "draws": draws if legacy else max(2_000, draws),
+            "tune": max(2_000, tune) if legacy else max(3_000, tune),
             "target_accept": 0.999,
             "retry": {
                 "attempt": 1,
-                "reason": "divergence-only",
+                "reason": "divergence-only" if legacy else "diagnostic-rescue",
                 "base_sampler_sha256": sha_json(base),
             },
         }
     )
+    if not legacy and base.get("backend") == "pyro":
+        retry["full_mass"] = True
     return retry
+
+
+def retry_sampler_contract(
+    base: Mapping[str, object], *, variant: str, held_out_occurrence_id: str
+) -> dict[str, object]:
+    """Derive the one permitted paper diagnostic rescue without mutating its base."""
+
+    return _retry_sampler_contract(
+        base,
+        variant=variant,
+        held_out_occurrence_id=held_out_occurrence_id,
+        legacy=False,
+    )
+
+
+def legacy_retry_sampler_contract(
+    base: Mapping[str, object], *, variant: str, held_out_occurrence_id: str
+) -> dict[str, object]:
+    """Reconstruct the former divergence-only identity for read-only reuse."""
+
+    return _retry_sampler_contract(
+        base,
+        variant=variant,
+        held_out_occurrence_id=held_out_occurrence_id,
+        legacy=True,
+    )
 
 
 def _retry_metadata(retry_sampler: Mapping[str, object]) -> Mapping[str, object]:
@@ -151,7 +195,7 @@ def _retry_metadata(retry_sampler: Mapping[str, object]) -> Mapping[str, object]
         not isinstance(retry, Mapping)
         or set(retry) != {"attempt", "reason", "base_sampler_sha256"}
         or retry.get("attempt") != 1
-        or retry.get("reason") != "divergence-only"
+        or retry.get("reason") not in {"diagnostic-rescue", "divergence-only"}
         or not isinstance(retry.get("base_sampler_sha256"), str)
         or len(retry["base_sampler_sha256"]) != 64
     ):
@@ -159,9 +203,16 @@ def _retry_metadata(retry_sampler: Mapping[str, object]) -> Mapping[str, object]
     return retry
 
 
-def _retry_diagnostics_payload(diagnostics: SamplingDiagnostics) -> dict[str, object]:
-    if not _eligible_divergence_diagnostics(diagnostics):
-        raise LOEOFoldError("LOEO retry diagnostics are not divergence-only")
+def _retry_diagnostics_payload(
+    diagnostics: SamplingDiagnostics, *, reason: object
+) -> dict[str, object]:
+    eligible = (
+        _eligible_legacy_divergence(diagnostics)
+        if reason == "divergence-only"
+        else _eligible_retry_diagnostics(diagnostics)
+    )
+    if not eligible:
+        raise LOEOFoldError("LOEO retry diagnostics do not fail the paper gate")
     values = {
         "max_rhat": diagnostics.max_rhat,
         "min_bulk_ess": diagnostics.min_bulk_ess,
@@ -178,20 +229,20 @@ def retry_failure_payload(
 
     retry = _retry_metadata(retry_sampler)
     return {
-        "reason": "divergence-only",
+        "reason": retry["reason"],
         "base_sampler_sha256": retry["base_sampler_sha256"],
-        "diagnostics": _retry_diagnostics_payload(diagnostics),
+        "diagnostics": _retry_diagnostics_payload(diagnostics, reason=retry["reason"]),
     }
 
 
 def validate_retry_failure(retry_sampler: Mapping[str, object], retry_failure: object) -> None:
-    """Reject a retry manifest record unless it is a divergence-only first failure."""
+    """Reject a retry manifest record unless it is a strict-gate first failure."""
 
     retry = _retry_metadata(retry_sampler)
     if (
         not isinstance(retry_failure, Mapping)
         or set(retry_failure) != {"reason", "base_sampler_sha256", "diagnostics"}
-        or retry_failure.get("reason") != "divergence-only"
+        or retry_failure.get("reason") != retry["reason"]
         or retry_failure.get("base_sampler_sha256") != retry["base_sampler_sha256"]
         or not isinstance(retry_failure.get("diagnostics"), Mapping)
     ):
@@ -205,7 +256,8 @@ def validate_retry_failure(retry_sampler: Mapping[str, object], retry_failure: o
             min_bulk_ess=diagnostics["min_bulk_ess"],
             min_tail_ess=diagnostics["min_tail_ess"],
             divergences=diagnostics["divergences"],
-        )
+        ),
+        reason=retry["reason"],
     )
 
 
@@ -525,6 +577,8 @@ def _validate_posterior_provenance(
         "init": sampler["init"],
         "geometry": sampler["geometry"],
     }
+    if sampler.get("full_mass") is True:
+        expected_sampler["full_mass"] = True
     if sampler["backend"] == "pyro":
         expected_sampler.update(
             {

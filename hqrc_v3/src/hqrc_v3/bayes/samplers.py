@@ -75,6 +75,7 @@ class _PyroChainRequest:
     tune: int
     seed: int
     target_accept: float
+    full_mass: bool
     device: str
 
 
@@ -88,8 +89,10 @@ class _PyroChainResult:
 def _summary_value(summary, name: str, reducer, default: float) -> float:
     if name not in summary:
         return default
-    value = float(reducer(np.asarray(summary[name], dtype=float)))
-    return value if math.isfinite(value) else default
+    values = np.asarray(summary[name], dtype=float)
+    if values.size == 0 or not np.isfinite(values).all():
+        return default
+    return float(reducer(values))
 
 
 def validate_inference_data(idata: az.InferenceData, *, paper_profile: bool) -> SamplingDiagnostics:
@@ -112,8 +115,8 @@ def validate_inference_data(idata: az.InferenceData, *, paper_profile: bool) -> 
         divergences = int(raw_diverging.sum())
     diagnostics = SamplingDiagnostics(
         max_rhat=_summary_value(summary, "r_hat", np.nanmax, math.inf),
-        min_bulk_ess=_summary_value(summary, "ess_bulk", np.nanmin, 0.0),
-        min_tail_ess=_summary_value(summary, "ess_tail", np.nanmin, 0.0),
+        min_bulk_ess=_summary_value(summary, "ess_bulk", np.nanmin, -math.inf),
+        min_tail_ess=_summary_value(summary, "ess_tail", np.nanmin, -math.inf),
         divergences=divergences,
     )
     if paper_profile and (
@@ -149,13 +152,14 @@ def _run_pyro_chain(
     tune: int,
     seed: int,
     target_accept: float,
+    full_mass: bool,
     num_chains: int,
 ):
     import pyro
     from pyro.infer import MCMC, NUTS
 
     pyro.set_rng_seed(seed)
-    kernel = NUTS(model, target_accept_prob=target_accept)
+    kernel = NUTS(model, target_accept_prob=target_accept, full_mass=full_mass)
     mcmc = MCMC(
         kernel,
         num_samples=draws,
@@ -254,6 +258,7 @@ def _run_pyro_chain_worker(request: _PyroChainRequest) -> _PyroChainResult:
         tune=request.tune,
         seed=request.seed,
         target_accept=request.target_accept,
+        full_mass=request.full_mass,
         num_chains=1,
     )
     return _public_pyro_chain(
@@ -276,6 +281,7 @@ def _sample_pyro(
     tune: int,
     seed: int,
     target_accept: float,
+    full_mass: bool = False,
     device: str,
     cores: int,
 ) -> tuple[az.InferenceData, ResolvedDevice]:
@@ -300,6 +306,7 @@ def _sample_pyro(
                 tune=tune,
                 seed=seed + chain,
                 target_accept=target_accept,
+                full_mass=full_mass,
                 num_chains=1,
             )
             sequential.append(_public_pyro_chain(chain, samples, divergences, data, variant))
@@ -320,6 +327,7 @@ def _sample_pyro(
                 tune=tune,
                 seed=seed + chain,
                 target_accept=target_accept,
+                full_mass=full_mass,
                 device=resolved.logical_device,
             )
             for chain in range(4)
@@ -356,6 +364,7 @@ def sample_hqrc(
     seed: int = 11,
     init: str = PYMC_INITIALIZATION,
     target_accept: float | None = None,
+    full_mass: bool = False,
     backend: Literal["pymc", "nutpie", "pyro"] = "pymc",
     device: str = "cpu",
     paper_profile: bool = False,
@@ -373,6 +382,10 @@ def sample_hqrc(
         raise ValueError("cores must not exceed chains")
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise TypeError("seed must be an integer")
+    if not isinstance(full_mass, bool):
+        raise TypeError("full_mass must be a boolean")
+    if full_mass and backend != "pyro":
+        raise ValueError("full_mass is supported only by the Pyro backend")
     if init not in PYMC_INITIALIZATION_CHOICES:
         raise ValueError("init must be an approved PyMC initialization")
     if paper_profile and (chains != 4 or draws < 1_000 or tune < 1_000):
@@ -439,6 +452,7 @@ def sample_hqrc(
             tune=tune,
             seed=seed,
             target_accept=resolved_target_accept,
+            full_mass=full_mass,
             device=device,
             cores=cores,
         )
@@ -523,6 +537,8 @@ def sample_hqrc(
         "capability_probe": asdict(resolved.probe),
         "fallback_reason": resolved.fallback_reason,
     }
+    if full_mass:
+        sampler_metadata["full_mass"] = True
     attrs = {
         "hqrc_backend": backend,
         "hqrc_elapsed_seconds": time.perf_counter() - started,

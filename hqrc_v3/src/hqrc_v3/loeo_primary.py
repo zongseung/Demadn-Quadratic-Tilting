@@ -160,6 +160,13 @@ def _matrix_identity(
                     held_out_occurrence_id=held,
                 )
             )
+            candidates.append(
+                fold_publication_io.legacy_retry_sampler_contract(
+                    base,
+                    variant="H3",
+                    held_out_occurrence_id=held,
+                )
+            )
         if (
             any(identity.get(key) != first.get(key) for key in common_keys)
             or identity.get("causal") is not False

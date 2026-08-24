@@ -238,7 +238,7 @@ def test_matrix_identity_accepts_one_exact_retry_and_records_each_effective_samp
     ]
     assert identity["folds"][retry_index]["sampler"]["retry"] == {
         "attempt": 1,
-        "reason": "divergence-only",
+        "reason": "diagnostic-rescue",
         "base_sampler_sha256": sha_json(
             fold_publication_module.sampler_contract(
                 "paper",
