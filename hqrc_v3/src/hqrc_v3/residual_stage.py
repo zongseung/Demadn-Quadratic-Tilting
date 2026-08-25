@@ -1231,7 +1231,7 @@ def prepare_standardized_residual_artifact(
         )
 
 
-def select_diagnostic_residual_context(
+def select_residual_context(
     frame: pl.DataFrame,
     manifest: Mapping[str, Any],
     *,
@@ -1241,21 +1241,21 @@ def select_diagnostic_residual_context(
     seed: int | None,
     through: int,
 ) -> pl.DataFrame:
-    """Select one manifest-declared context and prove its registered event coverage."""
+    """Select any manifest-declared residual context and prove event coverage."""
 
     _validate_standardized_frame(frame)
-    if model not in MODEL_NAMES or feature_set not in _AR_FEATURE_SETS:
-        raise ArtifactMismatch("diagnostic context selector is invalid")
+    if model not in MODEL_NAMES or feature_set not in _FEATURE_SETS:
+        raise ArtifactMismatch("residual context selector is invalid")
     if isinstance(through, bool) or not isinstance(through, int):
-        raise ArtifactMismatch("diagnostic through year must be an integer")
+        raise ArtifactMismatch("residual through year must be an integer")
     profile = manifest.get("profile")
     if profile not in {"paper", "smoke"}:
-        raise ArtifactMismatch("diagnostic residual profile is invalid")
+        raise ArtifactMismatch("residual profile is invalid")
     if profile == "paper" and through != 2023:
-        raise ArtifactMismatch("paper AR diagnostics must stop at OOF year 2023")
+        raise ArtifactMismatch("paper residual selection must stop at OOF year 2023")
     contexts = manifest.get("contexts")
     if not isinstance(contexts, list):
-        raise ArtifactMismatch("diagnostic residual contexts are invalid")
+        raise ArtifactMismatch("residual contexts are invalid")
     matches = [
         record
         for record in contexts
@@ -1265,18 +1265,18 @@ def select_diagnostic_residual_context(
         and (seed is None or record.get("seed") == seed)
     ]
     if len(matches) != 1:
-        raise ArtifactMismatch("diagnostic selectors must match one manifest context")
+        raise ArtifactMismatch("residual selectors must match one manifest context")
     record = matches[0]
     selected_seed = record.get("seed")
     if isinstance(selected_seed, bool) or not isinstance(selected_seed, int):
-        raise ArtifactMismatch("diagnostic context seed is invalid")
+        raise ArtifactMismatch("residual context seed is invalid")
     selected = frame.filter(
         (pl.col("model") == model)
         & (pl.col("feature_set") == feature_set)
         & (pl.col("seed") == selected_seed)
     ).sort("model", "feature_set", "seed", "target_timestamp")
     if selected.is_empty():
-        raise ArtifactMismatch("manifest-declared diagnostic context is absent")
+        raise ArtifactMismatch("manifest-declared residual context is absent")
 
     split_ids = record.get("split_ids")
     if (
@@ -1284,29 +1284,29 @@ def select_diagnostic_residual_context(
         or not split_ids
         or any(not isinstance(value, str) or not is_oof_split_id(value) for value in split_ids)
     ):
-        raise ArtifactMismatch("diagnostic split identities are invalid")
+        raise ArtifactMismatch("residual split identities are invalid")
     split_years = [fold_for_split_id(value).eval_year for value in split_ids]
     if split_ids != [f"oof-{year}" for year in split_years] or split_years != sorted(
         set(split_years)
     ):
-        raise ArtifactMismatch("diagnostic split identities are not canonical")
+        raise ArtifactMismatch("residual split identities are not canonical")
     if max(split_years) != through or any(year > through for year in split_years):
-        raise ArtifactMismatch("diagnostic residuals do not match the numeric through year")
+        raise ArtifactMismatch("residuals do not match the numeric through year")
     if profile == "paper" and split_ids != [f"oof-{year}" for year in range(2020, 2024)]:
-        raise ArtifactMismatch("paper diagnostics require exact OOF 2020-2023 splits")
+        raise ArtifactMismatch("paper residuals require exact OOF 2020-2023 splits")
     if sorted(selected["split_id"].unique().to_list()) != split_ids:
-        raise ArtifactMismatch("diagnostic artifact splits differ from its manifest context")
+        raise ArtifactMismatch("residual artifact splits differ from its manifest context")
 
     lookup = _event_lookup(events).filter(pl.col("split_id").is_in(split_ids))
     expected_occurrences = sorted(lookup["occurrence_id"].unique().to_list())
     if record.get("occurrence_ids") != expected_occurrences:
-        raise ArtifactMismatch("diagnostic occurrence identities differ from the registry")
+        raise ArtifactMismatch("residual occurrence identities differ from the registry")
     if sorted(selected["occurrence_id"].unique().to_list()) != expected_occurrences:
-        raise ArtifactMismatch("diagnostic occurrence coverage differs from the registry")
+        raise ArtifactMismatch("residual occurrence coverage differs from the registry")
     if profile == "paper" and (
         len(expected_occurrences) != 8 or lookup.height != 1_032 or selected.height != 1_032
     ):
-        raise ArtifactMismatch("paper diagnostic event-window coverage differs")
+        raise ArtifactMismatch("paper residual event-window coverage differs")
 
     metadata = (
         "target_timestamp",
@@ -1320,8 +1320,33 @@ def select_diagnostic_residual_context(
     expected_metadata = lookup.select(metadata).sort("target_timestamp")
     actual_metadata = selected.select(metadata).sort("target_timestamp")
     if not actual_metadata.equals(expected_metadata):
-        raise ArtifactMismatch("diagnostic event timestamps or metadata differ from the registry")
+        raise ArtifactMismatch("residual event timestamps or metadata differ from the registry")
     return selected
+
+
+def select_diagnostic_residual_context(
+    frame: pl.DataFrame,
+    manifest: Mapping[str, Any],
+    *,
+    events: Sequence[EventOccurrence],
+    model: str,
+    feature_set: str,
+    seed: int | None,
+    through: int,
+) -> pl.DataFrame:
+    """Select one AR-diagnostic context while retaining its legacy B0/B1 scope."""
+
+    if model not in MODEL_NAMES or feature_set not in _AR_FEATURE_SETS:
+        raise ArtifactMismatch("diagnostic context selector is invalid")
+    return select_residual_context(
+        frame,
+        manifest,
+        events=events,
+        model=model,
+        feature_set=feature_set,
+        seed=seed,
+        through=through,
+    )
 
 
 __all__ = [
@@ -1333,4 +1358,5 @@ __all__ = [
     "load_standardized_residual_manifest",
     "prepare_standardized_residual_artifact",
     "select_diagnostic_residual_context",
+    "select_residual_context",
 ]

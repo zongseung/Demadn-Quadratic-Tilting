@@ -43,7 +43,7 @@ from hqrc_v3.provenance import ArtifactMismatch, file_sha256
 from hqrc_v3.residual_stage import (
     build_standardized_residuals,
     load_standardized_residual_manifest,
-    select_diagnostic_residual_context,
+    select_residual_context,
 )
 from hqrc_v3.splits import expanding_oof_folds, final_fold, select_fold_samples
 
@@ -332,7 +332,7 @@ class ValidatedCorrectionSource:
             "standardized residual artifact",
         )
         try:
-            return select_diagnostic_residual_context(
+            return select_residual_context(
                 frame,
                 self.residual_manifest,
                 events=self.events,

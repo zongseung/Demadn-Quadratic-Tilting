@@ -18,6 +18,7 @@ from hqrc_v3.correction_source import (
 from hqrc_v3.diagnostics.ar import EventResidualContext
 from hqrc_v3.events import EventOccurrence, EventRegistryError
 from hqrc_v3.provenance import file_sha256
+from hqrc_v3.residual_stage import build_standardized_residuals
 
 CONTEXT = EventResidualContext(
     "lightgbm",
@@ -56,6 +57,47 @@ def _canonical_write(path: Path, value: object) -> None:
     )
 
 
+def _standardized_fixture(
+    context: EventResidualContext, events: tuple[EventOccurrence, ...]
+) -> tuple[pl.DataFrame, list[dict[str, object]]]:
+    frames = []
+    for event in events:
+        rows = []
+        days = [
+            event.window_start + timedelta(days=offset)
+            for offset in range((event.window_end - event.window_start).days + 1)
+        ]
+        non_event_day = event.window_end + timedelta(days=7)
+        for day in (*days, non_event_day):
+            origin = datetime.combine(day, datetime.min.time())
+            residual = 10.0 if day in days else 2.0
+            for hour in range(24):
+                rows.append(
+                    {
+                        "origin": origin,
+                        "target_timestamp": origin + timedelta(hours=hour),
+                        "horizon": hour + 1,
+                        "observed_mw": 100.0,
+                        "predicted_mw": 100.0 - residual,
+                        "model": context.model,
+                        "feature_set": context.feature_set,
+                        "seed": context.seed,
+                        "split_id": f"oof-{event.central_date.year}",
+                    }
+                )
+        frames.append(pl.DataFrame(rows))
+    build = build_standardized_residuals(pl.concat(frames), events)
+    scales = [
+        {
+            "split_id": scale.split_id,
+            "sigma_n_mw": scale.sigma_n_mw,
+            "non_event_rows": scale.non_event_rows,
+        }
+        for scale in build.scales
+    ]
+    return build.frame, scales
+
+
 def _install_source_fixture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -64,6 +106,17 @@ def _install_source_fixture(
 ):
     context = EventResidualContext(
         CONTEXT.model, feature_set, CONTEXT.seed, CONTEXT.split_ids
+    )
+    events = tuple(
+        EventOccurrence(
+            occurrence_id=f"seollal-{year}",
+            holiday_type="seollal",
+            central_date=datetime(year, 1, 25).date(),
+            official_start=datetime(year, 1, 24).date(),
+            official_end=datetime(year, 1, 26).date(),
+            restriction=0,
+        )
+        for year in range(2020, 2024)
     )
     run = tmp_path / "run"
     inputs = run / "inputs"
@@ -105,15 +158,7 @@ def _install_source_fixture(
         final_members
     )
     residual_path = inputs / "standardized_residuals.parquet"
-    residual_frame = pl.DataFrame(
-        {
-            "model": [context.model],
-            "feature_set": [context.feature_set],
-            "seed": [context.seed],
-            "split_id": ["oof-2023"],
-            "standardized_residual": [1.0],
-        }
-    )
+    residual_frame, fold_scales = _standardized_fixture(context, events)
     residual_frame.write_parquet(residual_path)
 
     residual_manifest = {
@@ -140,7 +185,7 @@ def _install_source_fixture(
             "standardized_residuals": {
                 "path": "inputs/standardized_residuals.parquet",
                 "sha256": file_sha256(residual_path),
-                "rows": 1,
+                "rows": residual_frame.height,
             }
         },
         "contexts": [
@@ -149,12 +194,12 @@ def _install_source_fixture(
                 "feature_set": context.feature_set,
                 "seed": context.seed,
                 "split_ids": list(context.split_ids),
-                "occurrence_ids": ["seollal-2023"],
-                "rows": 1,
-                "fold_scales": [],
+                "occurrence_ids": [event.occurrence_id for event in events],
+                "rows": residual_frame.height,
+                "fold_scales": fold_scales,
                 "latest_complete_oof_scale": {
                     "split_id": "oof-2023",
-                    "sigma_n_mw": 10.0,
+                    "sigma_n_mw": fold_scales[-1]["sigma_n_mw"],
                 },
             }
         ],
@@ -198,14 +243,6 @@ def _install_source_fixture(
     baseline_manifest_path = predictions / "baseline_manifest.json"
     _canonical_write(baseline_manifest_path, baseline_manifest)
 
-    event = EventOccurrence(
-        occurrence_id="seollal-2023",
-        holiday_type="seollal",
-        central_date=datetime(2023, 1, 22).date(),
-        official_start=datetime(2023, 1, 21).date(),
-        official_end=datetime(2023, 1, 24).date(),
-        restriction=0,
-    )
     target_times = np.asarray(
         [[np.datetime64(datetime(2024, 1, 1) + timedelta(hours=index)) for index in range(24)]]
     )
@@ -217,8 +254,8 @@ def _install_source_fixture(
     matrix.take = lambda _indices: matrix
 
     monkeypatch.setattr(source_module, "load_config", lambda _path: object())
-    monkeypatch.setattr(source_module, "load_event_registry", lambda _path: (event,))
-    monkeypatch.setattr(source_module, "load_holiday_calendar", lambda _path: (event,))
+    monkeypatch.setattr(source_module, "load_event_registry", lambda _path: events)
+    monkeypatch.setattr(source_module, "load_holiday_calendar", lambda _path: events)
     monkeypatch.setattr(
         source_module, "load_temporary_holiday_availability", lambda _path: object()
     )
@@ -256,11 +293,6 @@ def _install_source_fixture(
     )
     monkeypatch.setattr(
         source_module,
-        "select_diagnostic_residual_context",
-        lambda frame, _manifest, **_kwargs: frame.clone(),
-    )
-    monkeypatch.setattr(
-        source_module,
         "build_standardized_residuals",
         lambda _frame, _events: SimpleNamespace(frame=residual_frame.clone()),
     )
@@ -277,7 +309,7 @@ def _install_source_fixture(
         final_point=final_point,
         runner_state=runner_state,
         context=context,
-        event=event,
+        event=events[0],
     )
 
 
@@ -321,6 +353,9 @@ def test_validated_source_accepts_b1w_context_without_aliasing_b1(
 
     assert source.available_contexts == (fixture.context,)
     assert fixture.runner_state.calls[0]["feature_sets"] == ("B1W",)
+    assert source.load_standardized_context(
+        fixture.context, through=2023
+    ).equals(pl.read_parquet(fixture.residual_path))
     with pytest.raises(CorrectionSourceError, match="requested context"):
         source.load_oof_point_context(CONTEXT)
 

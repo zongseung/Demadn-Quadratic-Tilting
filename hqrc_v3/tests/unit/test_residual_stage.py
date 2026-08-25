@@ -197,6 +197,39 @@ def test_standardized_residuals_preserve_b1w_context_identity() -> None:
 
     assert result.frame["feature_set"].unique().to_list() == ["B1W"]
     assert result.scales[0].feature_set == "B1W"
+    manifest = {
+        "profile": "smoke",
+        "contexts": [
+            {
+                "model": "lightgbm",
+                "feature_set": "B1W",
+                "seed": 7,
+                "split_ids": ["oof-2020"],
+                "occurrence_ids": ["seollal-2020"],
+            }
+        ],
+    }
+    selected = residual_stage.select_residual_context(
+        result.frame,
+        manifest,
+        events=(event,),
+        model="lightgbm",
+        feature_set="B1W",
+        seed=7,
+        through=2020,
+    )
+
+    assert selected.equals(result.frame)
+    with pytest.raises(ArtifactMismatch, match="diagnostic context selector"):
+        residual_stage.select_diagnostic_residual_context(
+            result.frame,
+            manifest,
+            events=(event,),
+            model="lightgbm",
+            feature_set="B1W",
+            seed=7,
+            through=2020,
+        )
 
 
 def _full_year_prediction_frame(
