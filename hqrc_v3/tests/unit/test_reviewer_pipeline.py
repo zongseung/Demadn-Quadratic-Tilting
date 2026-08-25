@@ -343,6 +343,17 @@ def test_invalid_profile_contract_fails_before_stages(
     assert calls == []
 
 
+def test_negative_root_seed_fails_before_any_stage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _install_stage_recorders(monkeypatch, tmp_path)
+
+    with pytest.raises(ReviewerPipelineError, match="root seed.*non-negative"):
+        run_hqt_reviewer_pipeline(_options(tmp_path, root_seed=-1))
+
+    assert calls == []
+
+
 def test_pipeline_propagates_stage_failure_and_does_not_run_later_stages(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

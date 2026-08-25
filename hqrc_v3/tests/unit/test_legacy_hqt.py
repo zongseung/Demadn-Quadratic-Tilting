@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -11,6 +12,7 @@ import polars as pl
 import pymc as pm
 import pytest
 
+import hqrc_v3.legacy_hqt_loeo as loeo_module
 from hqrc_v3.bayes.legacy_hqt import (
     LEGACY_HQT_MODEL_SPEC,
     build_legacy_hqt_model,
@@ -32,6 +34,7 @@ from hqrc_v3.legacy_hqt_loeo import (
     event_type_mean_shift_mw,
     run_legacy_hqt_loeo,
 )
+from hqrc_v3.provenance import file_sha256
 
 
 def _tiny_data() -> HQRCData:
@@ -102,6 +105,115 @@ def _legacy_frame(*, event_years: range, feature_set: str) -> pl.DataFrame:
                     }
                 )
     return pl.DataFrame(rows)
+
+
+def _install_checkpoint_runner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[HQRCData]:
+    context = EventResidualContext(
+        "xgboost", "B1", 7, ("oof-2020", "oof-2021", "oof-2022", "oof-2023")
+    )
+    fold = _physical_fold(tmp_path)
+    start = datetime(2024, 9, 14)
+    tau = np.arange(72, dtype=float) / 24.0
+    held_out = LOEOHeldOut(
+        occurrence_id="chuseok-2024",
+        path=tmp_path / "held-out.parquet",
+        universe_sha256="universe-sha",
+        frame=pl.DataFrame(
+            {
+                "causal": [False] * tau.size,
+                "holiday_type": ["chuseok"] * tau.size,
+                "occurrence_id": ["chuseok-2024"] * tau.size,
+                "observed_mw": 100.0 + np.arange(tau.size),
+                "predicted_mw": 99.0 + np.arange(tau.size),
+                "sigma_n_mw": [100.0] * tau.size,
+                "target_timestamp": [start + timedelta(hours=hour) for hour in range(tau.size)],
+                "tau_days": tau,
+            }
+        ),
+        context=context,
+        causal=False,
+    )
+    publication = LOEOPublication(
+        output_dir=tmp_path / "publication",
+        generation_dir=tmp_path / "publication" / "generation",
+        manifest_path=tmp_path / "publication" / "manifest.json",
+        universe_path=tmp_path / "publication" / "universe.parquet",
+        universe_sha256="universe-sha",
+        occurrence_ids=("chuseok-2024",),
+        fold_paths={"chuseok-2024": tmp_path / "publication" / "fold.parquet"},
+        fold_sha256={"chuseok-2024": "fold-sha"},
+        context=context,
+        causal=False,
+    )
+    baseline_manifest = tmp_path / "baseline_manifest.json"
+    baseline_manifest.write_text("{}", encoding="utf-8")
+    source = SimpleNamespace(
+        available_contexts=(context,),
+        baseline_manifest_path=baseline_manifest,
+        residual_sha256="residual-sha",
+    )
+    sampled: list[HQRCData] = []
+
+    def fake_sample(data: HQRCData, **_kwargs: object) -> az.InferenceData:
+        sampled.append(data)
+        idata = az.from_dict(
+            posterior={
+                "mu": np.zeros((1, 2, 2, 3)),
+                "between_cholesky": np.broadcast_to(np.eye(3), (1, 2, 2, 3, 3)),
+            }
+        )
+        idata.attrs["legacy_hqt_model_json"] = json.dumps(LEGACY_HQT_MODEL_SPEC, sort_keys=True)
+        return idata
+
+    monkeypatch.setattr(loeo_module, "validate_correction_source", lambda **_kw: source)
+    monkeypatch.setattr(loeo_module, "publish_loeo_universe", lambda *_args, **_kw: publication)
+    monkeypatch.setattr(loeo_module, "load_loeo_universe", lambda *_args, **_kw: publication)
+    monkeypatch.setattr(loeo_module, "load_loeo_fold", lambda *_args, **_kw: fold)
+    monkeypatch.setattr(loeo_module, "load_loeo_event", lambda *_args, **_kw: held_out)
+    monkeypatch.setattr(loeo_module, "sample_legacy_hqt", fake_sample)
+    monkeypatch.setattr(loeo_module, "validate_inference_data", lambda *_args, **_kw: None)
+    monkeypatch.setattr(
+        loeo_module,
+        "_scale_stability",
+        lambda *_args: pl.DataFrame({"scale_ratio": [1.0]}),
+    )
+    return sampled
+
+
+def _run_checkpoint(tmp_path: Path):
+    return run_legacy_hqt_loeo(
+        source_run_dir=tmp_path / "source",
+        config_path=tmp_path / "experiment.toml",
+        output_root=tmp_path / "output",
+        models=("xgboost",),
+        feature_sets=("B1",),
+        held_out_occurrence_ids=None,
+        root_seed=17,
+        profile="smoke",
+        draws=2,
+        tune=2,
+        chains=1,
+        cores=1,
+    )
+
+
+def _fold_dir(tmp_path: Path) -> Path:
+    return tmp_path / "output/xgboost/B1/seed-7/legacy-hqt/folds/chuseok-2024"
+
+
+def _write_partial_manifest(fold_dir: Path) -> None:
+    identity = (fold_dir / "input_identity.json").read_bytes()
+    manifest = {
+        "files": {
+            "input_identity.json": hashlib.sha256(identity).hexdigest(),
+            "posterior.nc": file_sha256(fold_dir / "posterior.nc"),
+        },
+        "identity_sha256": hashlib.sha256(identity).hexdigest(),
+        "schema_version": 1,
+    }
+    (fold_dir / "manifest.json").write_bytes(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    )
 
 
 def test_legacy_hqt_graph_is_exact_iid_quadratic_partial_pooling() -> None:
@@ -300,96 +412,155 @@ def test_legacy_hqt_selects_b1w_as_a_distinct_context() -> None:
     assert selected == (b1w,)
 
 
+def test_legacy_loeo_posterior_is_stamped_with_fold_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_checkpoint_runner(monkeypatch, tmp_path)
+
+    _run_checkpoint(tmp_path)
+
+    fold_dir = _fold_dir(tmp_path)
+    identity_digest = hashlib.sha256((fold_dir / "input_identity.json").read_bytes()).hexdigest()
+    posterior = az.from_netcdf(fold_dir / "posterior.nc")
+    assert posterior.attrs["legacy_hqt_loeo_identity_sha256"] == identity_digest
+
+
+def test_legacy_loeo_valid_partial_checkpoint_resumes_without_refit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sampled = _install_checkpoint_runner(monkeypatch, tmp_path)
+    _run_checkpoint(tmp_path)
+    fold_dir = _fold_dir(tmp_path)
+    for name in ("COMPLETE", "hourly_predictions.parquet", "metrics.parquet"):
+        (fold_dir / name).unlink()
+    _write_partial_manifest(fold_dir)
+
+    resumed = _run_checkpoint(tmp_path)
+
+    assert len(sampled) == 1
+    assert resumed[0].sampler_fit_count == 0
+    assert (fold_dir / "COMPLETE").is_file()
+
+
+def test_legacy_loeo_rejects_posterior_only_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sampled = _install_checkpoint_runner(monkeypatch, tmp_path)
+    _run_checkpoint(tmp_path)
+    fold_dir = _fold_dir(tmp_path)
+    for path in tuple(fold_dir.iterdir()):
+        if path.name != "posterior.nc":
+            path.unlink()
+
+    with pytest.raises(LegacyHQTError, match="identity.*missing|checkpoint state"):
+        _run_checkpoint(tmp_path)
+
+    assert len(sampled) == 1
+
+
+def test_legacy_loeo_rejects_missing_identity_beside_posterior(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sampled = _install_checkpoint_runner(monkeypatch, tmp_path)
+    _run_checkpoint(tmp_path)
+    fold_dir = _fold_dir(tmp_path)
+    (fold_dir / "COMPLETE").unlink()
+    (fold_dir / "input_identity.json").unlink()
+
+    with pytest.raises(LegacyHQTError, match="identity.*missing"):
+        _run_checkpoint(tmp_path)
+
+    assert len(sampled) == 1
+
+
+def test_legacy_loeo_rejects_rewritten_partial_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sampled = _install_checkpoint_runner(monkeypatch, tmp_path)
+    _run_checkpoint(tmp_path)
+    fold_dir = _fold_dir(tmp_path)
+    for name in ("COMPLETE", "hourly_predictions.parquet", "metrics.parquet"):
+        (fold_dir / name).unlink()
+    _write_partial_manifest(fold_dir)
+    manifest_path = fold_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["files"]["posterior.nc"] = "0" * 64
+    manifest_path.write_bytes(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode())
+
+    with pytest.raises(LegacyHQTError, match="manifest|digest"):
+        _run_checkpoint(tmp_path)
+
+    assert len(sampled) == 1
+
+
+def test_legacy_loeo_rejects_tampered_complete_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sampled = _install_checkpoint_runner(monkeypatch, tmp_path)
+    _run_checkpoint(tmp_path)
+    complete = _fold_dir(tmp_path) / "COMPLETE"
+    complete.write_bytes(complete.read_bytes() + b"tampered")
+
+    with pytest.raises(LegacyHQTError, match="completed legacy HQT"):
+        _run_checkpoint(tmp_path)
+
+    assert len(sampled) == 1
+
+
+def test_legacy_loeo_rejects_incomplete_posterior_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sampled = _install_checkpoint_runner(monkeypatch, tmp_path)
+    _run_checkpoint(tmp_path)
+    fold_dir = _fold_dir(tmp_path)
+    (fold_dir / "COMPLETE").unlink()
+    posterior = fold_dir / "posterior.nc"
+    copied = tmp_path / "copied-posterior.nc"
+    copied.write_bytes(posterior.read_bytes())
+    posterior.unlink()
+    posterior.symlink_to(copied)
+
+    with pytest.raises(LegacyHQTError, match="posterior.*unsafe|namespace"):
+        _run_checkpoint(tmp_path)
+
+    assert len(sampled) == 1
+
+
+def test_legacy_loeo_rejects_completed_manifest_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sampled = _install_checkpoint_runner(monkeypatch, tmp_path)
+    _run_checkpoint(tmp_path)
+    manifest = _fold_dir(tmp_path) / "manifest.json"
+    copied = tmp_path / "copied-manifest.json"
+    copied.write_bytes(manifest.read_bytes())
+    manifest.unlink()
+    manifest.symlink_to(copied)
+
+    with pytest.raises(LegacyHQTError, match="manifest.*unsafe|namespace"):
+        _run_checkpoint(tmp_path)
+
+    assert len(sampled) == 1
+
+
+def test_legacy_loeo_rejects_unknown_incomplete_checkpoint_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_checkpoint_runner(monkeypatch, tmp_path)
+    _run_checkpoint(tmp_path)
+    fold_dir = _fold_dir(tmp_path)
+    (fold_dir / "COMPLETE").unlink()
+    (fold_dir / "unexpected.txt").write_text("unknown", encoding="utf-8")
+
+    with pytest.raises(LegacyHQTError, match="namespace"):
+        _run_checkpoint(tmp_path)
+
+
 def test_legacy_hqt_loeo_writes_products_then_reuses_physical_fold(
     tmp_path: Path, monkeypatch
 ) -> None:
-    context = EventResidualContext(
-        "xgboost", "B1", 7, ("oof-2020", "oof-2021", "oof-2022", "oof-2023")
-    )
-    fold = _physical_fold(tmp_path)
-    start = datetime(2024, 9, 14)
-    tau = np.arange(72, dtype=float) / 24.0
-    held_out = LOEOHeldOut(
-        occurrence_id="chuseok-2024",
-        path=tmp_path / "held-out.parquet",
-        universe_sha256="universe-sha",
-        frame=pl.DataFrame(
-            {
-                "causal": [False] * tau.size,
-                "holiday_type": ["chuseok"] * tau.size,
-                "occurrence_id": ["chuseok-2024"] * tau.size,
-                "observed_mw": 100.0 + np.arange(tau.size),
-                "predicted_mw": 99.0 + np.arange(tau.size),
-                "sigma_n_mw": [100.0] * tau.size,
-                "target_timestamp": [start + timedelta(hours=hour) for hour in range(tau.size)],
-                "tau_days": tau,
-            }
-        ),
-        context=context,
-        causal=False,
-    )
-    publication = LOEOPublication(
-        output_dir=tmp_path / "publication",
-        generation_dir=tmp_path / "publication" / "generation",
-        manifest_path=tmp_path / "publication" / "manifest.json",
-        universe_path=tmp_path / "publication" / "universe.parquet",
-        universe_sha256="universe-sha",
-        occurrence_ids=("chuseok-2024",),
-        fold_paths={"chuseok-2024": tmp_path / "publication" / "fold.parquet"},
-        fold_sha256={"chuseok-2024": "fold-sha"},
-        context=context,
-        causal=False,
-    )
-    baseline_manifest = tmp_path / "baseline_manifest.json"
-    baseline_manifest.write_text("{}")
-    source = SimpleNamespace(
-        available_contexts=(context,),
-        baseline_manifest_path=baseline_manifest,
-        residual_sha256="residual-sha",
-    )
-    sampled: list[HQRCData] = []
-
-    def fake_sample(data: HQRCData, **_kwargs) -> az.InferenceData:
-        sampled.append(data)
-        idata = az.from_dict(
-            posterior={
-                "mu": np.zeros((1, 2, 2, 3)),
-                "between_cholesky": np.broadcast_to(np.eye(3), (1, 2, 2, 3, 3)),
-            }
-        )
-        idata.attrs["legacy_hqt_model_json"] = json.dumps(LEGACY_HQT_MODEL_SPEC, sort_keys=True)
-        return idata
-
-    monkeypatch.setattr("hqrc_v3.legacy_hqt_loeo.validate_correction_source", lambda **_kw: source)
-    monkeypatch.setattr(
-        "hqrc_v3.legacy_hqt_loeo.publish_loeo_universe", lambda *_args, **_kw: publication
-    )
-    monkeypatch.setattr(
-        "hqrc_v3.legacy_hqt_loeo.load_loeo_universe", lambda *_args, **_kw: publication
-    )
-    monkeypatch.setattr("hqrc_v3.legacy_hqt_loeo.load_loeo_fold", lambda *_args, **_kw: fold)
-    monkeypatch.setattr("hqrc_v3.legacy_hqt_loeo.load_loeo_event", lambda *_args, **_kw: held_out)
-    monkeypatch.setattr("hqrc_v3.legacy_hqt_loeo.sample_legacy_hqt", fake_sample)
-    monkeypatch.setattr("hqrc_v3.legacy_hqt_loeo.validate_inference_data", lambda *_a, **_kw: None)
-    monkeypatch.setattr(
-        "hqrc_v3.legacy_hqt_loeo._scale_stability",
-        lambda *_args: pl.DataFrame({"scale_ratio": [1.0]}),
-    )
-
-    first = run_legacy_hqt_loeo(
-        source_run_dir=tmp_path / "source",
-        config_path=tmp_path / "experiment.toml",
-        output_root=tmp_path / "output",
-        models=("xgboost",),
-        feature_sets=("B1",),
-        held_out_occurrence_ids=None,
-        root_seed=17,
-        profile="smoke",
-        draws=2,
-        tune=2,
-        chains=1,
-        cores=1,
-    )
+    sampled = _install_checkpoint_runner(monkeypatch, tmp_path)
+    first = _run_checkpoint(tmp_path)
     fold_dir = first[0].output_dir / "folds" / "chuseok-2024"
 
     assert len(sampled) == 1
@@ -417,20 +588,7 @@ def test_legacy_hqt_loeo_writes_products_then_reuses_physical_fold(
     assert (first[0].output_dir / "improvement_summary.parquet").is_file()
     assert (first[0].output_dir / "scale_stability.parquet").is_file()
 
-    second = run_legacy_hqt_loeo(
-        source_run_dir=tmp_path / "source",
-        config_path=tmp_path / "experiment.toml",
-        output_root=tmp_path / "output",
-        models=("xgboost",),
-        feature_sets=("B1",),
-        held_out_occurrence_ids=None,
-        root_seed=17,
-        profile="smoke",
-        draws=2,
-        tune=2,
-        chains=1,
-        cores=1,
-    )
+    second = _run_checkpoint(tmp_path)
 
     assert len(sampled) == 1
     assert second[0].sampler_fit_count == 0

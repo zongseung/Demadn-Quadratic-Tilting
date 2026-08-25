@@ -1,11 +1,12 @@
 from collections import Counter
 from dataclasses import replace
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
 
 from hqrc_v3.events import (
+    EventOccurrence,
     EventRegistryError,
     load_event_registry,
     load_holiday_calendar,
@@ -51,6 +52,19 @@ def test_feature_calendar_includes_only_declared_distance_support_outside_event_
         "chuseok-2021",
         "seollal-2022",
     }
+
+
+@pytest.mark.parametrize("restriction", (False, True, 0.0, 1.0))
+def test_event_occurrence_rejects_non_integer_restriction(restriction: object) -> None:
+    with pytest.raises(EventRegistryError, match="restriction must be either 0 or 1"):
+        EventOccurrence(
+            occurrence_id="seollal-2024",
+            holiday_type="seollal",
+            central_date=date(2024, 2, 10),
+            official_start=date(2024, 2, 9),
+            official_end=date(2024, 2, 12),
+            restriction=restriction,  # type: ignore[arg-type]
+        )
 
 
 def test_feature_and_correction_registries_must_align() -> None:

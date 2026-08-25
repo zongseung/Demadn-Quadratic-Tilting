@@ -50,6 +50,19 @@ _SCALE_COLUMNS = (
     "scale_ratio",
     "n_2024_non_event_hours",
 )
+_LOEO_INPUT_FILES = (
+    "event_metrics.parquet",
+    "pooled_metrics.parquet",
+    "scale_stability.parquet",
+)
+_CAUSAL_INPUT_FILES = (
+    "input_identity.json",
+    "hourly_predictions.parquet",
+    "event_metrics.parquet",
+    "pooled_metrics.parquet",
+    "manifest.json",
+    "COMPLETE",
+)
 
 
 class ReviewerReportError(ValueError):
@@ -644,10 +657,14 @@ def _plot_causal_corrections(hourly: pl.DataFrame, path: Path) -> None:
 
 def _input_records(inputs: ReviewerReportInputs) -> list[dict[str, str]]:
     paths = [inputs.final_predictions_path]
-    for directory in (*inputs.loeo_context_dirs, *inputs.causal_context_dirs):
-        paths.extend(sorted(path for path in directory.iterdir() if path.is_file()))
+    for directory in inputs.loeo_context_dirs:
+        paths.extend(directory / name for name in _LOEO_INPUT_FILES)
+    for directory in inputs.causal_context_dirs:
+        paths.extend(directory / name for name in _CAUSAL_INPUT_FILES)
     records = []
     for path in sorted(set(paths), key=lambda item: str(item.resolve())):
+        if not path.is_file() or path.is_symlink():
+            raise ReviewerReportError(f"required reviewer input is missing or unsafe: {path}")
         records.append({"path": str(path.resolve()), "sha256": file_sha256(path)})
     return records
 

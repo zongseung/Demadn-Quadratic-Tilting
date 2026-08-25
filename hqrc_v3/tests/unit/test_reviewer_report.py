@@ -171,6 +171,9 @@ def _write_contexts(root: Path) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
                 for scope in ("all", "seollal", "chuseok")
             ]
         ).write_parquet(causal / "pooled_metrics.parquet")
+        (causal / "input_identity.json").write_text("{}", encoding="utf-8")
+        (causal / "manifest.json").write_text("{}", encoding="utf-8")
+        (causal / "COMPLETE").write_text("{}", encoding="utf-8")
         causal_dirs.append(causal)
     return tuple(loeo_dirs), tuple(causal_dirs)
 
@@ -266,6 +269,31 @@ def test_reviewer_report_writes_exact_normalized_tables_and_manifest(tmp_path: P
     assert set(manifest["inference"]["bootstrap_seeds"]) == set(MODELS)
     for relative, digest in manifest["outputs"].items():
         assert hashlib.sha256((result.output_root / relative).read_bytes()).hexdigest() == digest
+
+
+def test_reviewer_manifest_tracks_only_consumed_and_required_provenance_files(
+    tmp_path: Path,
+) -> None:
+    inputs = _reviewer_fixture(tmp_path)
+    output = tmp_path / "paper"
+    first = build_reviewer_report(inputs, output_root=output)
+    original_manifest = first.manifest_path.read_bytes()
+
+    (inputs.loeo_context_dirs[0] / "unrelated.txt").write_text("not consumed", encoding="utf-8")
+    second = build_reviewer_report(inputs, output_root=output)
+
+    assert second.manifest_path.read_bytes() == original_manifest
+
+    consumed = inputs.loeo_context_dirs[0] / "event_metrics.parquet"
+    pl.read_parquet(consumed).with_columns(
+        pl.when(pl.col("correction") == "H1")
+        .then(pl.col("rmse") + 0.5)
+        .otherwise(pl.col("rmse"))
+        .alias("rmse")
+    ).write_parquet(consumed)
+    third = build_reviewer_report(inputs, output_root=output)
+
+    assert third.manifest_path.read_bytes() != original_manifest
 
 
 def test_reviewer_report_rejects_non_ten_event_inference(tmp_path: Path):

@@ -5,11 +5,14 @@ from __future__ import annotations
 import json
 import math
 import os
+import stat
 import tempfile
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
+from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 import arviz as az
 import numpy as np
@@ -40,6 +43,14 @@ from hqrc_v3.provenance import file_sha256
 
 _HOLIDAY_INDEX = {"seollal": 0, "chuseok": 1}
 _CORRECTIONS = ("H0", "H1", "H2", "H2-taper")
+_ARTIFACT_FILES = (
+    "input_identity.json",
+    "posterior.nc",
+    "hourly_predictions.parquet",
+    "metrics.parquet",
+)
+_PARTIAL_ARTIFACT_FILES = ("input_identity.json", "posterior.nc")
+_COMPLETE_NAMESPACE = frozenset((*_ARTIFACT_FILES, "manifest.json", "COMPLETE"))
 
 
 class LegacyHQTError(ValueError):
@@ -60,6 +71,10 @@ def _canonical_json(value: object) -> bytes:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     except (TypeError, ValueError) as error:
         raise LegacyHQTError("legacy HQT metadata is not canonical JSON") from error
+
+
+def _json_sha256(value: object) -> str:
+    return sha256(_canonical_json(value)).hexdigest()
 
 
 def _write_atomic(path: Path, payload: bytes) -> None:
@@ -102,14 +117,24 @@ def _write_netcdf_atomic(idata: az.InferenceData, path: Path) -> None:
             os.unlink(temporary)
 
 
-def _read_identity(path: Path) -> dict[str, object]:
+def _require_real_file(path: Path, description: str) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except OSError as error:
+        raise LegacyHQTError(f"{description} is missing or unsafe") from error
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        raise LegacyHQTError(f"{description} is missing or unsafe")
+
+
+def _read_identity(path: Path, description: str = "legacy HQT identity") -> dict[str, Any]:
+    _require_real_file(path, description)
     try:
         raw = path.read_bytes()
         value = json.loads(raw)
     except (OSError, json.JSONDecodeError) as error:
-        raise LegacyHQTError("legacy HQT identity is unreadable") from error
+        raise LegacyHQTError(f"{description} is unreadable") from error
     if not isinstance(value, dict) or raw != _canonical_json(value):
-        raise LegacyHQTError("legacy HQT identity is not canonical")
+        raise LegacyHQTError(f"{description} is not canonical")
     return value
 
 
@@ -401,27 +426,155 @@ def _fold_products(
     return hourly, pl.concat(metrics, how="vertical")
 
 
-def _load_complete_fold(
-    fold_dir: Path, identity: Mapping[str, object]
-) -> tuple[pl.DataFrame, pl.DataFrame] | None:
-    complete = fold_dir / "COMPLETE"
-    if not complete.is_file():
-        return None
-    identity_path = fold_dir / "input_identity.json"
-    if not identity_path.is_file() or _read_identity(identity_path) != dict(identity):
-        raise LegacyHQTError("completed legacy HQT fold identity differs")
-    manifest = _read_identity(fold_dir / "manifest.json")
+def _validate_posterior(
+    idata: az.InferenceData,
+    *,
+    identity_sha256: str,
+    paper_profile: bool,
+) -> None:
+    try:
+        model_spec = json.loads(idata.attrs.get("legacy_hqt_model_json", "null"))
+    except (TypeError, json.JSONDecodeError) as error:
+        raise LegacyHQTError("resumable legacy HQT posterior model is unreadable") from error
+    if model_spec != LEGACY_HQT_MODEL_SPEC:
+        raise LegacyHQTError("resumable legacy HQT posterior model differs")
+    if idata.attrs.get("legacy_hqt_loeo_identity_sha256") != identity_sha256:
+        raise LegacyHQTError("resumable legacy HQT posterior identity differs")
+    validate_inference_data(idata, paper_profile=paper_profile)
+
+
+def _manifest_files(
+    manifest: Mapping[str, object],
+    identity: Mapping[str, object],
+    *,
+    completed: bool,
+    expected_prediction_seed: int,
+) -> frozenset[str]:
     files = manifest.get("files")
-    if not isinstance(files, dict):
-        raise LegacyHQTError("completed legacy HQT fold manifest differs")
-    for name in ("posterior.nc", "hourly_predictions.parquet", "metrics.parquet"):
-        path = fold_dir / name
-        if not path.is_file() or files.get(name) != file_sha256(path):
-            raise LegacyHQTError("completed legacy HQT fold artifact differs")
-    return (
-        pl.read_parquet(fold_dir / "hourly_predictions.parquet"),
-        pl.read_parquet(fold_dir / "metrics.parquet"),
+    file_names = frozenset(files) if isinstance(files, dict) else frozenset()
+    partial_names = frozenset(_PARTIAL_ARTIFACT_FILES)
+    full_names = frozenset(_ARTIFACT_FILES)
+    has_full_manifest = file_names == full_names
+    expected_keys = {"files", "identity_sha256", "schema_version"}
+    if has_full_manifest:
+        expected_keys.add("prediction_seed")
+    if (
+        set(manifest) != expected_keys
+        or manifest.get("schema_version") != 1
+        or manifest.get("identity_sha256") != _json_sha256(identity)
+        or not isinstance(files, dict)
+        or (completed and not has_full_manifest)
+        or (not completed and file_names not in {partial_names, full_names})
+        or (has_full_manifest and manifest.get("prediction_seed") != expected_prediction_seed)
+    ):
+        state = "completed" if completed else "incomplete"
+        raise LegacyHQTError(f"{state} legacy HQT fold manifest differs")
+    return file_names
+
+
+def _checkpoint_entries(fold_dir: Path) -> set[str]:
+    try:
+        mode = fold_dir.lstat().st_mode
+        entries = tuple(fold_dir.iterdir())
+    except OSError as error:
+        raise LegacyHQTError("legacy HQT fold namespace is unsafe") from error
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise LegacyHQTError("legacy HQT fold namespace is unsafe")
+    for entry in entries:
+        _require_real_file(entry, f"legacy HQT fold checkpoint {entry.name}")
+    return {entry.name for entry in entries}
+
+
+def _load_complete_fold(
+    fold_dir: Path, identity: Mapping[str, object], *, prediction_seed: int
+) -> tuple[pl.DataFrame, pl.DataFrame] | None:
+    complete_path = fold_dir / "COMPLETE"
+    if not os.path.lexists(complete_path):
+        return None
+    try:
+        entries = _checkpoint_entries(fold_dir)
+        if entries != _COMPLETE_NAMESPACE:
+            raise LegacyHQTError("completed legacy HQT fold namespace differs")
+        stored_identity = _read_identity(
+            fold_dir / "input_identity.json", "completed legacy HQT fold identity"
+        )
+        if stored_identity != dict(identity):
+            raise LegacyHQTError("completed legacy HQT fold identity differs")
+        manifest_path = fold_dir / "manifest.json"
+        manifest = _read_identity(manifest_path, "completed legacy HQT fold manifest")
+        complete = _read_identity(complete_path, "completed legacy HQT completion marker")
+        files = manifest["files"]
+        file_names = _manifest_files(
+            manifest,
+            identity,
+            completed=True,
+            expected_prediction_seed=prediction_seed,
+        )
+        if complete != {"manifest_sha256": file_sha256(manifest_path), "schema_version": 1}:
+            raise LegacyHQTError("completed legacy HQT fold completion marker differs")
+        for name in file_names:
+            path = fold_dir / name
+            _require_real_file(path, f"completed legacy HQT fold artifact {name}")
+            if files[name] != file_sha256(path):  # type: ignore[index]
+                raise LegacyHQTError(f"completed legacy HQT fold artifact digest differs: {name}")
+        idata = az.from_netcdf(fold_dir / "posterior.nc")
+        _validate_posterior(
+            idata,
+            identity_sha256=_json_sha256(identity),
+            paper_profile=identity["sampler"]["profile"] == "paper",  # type: ignore[index]
+        )
+        hourly = pl.read_parquet(fold_dir / "hourly_predictions.parquet")
+        metrics = pl.read_parquet(fold_dir / "metrics.parquet")
+    except LegacyHQTError:
+        raise
+    except (OSError, KeyError, TypeError, ValueError, pl.exceptions.PolarsError) as error:
+        raise LegacyHQTError("completed legacy HQT fold checkpoint is unreadable") from error
+    return hourly, metrics
+
+
+def _load_resumable_posterior(
+    fold_dir: Path,
+    *,
+    identity: Mapping[str, object],
+    paper_profile: bool,
+    prediction_seed: int,
+) -> az.InferenceData | None:
+    posterior_path = fold_dir / "posterior.nc"
+    manifest_path = fold_dir / "manifest.json"
+    posterior_exists = os.path.lexists(posterior_path)
+    manifest_exists = os.path.lexists(manifest_path)
+    if not posterior_exists:
+        if manifest_exists:
+            raise LegacyHQTError("incomplete legacy HQT manifest exists without a posterior")
+        if _checkpoint_entries(fold_dir) != {"input_identity.json"}:
+            raise LegacyHQTError("incomplete legacy HQT checkpoint state differs")
+        return None
+    _require_real_file(posterior_path, "incomplete legacy HQT posterior")
+    if not manifest_exists:
+        raise LegacyHQTError("incomplete legacy HQT posterior manifest is missing")
+    manifest = _read_identity(manifest_path, "incomplete legacy HQT manifest")
+    file_names = _manifest_files(
+        manifest,
+        identity,
+        completed=False,
+        expected_prediction_seed=prediction_seed,
     )
+    files = manifest["files"]
+    for name in file_names:
+        path = fold_dir / name
+        _require_real_file(path, f"incomplete legacy HQT artifact {name}")
+        if files[name] != file_sha256(path):  # type: ignore[index]
+            raise LegacyHQTError(f"incomplete legacy HQT artifact digest differs: {name}")
+    try:
+        idata = az.from_netcdf(posterior_path)
+    except (OSError, ValueError) as error:
+        raise LegacyHQTError("incomplete legacy HQT posterior is unreadable") from error
+    _validate_posterior(
+        idata,
+        identity_sha256=_json_sha256(identity),
+        paper_profile=paper_profile,
+    )
+    return idata
 
 
 def _fit_fold(
@@ -448,25 +601,40 @@ def _fit_fold(
         occurrence_id=held_out_occurrence_id,
     )
     identity = _fold_identity(source, publication, fold, sampler)
-    completed = _load_complete_fold(fold_dir, identity)
-    if completed is not None:
-        return completed[0], completed[1], True
-
-    fold_dir.mkdir(parents=True, exist_ok=True)
+    prediction_seed = derive_loeo_seed(
+        int(sampler["root_seed"]), f"legacy-hqt-predictive:{held_out_occurrence_id}"
+    )
+    entries: set[str] = set()
+    if os.path.lexists(fold_dir):
+        entries = _checkpoint_entries(fold_dir)
+        completed = _load_complete_fold(
+            fold_dir,
+            identity,
+            prediction_seed=prediction_seed,
+        )
+        if completed is not None:
+            return completed[0], completed[1], True
+        if not entries <= _COMPLETE_NAMESPACE - {"COMPLETE"}:
+            raise LegacyHQTError("incomplete legacy HQT fold namespace differs")
+    else:
+        fold_dir.mkdir(parents=True, exist_ok=False)
     identity_path = fold_dir / "input_identity.json"
-    if identity_path.exists():
-        if _read_identity(identity_path) != identity:
+    if entries and "input_identity.json" not in entries:
+        raise LegacyHQTError("incomplete legacy HQT identity is missing beside checkpoint state")
+    if "input_identity.json" in entries:
+        if _read_identity(identity_path, "incomplete legacy HQT identity") != identity:
             raise LegacyHQTError("incomplete legacy HQT fold identity differs")
     else:
         _write_atomic(identity_path, _canonical_json(identity))
-    posterior_path = fold_dir / "posterior.nc"
-    if posterior_path.is_file():
-        idata = az.from_netcdf(posterior_path)
-        if json.loads(idata.attrs.get("legacy_hqt_model_json", "null")) != (LEGACY_HQT_MODEL_SPEC):
-            raise LegacyHQTError("resumable legacy HQT posterior model differs")
-        validate_inference_data(idata, paper_profile=sampler["profile"] == "paper")
-        fitted = False
-    else:
+    identity_digest = _json_sha256(identity)
+    idata = _load_resumable_posterior(
+        fold_dir,
+        identity=identity,
+        paper_profile=sampler["profile"] == "paper",
+        prediction_seed=prediction_seed,
+    )
+    fitted = idata is None
+    if fitted:
         data = build_legacy_hqt_data(fold)
         idata = sample_legacy_hqt(
             data,
@@ -479,28 +647,34 @@ def _fit_fold(
             target_accept=float(sampler["target_accept"]),
             paper_profile=sampler["profile"] == "paper",
         )
+        idata.attrs["legacy_hqt_loeo_identity_sha256"] = identity_digest
+        posterior_path = fold_dir / "posterior.nc"
         _write_netcdf_atomic(idata, posterior_path)
-        fitted = True
-    prediction_seed = derive_loeo_seed(
-        int(sampler["root_seed"]), f"legacy-hqt-predictive:{held_out_occurrence_id}"
-    )
+        partial_manifest = {
+            "files": {name: file_sha256(fold_dir / name) for name in _PARTIAL_ARTIFACT_FILES},
+            "identity_sha256": identity_digest,
+            "schema_version": 1,
+        }
+        _write_atomic(fold_dir / "manifest.json", _canonical_json(partial_manifest))
+    assert idata is not None
+    posterior_path = fold_dir / "posterior.nc"
     hourly, metrics = _fold_products(fold, held_out, idata, prediction_seed=prediction_seed)
     hourly_path = fold_dir / "hourly_predictions.parquet"
     metrics_path = fold_dir / "metrics.parquet"
     _write_parquet_atomic(hourly, hourly_path)
     _write_parquet_atomic(metrics, metrics_path)
     manifest = {
-        "files": {
-            "hourly_predictions.parquet": file_sha256(hourly_path),
-            "metrics.parquet": file_sha256(metrics_path),
-            "posterior.nc": file_sha256(posterior_path),
-        },
-        "identity_sha256": __import__("hashlib").sha256(_canonical_json(identity)).hexdigest(),
+        "files": {name: file_sha256(fold_dir / name) for name in _ARTIFACT_FILES},
+        "identity_sha256": identity_digest,
         "prediction_seed": prediction_seed,
         "schema_version": 1,
     }
-    _write_atomic(fold_dir / "manifest.json", _canonical_json(manifest))
-    _write_atomic(fold_dir / "COMPLETE", b"complete\n")
+    manifest_path = fold_dir / "manifest.json"
+    _write_atomic(manifest_path, _canonical_json(manifest))
+    _write_atomic(
+        fold_dir / "COMPLETE",
+        _canonical_json({"manifest_sha256": file_sha256(manifest_path), "schema_version": 1}),
+    )
     return hourly, metrics, not fitted
 
 

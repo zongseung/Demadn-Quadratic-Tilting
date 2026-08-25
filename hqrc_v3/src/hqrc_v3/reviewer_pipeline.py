@@ -97,8 +97,12 @@ def _validate_options(options: ReviewerPipelineOptions) -> _ResolvedSampler:
         raise ReviewerPipelineError("reviewer models must be a canonical manuscript-model subset")
     if isinstance(options.baseline_seed, bool) or not isinstance(options.baseline_seed, int):
         raise ReviewerPipelineError("reviewer baseline seed must be an integer")
-    if isinstance(options.root_seed, bool) or not isinstance(options.root_seed, int):
-        raise ReviewerPipelineError("reviewer root seed must be an integer")
+    if (
+        isinstance(options.root_seed, bool)
+        or not isinstance(options.root_seed, int)
+        or options.root_seed < 0
+    ):
+        raise ReviewerPipelineError("reviewer root seed must be a non-negative integer")
     if options.init not in _SAMPLER_INITIALIZATIONS:
         raise ReviewerPipelineError("reviewer sampler initialization is unsupported")
     if options.profile == "paper":

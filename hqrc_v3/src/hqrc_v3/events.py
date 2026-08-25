@@ -47,7 +47,7 @@ class EventOccurrence:
             raise EventRegistryError("official_start must not be after official_end")
         if not self.official_start <= self.central_date <= self.official_end:
             raise EventRegistryError("central_date must fall within the official holiday period")
-        if self.restriction not in (0, 1):
+        if type(self.restriction) is not int or self.restriction not in (0, 1):
             raise EventRegistryError("restriction must be either 0 or 1")
 
     @property
@@ -179,5 +179,5 @@ def validate_feature_event_alignment(
             event.official_end,
         ):
             raise EventRegistryError(
-                "feature/correction window registry differs for " f"{event.occurrence_id}"
+                f"feature/correction window registry differs for {event.occurrence_id}"
             )

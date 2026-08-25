@@ -177,20 +177,28 @@ identical command twice. The second summary must have zero baseline/HQT fits,
 positive cache/reuse counts, and unchanged output digests:
 
 ```bash
-uv run --project hqrc_v3 --locked hqrc run-hqt-reviewer \
-  --data power_demand_final.csv \
-  --config hqrc_v3/configs/experiment.toml \
-  --frozen-model-config hqrc_v3/configs/model_spaces.toml \
-  --frozen-model-hash "$MODEL_SHA256" \
-  --event-registry hqrc_v3/configs/events.csv \
-  --holiday-calendar hqrc_v3/configs/holiday_calendar.csv \
-  --temporary-holiday-availability hqrc_v3/configs/temporary_holiday_availability.csv \
-  --run-dir artifacts/hqt-reviewer-smoke-source \
-  --cache-dir artifacts/hqt-reviewer-smoke-cache \
-  --output-root artifacts/hqt-reviewer-smoke-results \
-  --baseline-seed 7 --root-seed 20260813 \
-  --profile smoke --model xgboost \
-  --draws 5 --tune 5 --chains 2 --cores 2 --smoke-boosting-rounds 2
+MODEL_SHA256="$(openssl dgst -sha256 hqrc_v3/configs/model_spaces.toml | awk '{print $NF}')"
+SMOKE_ROOT="$(mktemp -d)"
+
+run_reviewer_smoke() {
+  uv run --project hqrc_v3 --locked hqrc run-hqt-reviewer \
+    --data power_demand_final.csv \
+    --config hqrc_v3/configs/experiment.toml \
+    --frozen-model-config hqrc_v3/configs/model_spaces.toml \
+    --frozen-model-hash "$MODEL_SHA256" \
+    --event-registry hqrc_v3/configs/events.csv \
+    --holiday-calendar hqrc_v3/configs/holiday_calendar.csv \
+    --temporary-holiday-availability hqrc_v3/configs/temporary_holiday_availability.csv \
+    --run-dir "$SMOKE_ROOT/source" \
+    --cache-dir "$SMOKE_ROOT/cache" \
+    --output-root "$SMOKE_ROOT/results" \
+    --baseline-seed 7 --root-seed 20260813 \
+    --profile smoke --model xgboost \
+    --draws 5 --tune 5 --chains 2 --cores 2 --smoke-boosting-rounds 2
+}
+
+run_reviewer_smoke
+run_reviewer_smoke
 ```
 
 `run-hqt-loeo` remains a lower-level compatibility command for rerunning only
