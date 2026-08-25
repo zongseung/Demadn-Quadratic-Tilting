@@ -274,6 +274,7 @@ def test_reviewer_handler_maps_fixed_b1w_pipeline_scope(monkeypatch, capsys):
             baseline_fit_count=3,
             baseline_cache_hit_count=4,
             hqt_fit_count=5,
+            hqt_reuse_count=6,
         )
 
     monkeypatch.setattr(cli, "run_hqt_reviewer_pipeline", run)
@@ -327,7 +328,9 @@ def test_reviewer_handler_maps_fixed_b1w_pipeline_scope(monkeypatch, capsys):
     assert options.chains == options.cores == 2
     assert options.smoke_boosting_rounds == 2
     assert progress is print
-    assert "baseline_fits=3 baseline_cache_hits=4 hqt_fits=5" in capsys.readouterr().out
+    assert (
+        "baseline_fits=3 baseline_cache_hits=4 hqt_fits=5 hqt_reused=6" in capsys.readouterr().out
+    )
 
 
 def test_ar_commands_require_canonical_run_inputs_and_diagnose_never_auto_approves(capsys):

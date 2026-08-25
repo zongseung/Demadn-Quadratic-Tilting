@@ -124,6 +124,7 @@ def test_reviewer_pipeline_runs_exact_stages_in_order(
     assert result.baseline_fit_count == 5
     assert result.baseline_cache_hit_count == 5
     assert result.hqt_fit_count == 11
+    assert result.hqt_reuse_count == 0
 
 
 def test_reviewer_pipeline_maps_scopes_and_separate_output_roots(
@@ -280,6 +281,29 @@ def test_paper_profile_accepts_more_than_four_chains(
     assert by_name["causal"]["chains"] == 5
 
 
+def test_paper_default_chains_rejects_oversized_cores_before_stages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _install_stage_recorders(monkeypatch, tmp_path)
+
+    with pytest.raises(ReviewerPipelineError, match="cores.*chains"):
+        run_hqt_reviewer_pipeline(
+            _options(
+                tmp_path,
+                profile="paper",
+                models=MODEL_NAMES,
+                draws=None,
+                tune=None,
+                chains=None,
+                cores=5,
+                target_accept=None,
+                smoke_boosting_rounds=None,
+            )
+        )
+
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -291,6 +315,16 @@ def test_paper_profile_accepts_more_than_four_chains(
             "draws": 999,
             "tune": 1_000,
             "chains": 4,
+            "target_accept": 0.99,
+            "smoke_boosting_rounds": None,
+        },
+        {
+            "profile": "paper",
+            "models": MODEL_NAMES,
+            "draws": 1_000,
+            "tune": 1_000,
+            "chains": 4.5,
+            "cores": 4,
             "target_accept": 0.99,
             "smoke_boosting_rounds": None,
         },
@@ -328,7 +362,7 @@ def test_pipeline_propagates_stage_failure_and_does_not_run_later_stages(
     assert [name for name, _ in calls] == ["oof", "final", "residual-failed"]
 
 
-def test_completed_rerun_reports_zero_fits_and_positive_reuse(
+def test_completed_rerun_aggregates_reuse_across_multiple_contexts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from hqrc_v3 import reviewer_pipeline as module
@@ -358,6 +392,12 @@ def test_completed_rerun_reports_zero_fits_and_positive_reuse(
                 sampler_fit_count=0,
                 reused_fold_count=10,
             ),
+            SimpleNamespace(
+                context=SimpleNamespace(model="lightgbm", feature_set="B1W"),
+                output_dir=tmp_path / "results/retrospective-loeo/lightgbm/B1W",
+                sampler_fit_count=0,
+                reused_fold_count=10,
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -370,14 +410,23 @@ def test_completed_rerun_reports_zero_fits_and_positive_reuse(
                 sampler_fit_count=0,
                 reused=True,
             ),
+            SimpleNamespace(
+                context=SimpleNamespace(model="lightgbm", feature_set="B1W"),
+                output_dir=tmp_path / "results/causal-2024/lightgbm/B1W",
+                sampler_fit_count=0,
+                reused=False,
+            ),
         ),
     )
     messages: list[str] = []
 
-    result = run_hqt_reviewer_pipeline(_options(tmp_path), progress=messages.append)
+    result = run_hqt_reviewer_pipeline(
+        _options(tmp_path, models=("xgboost", "lightgbm")), progress=messages.append
+    )
 
     assert result.baseline_fit_count == 0
     assert result.baseline_cache_hit_count == 10
     assert result.hqt_fit_count == 0
+    assert result.hqt_reuse_count == 21
     assert "[HQT] xgboost/B1W retrospective LOEO complete fits=0 reused=10" in messages
     assert "[HQT] xgboost/B1W causal-2024 complete fits=0 reused=1" in messages

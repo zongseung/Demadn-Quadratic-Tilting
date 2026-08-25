@@ -436,7 +436,8 @@ def run_hqt_reviewer_handler(arguments: argparse.Namespace) -> object:
         "[reviewer] COMPLETE "
         f"baseline_fits={result.baseline_fit_count} "
         f"baseline_cache_hits={result.baseline_cache_hit_count} "
-        f"hqt_fits={result.hqt_fit_count}"
+        f"hqt_fits={result.hqt_fit_count} "
+        f"hqt_reused={result.hqt_reuse_count}"
     )
     return result
 

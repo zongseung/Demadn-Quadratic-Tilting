@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,13 +66,23 @@ class ReviewerPipelineResult:
     baseline_fit_count: int
     baseline_cache_hit_count: int
     hqt_fit_count: int
+    hqt_reuse_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedSampler:
+    draws: int
+    tune: int
+    chains: int
+    cores: int
+    target_accept: float
 
 
 def _positive_integer(value: object) -> bool:
     return not isinstance(value, bool) and isinstance(value, int) and value > 0
 
 
-def _validate_options(options: ReviewerPipelineOptions) -> None:
+def _validate_options(options: ReviewerPipelineOptions) -> _ResolvedSampler:
     if not isinstance(options, ReviewerPipelineOptions):
         raise TypeError("options must be ReviewerPipelineOptions")
     if set(options.matrices) != set(REVIEWER_FEATURE_SUITE):
@@ -90,19 +101,6 @@ def _validate_options(options: ReviewerPipelineOptions) -> None:
         raise ReviewerPipelineError("reviewer root seed must be an integer")
     if options.init not in _SAMPLER_INITIALIZATIONS:
         raise ReviewerPipelineError("reviewer sampler initialization is unsupported")
-    if options.target_accept is not None and (
-        isinstance(options.target_accept, bool)
-        or not isinstance(options.target_accept, (int, float))
-        or not math.isfinite(float(options.target_accept))
-        or not 0 < float(options.target_accept) < 1
-    ):
-        raise ReviewerPipelineError("reviewer target_accept must be between zero and one")
-    if options.cores is not None and (
-        not _positive_integer(options.cores)
-        or (options.chains is not None and options.cores > options.chains)
-    ):
-        raise ReviewerPipelineError("reviewer cores must be positive and no greater than chains")
-
     if options.profile == "paper":
         resolved_draws = 1_000 if options.draws is None else options.draws
         resolved_tune = 1_000 if options.tune is None else options.tune
@@ -112,35 +110,54 @@ def _validate_options(options: ReviewerPipelineOptions) -> None:
             raise ReviewerPipelineError(
                 "paper reviewer profile requires all five manuscript models"
             )
-        if (
-            not _positive_integer(resolved_draws)
-            or not _positive_integer(resolved_tune)
-            or resolved_draws < 1_000
-            or resolved_tune < 1_000
-            or resolved_chains < 4
-            or resolved_target != 0.99
-        ):
-            raise ReviewerPipelineError(
-                "paper reviewer profile requires at least 4 chains, at least 1000 tune/draws, "
-                "and target_accept=0.99"
-            )
         if options.smoke_boosting_rounds is not None:
             raise ReviewerPipelineError(
                 "smoke boosting rounds cannot alter the paper reviewer profile"
             )
     elif options.profile == "smoke":
-        if not all(
-            _positive_integer(value) for value in (options.draws, options.tune, options.chains)
-        ):
+        if options.draws is None or options.tune is None or options.chains is None:
             raise ReviewerPipelineError(
                 "smoke reviewer profile requires explicit positive draws, tune, and chains"
             )
+        resolved_draws = options.draws
+        resolved_tune = options.tune
+        resolved_chains = options.chains
+        resolved_target = 0.9 if options.target_accept is None else options.target_accept
         if not _positive_integer(options.smoke_boosting_rounds):
             raise ReviewerPipelineError(
                 "smoke reviewer profile requires explicit positive smoke boosting rounds"
             )
     else:
         raise ReviewerPipelineError("reviewer profile must be paper or smoke")
+
+    if not all(
+        _positive_integer(value) for value in (resolved_draws, resolved_tune, resolved_chains)
+    ):
+        raise ReviewerPipelineError("reviewer draws, tune, and chains must be positive integers")
+    resolved_cores = (
+        min(resolved_chains, os.cpu_count() or 1) if options.cores is None else options.cores
+    )
+    if not _positive_integer(resolved_cores):
+        raise ReviewerPipelineError("reviewer cores must be a positive integer")
+    if resolved_cores > resolved_chains:
+        raise ReviewerPipelineError("reviewer cores must be no greater than chains")
+    if (
+        isinstance(resolved_target, bool)
+        or not isinstance(resolved_target, (int, float))
+        or not math.isfinite(float(resolved_target))
+        or not 0 < float(resolved_target) < 1
+    ):
+        raise ReviewerPipelineError("reviewer target_accept must be between zero and one")
+    if options.profile == "paper" and (
+        resolved_draws < 1_000
+        or resolved_tune < 1_000
+        or resolved_chains < 4
+        or resolved_target != 0.99
+    ):
+        raise ReviewerPipelineError(
+            "paper reviewer profile requires at least 4 chains, at least 1000 tune/draws, "
+            "and target_accept=0.99"
+        )
 
     source = Path(options.source_run_dir).expanduser().resolve()
     output = Path(options.output_root).expanduser().resolve()
@@ -149,6 +166,13 @@ def _validate_options(options: ReviewerPipelineOptions) -> None:
         raise ReviewerPipelineError(
             "reviewer source, LOEO, causal, and paper namespaces must be separate"
         )
+    return _ResolvedSampler(
+        draws=resolved_draws,
+        tune=resolved_tune,
+        chains=resolved_chains,
+        cores=resolved_cores,
+        target_accept=float(resolved_target),
+    )
 
 
 def _baseline_stage_inputs(
@@ -183,7 +207,7 @@ def run_hqt_reviewer_pipeline(
 ) -> ReviewerPipelineResult:
     """Run or strictly reuse the six reviewer stages in their fixed order."""
 
-    _validate_options(options)
+    sampler = _validate_options(options)
     source_run_dir = Path(options.source_run_dir).expanduser().resolve()
     cache_dir = Path(options.cache_dir).expanduser().resolve()
     output_root = Path(options.output_root).expanduser().resolve()
@@ -225,12 +249,12 @@ def run_hqt_reviewer_pipeline(
         held_out_occurrence_ids=None,
         root_seed=options.root_seed,
         profile=options.profile,
-        draws=options.draws,
-        tune=options.tune,
-        chains=options.chains,
-        cores=options.cores,
+        draws=sampler.draws,
+        tune=sampler.tune,
+        chains=sampler.chains,
+        cores=sampler.cores,
         init=options.init,
-        target_accept=options.target_accept,
+        target_accept=sampler.target_accept,
     )
     for item in loeo:
         _emit(
@@ -247,12 +271,12 @@ def run_hqt_reviewer_pipeline(
         feature_set="B1W",
         root_seed=options.root_seed,
         profile=options.profile,
-        draws=options.draws,
-        tune=options.tune,
-        chains=options.chains,
-        cores=options.cores,
+        draws=sampler.draws,
+        tune=sampler.tune,
+        chains=sampler.chains,
+        cores=sampler.cores,
         init=options.init,
-        target_accept=options.target_accept,
+        target_accept=sampler.target_accept,
     )
     for item in causal:
         _emit(
@@ -280,6 +304,8 @@ def run_hqt_reviewer_pipeline(
         baseline_fit_count=int(oof.fit_count) + int(final.fit_count),
         baseline_cache_hit_count=int(oof.cache_hit_count) + int(final.cache_hit_count),
         hqt_fit_count=sum(int(item.sampler_fit_count) for item in (*loeo, *causal)),
+        hqt_reuse_count=sum(int(item.reused_fold_count) for item in loeo)
+        + sum(int(item.reused) for item in causal),
     )
 
 

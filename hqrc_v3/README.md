@@ -107,7 +107,7 @@ ten-event folds, and causal contexts are accepted only after their manifests,
 digests, and `COMPLETE` markers validate. If execution is interrupted, rerun the
 identical command: completed work is skipped and execution continues at the first
 missing context. The final summary reports baseline fit/cache-hit counts and HQT
-fit/reuse counts.
+fit counts plus aggregate `hqt_reused` across retrospective folds and causal contexts.
 
 `--cache-dir` may point at an earlier B0/B1 paper prediction cache. B0 is reused
 only when raw data, experiment/model/event/calendar/temporary-availability digests,
