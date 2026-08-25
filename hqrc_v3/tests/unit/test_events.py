@@ -1,14 +1,24 @@
 from collections import Counter
+from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from hqrc_v3.events import EventRegistryError, load_event_registry, load_holiday_calendar
+
+from hqrc_v3.events import (
+    EventRegistryError,
+    load_event_registry,
+    load_holiday_calendar,
+    validate_feature_event_alignment,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+EVENT_REGISTRY = PROJECT_ROOT / "configs/events.csv"
+HOLIDAY_CALENDAR = PROJECT_ROOT / "configs/holiday_calendar.csv"
 
 
 def test_registry_has_exactly_five_occurrences_per_type():
-    events = load_event_registry(PROJECT_ROOT / "configs/events.csv")
+    events = load_event_registry(EVENT_REGISTRY)
 
     assert len(events) == 10
     assert Counter(event.holiday_type for event in events) == {
@@ -24,8 +34,8 @@ def test_registry_has_exactly_five_occurrences_per_type():
 
 
 def test_feature_calendar_includes_only_declared_distance_support_outside_event_years():
-    events = load_event_registry(PROJECT_ROOT / "configs/events.csv")
-    calendar = load_holiday_calendar(PROJECT_ROOT / "configs/holiday_calendar.csv")
+    events = load_event_registry(EVENT_REGISTRY)
+    calendar = load_holiday_calendar(HOLIDAY_CALENDAR)
 
     assert min(event.central_date.year for event in events) == 2020
     assert min(event.central_date.year for event in calendar) == 2018
@@ -41,6 +51,16 @@ def test_feature_calendar_includes_only_declared_distance_support_outside_event_
         "chuseok-2021",
         "seollal-2022",
     }
+
+
+def test_feature_and_correction_registries_must_align() -> None:
+    calendar = load_holiday_calendar(HOLIDAY_CALENDAR)
+    events = load_event_registry(EVENT_REGISTRY)
+    validate_feature_event_alignment(calendar, events)
+    changed = replace(events[0], official_end=events[0].official_end + timedelta(days=1))
+
+    with pytest.raises(EventRegistryError, match="feature/correction window"):
+        validate_feature_event_alignment(calendar, (changed, *events[1:]))
 
 
 @pytest.mark.parametrize(

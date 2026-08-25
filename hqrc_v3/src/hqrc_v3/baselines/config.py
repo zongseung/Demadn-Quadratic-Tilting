@@ -8,6 +8,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from hqrc_v3.features import (
+    B1W_WINDOW_COLUMNS as FEATURE_B1W_WINDOW_COLUMNS,
+)
+from hqrc_v3.features import (
+    B1W_WINDOW_VERSION as FEATURE_B1W_WINDOW_VERSION,
+)
+from hqrc_v3.features import (
+    feature_columns,
+    history_columns,
+)
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
 
 MODEL_NAMES = (
@@ -38,6 +48,10 @@ _B1_ONLY_COLUMNS = (
     "is_seollal",
     "is_chuseok",
 )
+B1W_WINDOW_COLUMNS = ("is_seollal_window", "is_chuseok_window")
+B1W_WINDOW_VERSION = "official-sequence-buffer-v1"
+_B1W_FUTURE_WIDTH = 16
+_B1W_HISTORY_WIDTH = 19
 
 
 class PaperBaselineConfigError(ValueError):
@@ -54,6 +68,20 @@ def _require_keys(table: dict[str, Any], expected: set[str], name: str) -> None:
         raise PaperBaselineConfigError(
             f"{name} keys differ from the frozen registry: expected {sorted(expected)}"
         )
+
+
+def _validate_reviewer_feature_schema() -> None:
+    """Freeze the B1W schema outside the unchanged manuscript TOML registry."""
+
+    _require_exact(FEATURE_B1W_WINDOW_COLUMNS, B1W_WINDOW_COLUMNS, "B1W window columns")
+    _require_exact(FEATURE_B1W_WINDOW_VERSION, B1W_WINDOW_VERSION, "B1W window version")
+    _require_exact(
+        feature_columns("B1W"),
+        _B0_FUTURE_COLUMNS + _B1_ONLY_COLUMNS + B1W_WINDOW_COLUMNS,
+        "B1W future columns",
+    )
+    _require_exact(len(feature_columns("B1W")), _B1W_FUTURE_WIDTH, "B1W future width")
+    _require_exact(len(history_columns("B1W")), _B1W_HISTORY_WIDTH, "B1W history width")
 
 
 @dataclass(frozen=True)
@@ -271,6 +299,7 @@ class PaperBaselineConfig:
         _require_exact(self.schema_version, 2, "schema_version")
         _require_exact(self.models, MODEL_NAMES, "models")
         _require_exact(self.validation_days, 61, "validation_days")
+        _validate_reviewer_feature_schema()
         if not isinstance(self.source_sha256, str) or _SHA256.fullmatch(self.source_sha256) is None:
             raise PaperBaselineConfigError("source_sha256 must be a lowercase SHA-256 digest")
 

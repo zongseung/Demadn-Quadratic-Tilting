@@ -5,13 +5,16 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
-import hqrc_v3.baselines as baselines
-import hqrc_v3.baselines.classical as classical
 import numpy as np
 import pytest
 import torch
+
+import hqrc_v3.baselines as baselines
+import hqrc_v3.baselines.classical as classical
 from hqrc_v3.baselines.classical import ClassicalBaseline
 from hqrc_v3.baselines.config import (
+    B1W_WINDOW_COLUMNS,
+    B1W_WINDOW_VERSION,
     MODEL_NAMES,
     PAPER_SEEDS,
     PaperBaselineConfig,
@@ -75,6 +78,22 @@ def test_versioned_config_loads_only_the_five_exact_paper_models() -> None:
     assert len(config.preprocessing.b0_future_columns) == 7
     assert len(config.preprocessing.b1_only_columns) == 7
     assert config.seq2seq_lstm.seeds == config.transformer.seeds == PAPER_SEEDS
+
+
+def test_reviewer_b1w_schema_is_frozen_outside_the_toml_contract() -> None:
+    config = load_paper_baselines(MODEL_CONFIG)
+
+    assert config.preprocessing.b1_only_columns == (
+        "is_public_holiday",
+        "official_sequence_position",
+        "seollal_distance",
+        "chuseok_distance",
+        "is_substitute_or_temporary_holiday",
+        "is_seollal",
+        "is_chuseok",
+    )
+    assert B1W_WINDOW_COLUMNS == ("is_seollal_window", "is_chuseok_window")
+    assert B1W_WINDOW_VERSION == "official-sequence-buffer-v1"
 
 
 def test_paper_baseline_api_is_available_from_the_package_namespace() -> None:

@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 import polars as pl
+
 from hqrc_v3.events import EventOccurrence, load_holiday_calendar
 from hqrc_v3.features import (
+    B1W_WINDOW_COLUMNS,
+    B1W_WINDOW_VERSION,
     assert_no_holiday_leakage,
     attach_calendar_features,
     build_daily_forecast_matrix,
     feature_columns,
+    history_columns,
 )
 
 B0_FUTURE = (
@@ -31,6 +35,9 @@ B1_ONLY = (
     "is_seollal",
     "is_chuseok",
 )
+B1W_WINDOW = ("is_seollal_window", "is_chuseok_window")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+HOLIDAY_CALENDAR = PROJECT_ROOT / "configs/holiday_calendar.csv"
 
 
 def test_b0_has_no_holiday_derived_columns(hourly_frame, holiday_calendar):
@@ -67,10 +74,13 @@ def test_future_matrix_does_not_change_when_target_weather_is_perturbed(
     featured = attach_calendar_features(hourly_frame, holiday_calendar)
     before_b0 = build_daily_forecast_matrix(featured, feature_set="B0")
     before_b1 = build_daily_forecast_matrix(featured, feature_set="B1")
+    before_b1w = build_daily_forecast_matrix(featured, feature_set="B1W")
     assert before_b0.history.shape[1:] == (168, 10)
     assert before_b0.future.shape[1:] == (24, 7)
     assert before_b1.history.shape[1:] == (168, 17)
     assert before_b1.future.shape[1:] == (24, 14)
+    assert before_b1w.history.shape[1:] == (168, 19)
+    assert before_b1w.future.shape[1:] == (24, 16)
     target_day = date(2023, 1, 8)
     perturbed = hourly_frame.with_columns(
         pl.when(pl.col("timestamp").dt.date() == target_day)
@@ -85,10 +95,12 @@ def test_future_matrix_does_not_change_when_target_weather_is_perturbed(
     changed = attach_calendar_features(perturbed, holiday_calendar)
     after_b0 = build_daily_forecast_matrix(changed, feature_set="B0")
     after_b1 = build_daily_forecast_matrix(changed, feature_set="B1")
+    after_b1w = build_daily_forecast_matrix(changed, feature_set="B1W")
     origin = np.flatnonzero(before_b0.origins == np.datetime64("2023-01-08", "ns"))[0]
 
     assert before_b0.future[origin].tobytes() == after_b0.future[origin].tobytes()
     assert before_b1.future[origin].tobytes() == after_b1.future[origin].tobytes()
+    assert before_b1w.future[origin].tobytes() == after_b1w.future[origin].tobytes()
 
 
 def test_source_public_holiday_and_official_window_are_distinct(
@@ -129,6 +141,57 @@ def _feature_frame(timestamps: list[datetime]) -> pl.DataFrame:
             "source_public_holiday": [0] * len(timestamps),
         }
     )
+
+
+def _feature_frame_for_dates(start: str, end: str) -> pl.DataFrame:
+    first = date.fromisoformat(start)
+    last = date.fromisoformat(end)
+    return _feature_frame(
+        [datetime.combine(first + timedelta(days=offset), datetime.min.time())
+         for offset in range((last - first).days + 1)]
+    )
+
+
+def _value(frame: pl.DataFrame, day: str, column: str) -> int:
+    return frame.filter(pl.col("timestamp").dt.date() == date.fromisoformat(day)).item(0, column)
+
+
+def test_b1w_uses_registry_windows_not_fixed_central_offsets(
+    holiday_calendar: tuple[EventOccurrence, ...],
+) -> None:
+    featured = attach_calendar_features(
+        _feature_frame_for_dates("2023-01-06", "2023-01-12"), holiday_calendar
+    )
+
+    assert _value(featured, "2023-01-06", "is_seollal_window") == 0
+    assert _value(featured, "2023-01-07", "is_seollal_window") == 1
+    assert _value(featured, "2023-01-08", "is_seollal") == 1
+    assert _value(featured, "2023-01-10", "is_seollal") == 1
+    assert _value(featured, "2023-01-11", "is_seollal") == 0
+    assert _value(featured, "2023-01-11", "is_seollal_window") == 1
+    assert _value(featured, "2023-01-12", "is_seollal_window") == 0
+    assert _value(featured, "2023-01-07", "is_public_holiday") == 0
+    assert _value(featured, "2023-01-11", "is_public_holiday") == 0
+
+
+def test_b1w_allows_plus_three_when_official_sequence_is_extended() -> None:
+    calendar = load_holiday_calendar(HOLIDAY_CALENDAR)
+    featured = attach_calendar_features(
+        _feature_frame_for_dates("2024-02-07", "2024-02-14"), calendar
+    )
+
+    assert _value(featured, "2024-02-13", "is_seollal") == 0
+    assert _value(featured, "2024-02-13", "is_seollal_window") == 1
+    assert _value(featured, "2024-02-14", "is_seollal_window") == 0
+
+
+def test_b1w_schema_has_exact_history_and_future_widths() -> None:
+    assert B1W_WINDOW_VERSION == "official-sequence-buffer-v1"
+    assert B1W_WINDOW_COLUMNS == B1W_WINDOW
+    assert feature_columns("B1") == B0_FUTURE + B1_ONLY
+    assert feature_columns("B1W") == B0_FUTURE + B1_ONLY + B1W_WINDOW
+    assert len(feature_columns("B1W")) == 16
+    assert len(history_columns("B1W")) == 19
 
 
 def test_signed_distances_use_boundary_support_occurrences() -> None:

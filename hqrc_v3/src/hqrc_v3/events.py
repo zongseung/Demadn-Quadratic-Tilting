@@ -157,3 +157,27 @@ def load_holiday_calendar(path: Path) -> tuple[EventOccurrence, ...]:
         raise EventRegistryError("feature distance support central dates differ")
     _validate_restriction_mapping(events)
     return events
+
+
+def validate_feature_event_alignment(
+    calendar: tuple[EventOccurrence, ...], events: tuple[EventOccurrence, ...]
+) -> None:
+    """Require correction occurrences to retain the feature calendar's event support."""
+
+    calendar_by_id = {occurrence.occurrence_id: occurrence for occurrence in calendar}
+    for event in events:
+        calendar_occurrence = calendar_by_id.get(event.occurrence_id)
+        if calendar_occurrence is None or (
+            calendar_occurrence.holiday_type,
+            calendar_occurrence.central_date,
+            calendar_occurrence.official_start,
+            calendar_occurrence.official_end,
+        ) != (
+            event.holiday_type,
+            event.central_date,
+            event.official_start,
+            event.official_end,
+        ):
+            raise EventRegistryError(
+                "feature/correction window registry differs for " f"{event.occurrence_id}"
+            )

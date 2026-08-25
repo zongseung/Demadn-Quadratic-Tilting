@@ -12,7 +12,9 @@ from hqrc_v3.contracts import DataContractError, ForecastMatrix
 from hqrc_v3.data import audit_hourly_data, substitute_or_temporary_expr
 from hqrc_v3.events import EventOccurrence
 
-FeatureSet = Literal["B0", "B1"]
+FeatureSet = Literal["B0", "B1", "B1W"]
+B1W_WINDOW_VERSION = "official-sequence-buffer-v1"
+B1W_WINDOW_COLUMNS = ("is_seollal_window", "is_chuseok_window")
 _OBSERVED_COLUMNS = ("load_mw", "temperature_c", "relative_humidity")
 _B0_COLUMNS = (
     "hour",
@@ -50,6 +52,8 @@ def feature_columns(feature_set: FeatureSet) -> tuple[str, ...]:
         return _B0_COLUMNS
     if feature_set == "B1":
         return _B0_COLUMNS + _B1_ONLY_COLUMNS
+    if feature_set == "B1W":
+        return _B0_COLUMNS + _B1_ONLY_COLUMNS + B1W_WINDOW_COLUMNS
     raise DataContractError(f"unknown feature set: {feature_set}")
 
 
@@ -98,15 +102,20 @@ def attach_calendar_features(
     relative_day = pl.lit(0, dtype=pl.Int64)
     is_seollal = pl.lit(0, dtype=pl.Int8)
     is_chuseok = pl.lit(0, dtype=pl.Int8)
+    is_seollal_window = pl.lit(0, dtype=pl.Int8)
+    is_chuseok_window = pl.lit(0, dtype=pl.Int8)
     for occurrence in calendar:
         in_official_period = day.is_between(occurrence.official_start, occurrence.official_end)
+        in_event_window = day.is_between(occurrence.window_start, occurrence.window_end)
         relative_day = pl.when(in_official_period).then(
             (day - pl.lit(occurrence.central_date)).dt.total_days()
         ).otherwise(relative_day)
         if occurrence.holiday_type == "seollal":
             is_seollal = pl.when(in_official_period).then(1).otherwise(is_seollal)
+            is_seollal_window = pl.when(in_event_window).then(1).otherwise(is_seollal_window)
         else:
             is_chuseok = pl.when(in_official_period).then(1).otherwise(is_chuseok)
+            is_chuseok_window = pl.when(in_event_window).then(1).otherwise(is_chuseok_window)
 
     featured = lazy.with_columns(
         day.alias("date"),
@@ -126,6 +135,8 @@ def attach_calendar_features(
         .alias("is_substitute_or_temporary_holiday"),
         is_seollal.cast(pl.Int8).alias("is_seollal"),
         is_chuseok.cast(pl.Int8).alias("is_chuseok"),
+        is_seollal_window.cast(pl.Int8).alias("is_seollal_window"),
+        is_chuseok_window.cast(pl.Int8).alias("is_chuseok_window"),
     )
     return featured if isinstance(frame, pl.LazyFrame) else featured.collect()
 
