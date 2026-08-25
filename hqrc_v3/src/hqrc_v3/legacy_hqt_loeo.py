@@ -261,11 +261,12 @@ def _sampler_contract(
         if (
             resolved_draws < 1_000
             or resolved_tune < 1_000
-            or resolved_chains != 4
+            or resolved_chains < 4
             or resolved_target != 0.99
         ):
             raise LegacyHQTError(
-                "paper HQT requires 4 chains, at least 1000 tune/draws, and target_accept=0.99"
+                "paper HQT requires at least 4 chains, at least 1000 tune/draws, "
+                "and target_accept=0.99"
             )
     elif profile == "smoke":
         if draws is None or tune is None or chains is None:

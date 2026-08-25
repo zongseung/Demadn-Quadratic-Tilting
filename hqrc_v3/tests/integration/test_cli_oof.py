@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 from hqrc_v3 import cli
@@ -141,6 +144,45 @@ def test_help_succeeds(capsys):
             ],
         ),
         (
+            "run-hqt-reviewer",
+            [
+                "--data",
+                "input.parquet",
+                "--config",
+                "experiment.toml",
+                "--frozen-model-config",
+                "model.toml",
+                "--frozen-model-hash",
+                "abc",
+                "--event-registry",
+                "events.csv",
+                "--holiday-calendar",
+                "holiday-calendar.csv",
+                "--temporary-holiday-availability",
+                "temporary-holidays.csv",
+                "--run-dir",
+                "source",
+                "--cache-dir",
+                "cache",
+                "--output-root",
+                "products",
+                "--profile",
+                "smoke",
+                "--model",
+                "xgboost",
+                "--draws",
+                "5",
+                "--tune",
+                "5",
+                "--chains",
+                "2",
+                "--cores",
+                "2",
+                "--smoke-boosting-rounds",
+                "2",
+            ],
+        ),
+        (
             "run-paper",
             [
                 "--data",
@@ -211,6 +253,81 @@ def test_audit_fixed_bounds_are_provided_to_its_handler():
         "2024-10-31T23:00:00",
         51_144,
     )
+
+
+def test_reviewer_handler_maps_fixed_b1w_pipeline_scope(monkeypatch, capsys):
+    captured = []
+    monkeypatch.setattr(
+        cli,
+        "_paper_stage_inputs",
+        lambda arguments: {
+            "matrices": {"B0": object(), "B1W": object()},
+            "config": object(),
+            "artifact_hashes": {"data_sha256": "a" * 64},
+            "cache_dir": Path("shared-cache"),
+        },
+    )
+
+    def run(options, *, progress):
+        captured.append((options, progress))
+        return SimpleNamespace(
+            baseline_fit_count=3,
+            baseline_cache_hit_count=4,
+            hqt_fit_count=5,
+        )
+
+    monkeypatch.setattr(cli, "run_hqt_reviewer_pipeline", run)
+
+    result = cli.main(
+        [
+            "run-hqt-reviewer",
+            "--data",
+            "input.parquet",
+            "--config",
+            "experiment.toml",
+            "--frozen-model-config",
+            "model.toml",
+            "--frozen-model-hash",
+            "a" * 64,
+            "--event-registry",
+            "events.csv",
+            "--holiday-calendar",
+            "holiday-calendar.csv",
+            "--temporary-holiday-availability",
+            "temporary-holidays.csv",
+            "--run-dir",
+            "source",
+            "--cache-dir",
+            "shared-cache",
+            "--output-root",
+            "products",
+            "--profile",
+            "smoke",
+            "--model",
+            "xgboost",
+            "--draws",
+            "5",
+            "--tune",
+            "5",
+            "--chains",
+            "2",
+            "--cores",
+            "2",
+            "--smoke-boosting-rounds",
+            "2",
+        ]
+    )
+
+    assert result == 0
+    options, progress = captured[0]
+    assert set(options.matrices) == {"B0", "B1W"}
+    assert options.models == ("xgboost",)
+    assert options.profile == "smoke"
+    assert options.draws == options.tune == 5
+    assert options.chains == options.cores == 2
+    assert options.smoke_boosting_rounds == 2
+    assert progress is print
+    assert "baseline_fits=3 baseline_cache_hits=4 hqt_fits=5" in capsys.readouterr().out
 
 
 def test_ar_commands_require_canonical_run_inputs_and_diagnose_never_auto_approves(capsys):

@@ -46,6 +46,10 @@ from hqrc_v3.residual_stage import (
     prepare_standardized_residual_artifact,
     select_diagnostic_residual_context,
 )
+from hqrc_v3.reviewer_pipeline import (
+    ReviewerPipelineOptions,
+    run_hqt_reviewer_pipeline,
+)
 
 StageHandler = Callable[[argparse.Namespace], object]
 _EXPECTED_START = "2019-01-01T00:00:00"
@@ -390,6 +394,50 @@ def run_hqt_causal_2024_handler(arguments: argparse.Namespace) -> object:
             f"[HQT] {label} causal-2024 COMPLETE fits={item.sampler_fit_count} "
             f"reused={item.reused} output={item.output_dir}"
         )
+    return result
+
+
+def run_hqt_reviewer_handler(arguments: argparse.Namespace) -> object:
+    """Run the complete AR-free B0/B1W reviewer experiment in one command."""
+
+    arguments.seed = arguments.baseline_seed
+    arguments.feature_set = "reviewer"
+    arguments.oof_years = None
+    baseline_inputs = _paper_stage_inputs(arguments)
+    result = run_hqt_reviewer_pipeline(
+        ReviewerPipelineOptions(
+            matrices=baseline_inputs["matrices"],
+            baseline_config=baseline_inputs["config"],
+            artifact_hashes=baseline_inputs["artifact_hashes"],
+            data_path=Path(arguments.data),
+            config_path=Path(arguments.config),
+            model_config_path=Path(arguments.frozen_model_config),
+            event_registry_path=Path(arguments.event_registry),
+            holiday_calendar_path=Path(arguments.holiday_calendar),
+            temporary_holiday_availability_path=Path(arguments.temporary_holiday_availability),
+            source_run_dir=Path(arguments.run_dir),
+            cache_dir=Path(baseline_inputs["cache_dir"]),
+            output_root=Path(arguments.output_root),
+            baseline_seed=arguments.baseline_seed,
+            root_seed=arguments.root_seed,
+            models=_pipeline_models(arguments.model),
+            profile=arguments.profile,
+            draws=arguments.draws,
+            tune=arguments.tune,
+            chains=arguments.chains,
+            cores=arguments.cores,
+            init=arguments.init,
+            target_accept=arguments.target_accept,
+            smoke_boosting_rounds=arguments.smoke_boosting_rounds,
+        ),
+        progress=print,
+    )
+    print(
+        "[reviewer] COMPLETE "
+        f"baseline_fits={result.baseline_fit_count} "
+        f"baseline_cache_hits={result.baseline_cache_hit_count} "
+        f"hqt_fits={result.hqt_fit_count}"
+    )
     return result
 
 
@@ -740,6 +788,56 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hqt_causal.add_argument("--target-accept", type=float)
 
+    reviewer = subcommands.add_parser(
+        "run-hqt-reviewer",
+        help="run/reuse the complete AR-free B0/B1W HQT reviewer experiment",
+    )
+    _add_data_inputs(reviewer)
+    reviewer.add_argument(
+        "--frozen-model-config", required=True, help="frozen manuscript model TOML"
+    )
+    reviewer.add_argument("--frozen-model-hash", required=True, help="SHA-256 of frozen model TOML")
+    reviewer.add_argument("--event-registry", required=True, help="fixed correction registry")
+    reviewer.add_argument("--holiday-calendar", required=True, help="holiday feature calendar")
+    reviewer.add_argument(
+        "--temporary-holiday-availability",
+        required=True,
+        help="known-at-origin temporary-holiday registry",
+    )
+    reviewer.add_argument(
+        "--run-dir", required=True, help="reviewer baseline/residual source namespace"
+    )
+    reviewer.add_argument(
+        "--cache-dir",
+        help="shared prediction cache; defaults to prediction-stream-cache below --run-dir",
+    )
+    reviewer.add_argument(
+        "--output-root", required=True, help="parent for retrospective, causal, and paper outputs"
+    )
+    reviewer.add_argument(
+        "--baseline-seed", type=int, default=7, help="classical baseline RNG seed"
+    )
+    reviewer.add_argument("--root-seed", type=int, default=20260813)
+    reviewer.add_argument("--model", choices=(*MODEL_NAMES, "all"), default="all")
+    reviewer.add_argument("--profile", choices=("smoke", "paper"), default="paper")
+    reviewer.add_argument("--draws", type=int)
+    reviewer.add_argument("--tune", type=int)
+    reviewer.add_argument("--chains", type=int)
+    reviewer.add_argument(
+        "--cores",
+        type=int,
+        help="parallel chain workers; defaults to min(chains, detected logical CPUs)",
+    )
+    reviewer.add_argument(
+        "--init", choices=("adapt_diag", "jitter+adapt_diag"), default="adapt_diag"
+    )
+    reviewer.add_argument("--target-accept", type=float)
+    reviewer.add_argument(
+        "--smoke-boosting-rounds",
+        type=int,
+        help="required reduced XGBoost/LightGBM round cap for the smoke profile",
+    )
+
     paper = subcommands.add_parser(
         "run-paper",
         help="build all baseline sources then process HQRC models sequentially",
@@ -804,6 +902,7 @@ def _default_handlers() -> dict[str, StageHandler]:
         "run-loeo-primary": run_loeo_primary_handler,
         "run-hqt-loeo": run_hqt_loeo_handler,
         "run-hqt-causal-2024": run_hqt_causal_2024_handler,
+        "run-hqt-reviewer": run_hqt_reviewer_handler,
         "run-paper": run_paper_handler,
         "report": report_handler,
     }

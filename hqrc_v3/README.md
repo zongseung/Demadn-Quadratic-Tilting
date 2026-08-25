@@ -30,11 +30,17 @@ B0 future (7): hour, day_of_week, is_weekend,
 B1-only (7):   is_public_holiday, official_sequence_position,
                seollal_distance, chuseok_distance,
                is_substitute_or_temporary_holiday, is_seollal, is_chuseok
+B1W-only (2):  is_seollal_window, is_chuseok_window
 history:       load_mw, temperature_c, relative_humidity + that feature set's future schema
 ```
 
-Thus B0 history/future widths are 10/7 and B1 widths are 17/14. Holiday type is
-mutually exclusive one-hot, never an ordinal scalar. The feature calendar contains
+Thus B0 history/future widths are 10/7, B1 widths are 17/14, and B1W widths are
+19/16. B1W contains all of B1 plus two forecast-origin-known event-window indicators.
+Each indicator covers `official_start - 1 day` through `official_end + 1 day`; it is
+derived from the aligned holiday calendar and event registry, not a hard-coded
+central-date offset. B1 and B1W have different schemas and artifact identities, so
+a B1 stream, residual artifact, or HQT result is never compatible with or reused as
+B1W. Holiday type is mutually exclusive one-hot, never an ordinal scalar. The feature calendar contains
 14 rows: 2019--2024 Seollal/Chuseok plus 2018 Chuseok and 2025 Seollal as nearest-
 distance boundary support. The correction registry remains the ten 2020--2024
 events. In particular, 2024-10-01 is a known B1 public/temporary holiday, has both
@@ -73,26 +79,131 @@ runtime and test lock.
 
 ### Accepted-paper reviewer experiment (AR-free HQT)
 
-`run-hqt-loeo` is a separate compatibility path for the accepted conference
-paper. It uses the original iid-Gaussian quadratic partial-pooling model: no
-AR coefficient, pandemic covariate, or hour-of-day profile is fitted. H0 is the
-held-out baseline, H1 is the same-holiday raw-MW training residual mean, and H2
-is the original HQT. A cosine-tapered H2 is emitted only as a boundary
-sensitivity result. The command also writes pooled, Seollal, Chuseok, per-event,
-and residual-scale-stability tables.
+`run-hqt-reviewer` is the operator entry point for the accepted-paper reviewer
+experiment. It uses only the original iid-Gaussian quadratic partial-pooling HQT:
+no AR coefficient or AR approval, pandemic covariate, hour-of-day profile, HQRC
+runner, CRPS, or probabilistic report is part of this command. H0 is the held-out
+baseline, H1 is the same-holiday raw-MW training residual mean, and H2 is the
+original HQT. A cosine-tapered H2 is retained only as boundary sensitivity output.
 
-The reviewer comparison must include both B0 and holiday-aware B1. B1 already
-contains public-holiday, Seollal, Chuseok, substitute/temporary-holiday, sequence
-position, and event-distance variables known at the forecast origin. Completed
-baseline OOF and final-2024 streams are reused; H1/H2 are always refitted from
-the matching B0 or B1 residual stream and never copied across feature sets.
+The fixed execution order is:
+
+1. expanding 2020--2023 OOF baselines for B0, then B1W;
+2. final-2024 baselines for B0, then B1W;
+3. standardized B0/B1W OOF residual publication;
+4. B1W retrospective H0/H1/H2 LOEO over all ten 2020--2024 occurrences;
+5. B1W causal-2024 H0/H1/H2 trained only from the eight 2020--2023 OOF events;
+6. reviewer point-metric tables and figures.
+
+The paper profile requires `--model all`, meaning XGBoost, LightGBM, SVR,
+Seq2Seq-LSTM, and Transformer in manuscript order. A single `--model`, such as
+`xgboost`, is allowed only with the smoke profile. Paper sampling uses at least four chains,
+at least 1,000 tune and retained draws per chain, and `target_accept=0.99`. Smoke
+runs must explicitly state their smaller sampler sizes and boosting-round cap.
+
+Every stage owns its own strict identity and completion validation. Baseline
+streams reuse immutable prediction-cache entries; completed residual publication,
+ten-event folds, and causal contexts are accepted only after their manifests,
+digests, and `COMPLETE` markers validate. If execution is interrupted, rerun the
+identical command: completed work is skipped and execution continues at the first
+missing context. The final summary reports baseline fit/cache-hit counts and HQT
+fit/reuse counts.
+
+`--cache-dir` may point at an earlier B0/B1 paper prediction cache. B0 is reused
+only when raw data, experiment/model/event/calendar/temporary-availability digests,
+feature schema, model, baseline seed, split, timestamps, and profile all match.
+B1 entries never satisfy B1W identity; the first B1W run is fitted and later
+identical B1W runs are reused from their own entries.
+
+From the repository root, run the paper command exactly as follows:
+
+```bash
+MODEL_SHA256="$(openssl dgst -sha256 hqrc_v3/configs/model_spaces.toml | awk '{print $NF}')"
+
+uv run --project hqrc_v3 --locked hqrc run-hqt-reviewer \
+  --data power_demand_final.csv \
+  --config hqrc_v3/configs/experiment.toml \
+  --frozen-model-config hqrc_v3/configs/model_spaces.toml \
+  --frozen-model-hash "$MODEL_SHA256" \
+  --event-registry hqrc_v3/configs/events.csv \
+  --holiday-calendar hqrc_v3/configs/holiday_calendar.csv \
+  --temporary-holiday-availability hqrc_v3/configs/temporary_holiday_availability.csv \
+  --run-dir artifacts/hqt-reviewer-source \
+  --cache-dir artifacts/hqrc-v3-paper-20260811/prediction-stream-cache \
+  --output-root artifacts/hqt-reviewer-results \
+  --baseline-seed 7 --root-seed 20260813 \
+  --model all --profile paper \
+  --draws 1000 --tune 1000 --chains 4 --cores 4 \
+  --init adapt_diag --target-accept 0.99
+```
+
+From inside the `hqrc_v3/` directory, point uv at the parent workspace so it still
+uses the repository-root lock, and adjust paths exactly once:
+
+```bash
+MODEL_SHA256="$(openssl dgst -sha256 configs/model_spaces.toml | awk '{print $NF}')"
+
+uv run --project .. --locked hqrc run-hqt-reviewer \
+  --data ../power_demand_final.csv \
+  --config configs/experiment.toml \
+  --frozen-model-config configs/model_spaces.toml \
+  --frozen-model-hash "$MODEL_SHA256" \
+  --event-registry configs/events.csv \
+  --holiday-calendar configs/holiday_calendar.csv \
+  --temporary-holiday-availability configs/temporary_holiday_availability.csv \
+  --run-dir ../artifacts/hqt-reviewer-source \
+  --cache-dir ../artifacts/hqrc-v3-paper-20260811/prediction-stream-cache \
+  --output-root ../artifacts/hqt-reviewer-results \
+  --baseline-seed 7 --root-seed 20260813 \
+  --model all --profile paper \
+  --draws 1000 --tune 1000 --chains 4 --cores 4 \
+  --init adapt_diag --target-accept 0.99
+```
+
+The corresponding reviewer namespaces are separate and fixed:
+
+```text
+artifacts/hqt-reviewer-source/predictions/                 B0/B1W OOF and final
+artifacts/hqt-reviewer-source/inputs/                      standardized residuals
+artifacts/hqt-reviewer-results/retrospective-loeo/         ten-event B1W HQT
+artifacts/hqt-reviewer-results/causal-2024/                causal B1W HQT
+artifacts/hqt-reviewer-results/paper/tables/               CSV/Parquet reviewer tables
+artifacts/hqt-reviewer-results/paper/figures/              reviewer PNG figures
+artifacts/hqt-reviewer-results/paper/manifest.json          report digests
+```
+
+For the opt-in end-to-end smoke, use a temporary source/output root and run this
+identical command twice. The second summary must have zero baseline/HQT fits,
+positive cache/reuse counts, and unchanged output digests:
+
+```bash
+uv run --project hqrc_v3 --locked hqrc run-hqt-reviewer \
+  --data power_demand_final.csv \
+  --config hqrc_v3/configs/experiment.toml \
+  --frozen-model-config hqrc_v3/configs/model_spaces.toml \
+  --frozen-model-hash "$MODEL_SHA256" \
+  --event-registry hqrc_v3/configs/events.csv \
+  --holiday-calendar hqrc_v3/configs/holiday_calendar.csv \
+  --temporary-holiday-availability hqrc_v3/configs/temporary_holiday_availability.csv \
+  --run-dir artifacts/hqt-reviewer-smoke-source \
+  --cache-dir artifacts/hqt-reviewer-smoke-cache \
+  --output-root artifacts/hqt-reviewer-smoke-results \
+  --baseline-seed 7 --root-seed 20260813 \
+  --profile smoke --model xgboost \
+  --draws 5 --tune 5 --chains 2 --cores 2 --smoke-boosting-rounds 2
+```
+
+`run-hqt-loeo` remains a lower-level compatibility command for rerunning only
+retrospective HQT from an already completed source. For the reviewer comparison it
+must consume B1W residuals; it does not prepare B0/B1W baselines, causal-2024, or
+the final reviewer report itself.
 
 ```bash
 uv run --project hqrc_v3 --locked hqrc run-hqt-loeo \
-  --source-run-dir artifacts/hqrc-v3-paper-local \
+  --source-run-dir artifacts/hqt-reviewer-source \
   --config hqrc_v3/configs/experiment.toml \
   --output-root artifacts/hqt-reviewer-loeo \
-  --model all --feature-set all \
+  --model all --feature-set B1W \
   --profile paper --draws 1000 --tune 1000 --chains 4 \
   --root-seed 20260813 --target-accept 0.99
 ```

@@ -292,6 +292,19 @@ def test_public_causal_runner_validates_source_fits_once_and_writes_two_events(
     assert identity["sampler"]["root_seed"] == 20260813
 
 
+def test_causal_event_selection_accepts_final_parquet_nanosecond_timestamps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: FakeSource
+) -> None:
+    source._final = source._final.with_columns(pl.col("target_timestamp").cast(pl.Datetime("ns")))
+    _install_runner_fakes(monkeypatch, source)
+
+    result = _run(tmp_path)
+
+    assert result[0].sampler_fit_count == 1
+    hourly = pl.read_parquet(result[0].output_dir / "hourly_predictions.parquet")
+    assert tuple(hourly["occurrence_id"].unique(maintain_order=True)) == EVALUATION_IDS
+
+
 def test_complete_causal_context_is_hash_validated_and_reused(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: FakeSource
 ) -> None:

@@ -24,6 +24,7 @@ from hqrc_v3.diagnostics.ar import EventResidualContext
 from hqrc_v3.diagnostics.loeo import LOEOFold, LOEOHeldOut, LOEOPublication
 from hqrc_v3.legacy_hqt_loeo import (
     LegacyHQTError,
+    _sampler_contract,
     _select_contexts,
     build_legacy_hqt_data,
     build_legacy_hqt_data_from_frame,
@@ -167,6 +168,23 @@ def test_legacy_hqt_paper_profile_allows_more_than_four_chains(monkeypatch) -> N
     )
 
     assert captured["chains"] == 5
+
+
+def test_legacy_loeo_paper_contract_allows_more_than_four_chains() -> None:
+    contract = _sampler_contract(
+        profile="paper",
+        root_seed=31,
+        held_out_occurrence_id="seollal-2024",
+        draws=1_000,
+        tune=1_000,
+        chains=5,
+        cores=5,
+        init="adapt_diag",
+        target_accept=0.99,
+    )
+
+    assert contract["chains"] == 5
+    assert contract["cores"] == 5
 
 
 def test_new_event_draws_are_seeded_and_follow_quadratic_design() -> None:

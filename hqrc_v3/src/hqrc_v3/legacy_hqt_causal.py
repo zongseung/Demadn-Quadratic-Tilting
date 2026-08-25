@@ -255,7 +255,9 @@ def _evaluation_frames(
     evaluations = []
     for event in events:
         expected = _event_hours(event)
-        selected = final.filter(pl.col("target_timestamp").is_in(expected)).sort("target_timestamp")
+        selected = final.filter(
+            pl.col("target_timestamp").is_between(expected[0], expected[-1], closed="both")
+        ).sort("target_timestamp")
         observed_timestamps = tuple(selected["target_timestamp"].to_list())
         if selected.height != len(expected) or observed_timestamps != expected:
             raise LegacyHQTCausalError(
