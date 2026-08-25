@@ -10,6 +10,7 @@ from hqrc_v3.evaluation.data_benchmark import (
     write_data_benchmark_request,
 )
 from hqrc_v3.evaluation.inference import (
+    Alternative,
     EventBootstrapResult,
     HACDMResult,
     InferenceContractError,
@@ -34,19 +35,30 @@ from hqrc_v3.evaluation.reports import (
     sampler_eligible_default,
     write_benchmark,
 )
+from hqrc_v3.evaluation.reviewer import (
+    ReviewerReportError,
+    ReviewerReportInputs,
+    ReviewerReportResult,
+    build_reviewer_report,
+)
 
 __all__ = [
+    "Alternative",
     "DataBenchmarkError",
     "EventBootstrapResult",
     "HACDMResult",
     "InferenceContractError",
     "MetricContractError",
     "ReportContractError",
+    "ReviewerReportError",
+    "ReviewerReportInputs",
+    "ReviewerReportResult",
     "SamplerBenchmark",
     "WilcoxonEventResult",
     "bootstrap_event_median",
     "benchmark_polars_data",
     "build_report",
+    "build_reviewer_report",
     "empirical_crps",
     "event_metric_frame",
     "hac_dm_test",

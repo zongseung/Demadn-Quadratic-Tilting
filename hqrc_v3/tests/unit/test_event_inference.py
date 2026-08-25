@@ -1,5 +1,8 @@
 import numpy as np
+import pytest
+
 from hqrc_v3.evaluation.inference import (
+    InferenceContractError,
     bootstrap_event_median,
     hac_dm_test,
     holm_adjust,
@@ -23,6 +26,30 @@ def test_event_wilcoxon_and_holm_are_deterministic():
 
     assert result.n_events == 3
     assert adjusted == {"first": 0.06, "second": 0.06, "third": 0.8}
+
+
+def test_wilcoxon_supports_reference_greater_than_candidate():
+    reference = np.array([10.0, 9.0, 8.0, 7.0])
+    candidate = np.array([8.0, 7.0, 6.0, 5.0])
+
+    result = wilcoxon_event_test(reference, candidate, alternative="greater")
+
+    assert result.n_events == 4
+    assert 0.0 <= result.p_value <= 1.0
+
+
+def test_one_sided_wilcoxon_preserves_identical_vector_behavior():
+    values = np.array([2.0, 3.0, 4.0])
+
+    result = wilcoxon_event_test(values, values, alternative="greater")
+
+    assert result.statistic == 0.0
+    assert result.p_value == 1.0
+
+
+def test_wilcoxon_rejects_unknown_alternative():
+    with pytest.raises(InferenceContractError, match="alternative"):
+        wilcoxon_event_test(np.array([2.0]), np.array([1.0]), alternative="up")
 
 
 def test_hac_dm_reports_bandwidth_and_event_block_seed():

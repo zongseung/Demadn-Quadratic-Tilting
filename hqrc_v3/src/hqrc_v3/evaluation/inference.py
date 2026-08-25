@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 from scipy import stats
@@ -12,6 +13,9 @@ from scipy import stats
 
 class InferenceContractError(ValueError):
     """Raised when event-level comparisons do not form a valid paired analysis."""
+
+
+Alternative = Literal["two-sided", "greater", "less"]
 
 
 @dataclass(frozen=True)
@@ -78,16 +82,23 @@ def bootstrap_event_median(
     )
 
 
-def wilcoxon_event_test(reference: np.ndarray, candidate: np.ndarray) -> WilcoxonEventResult:
+def wilcoxon_event_test(
+    reference: np.ndarray,
+    candidate: np.ndarray,
+    *,
+    alternative: Alternative = "two-sided",
+) -> WilcoxonEventResult:
     """Apply paired Wilcoxon signed-rank to occurrence summaries, never hours."""
 
     left = _finite_vector(reference, name="reference")
     right = _finite_vector(candidate, name="candidate")
     if left.shape != right.shape:
         raise InferenceContractError("paired event summaries must have equal length")
+    if alternative not in {"two-sided", "greater", "less"}:
+        raise InferenceContractError("unsupported Wilcoxon alternative")
     if np.allclose(left, right, rtol=0.0, atol=0.0):
         return WilcoxonEventResult(0.0, 1.0, int(left.size))
-    result = stats.wilcoxon(left, right, alternative="two-sided", method="auto")
+    result = stats.wilcoxon(left, right, alternative=alternative, method="auto")
     return WilcoxonEventResult(float(result.statistic), float(result.pvalue), int(left.size))
 
 
