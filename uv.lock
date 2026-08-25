@@ -596,6 +596,7 @@ source = { editable = "hqrc_v3" }
 dependencies = [
     { name = "arviz" },
     { name = "lightgbm" },
+    { name = "matplotlib" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "polars" },
@@ -625,6 +626,7 @@ dev = [
 requires-dist = [
     { name = "arviz", specifier = ">=0.22.0" },
     { name = "lightgbm", specifier = ">=4.6.0" },
+    { name = "matplotlib", specifier = ">=3.10.6" },
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "nutpie", marker = "extra == 'sampler-acceleration'" },
     { name = "pandas", specifier = ">=2.3.2" },

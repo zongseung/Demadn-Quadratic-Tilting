@@ -1315,5 +1315,38 @@ def test_readme_hqrc_commands_are_executable_from_the_repository_root() -> None:
         "MODEL_SHA256=\"$(openssl dgst -sha256 "
         "hqrc_v3/configs/model_spaces.toml | awk '{print $NF}')\""
     ) in readme
-    assert readme.count('--frozen-model-hash "$MODEL_SHA256"') == 4
+
+    root_commands: list[str] = []
+    lines = readme.splitlines()
+    line_index = 0
+    while line_index < len(lines):
+        line = lines[line_index].strip()
+        if line.startswith("uv run --project hqrc_v3 --locked hqrc "):
+            parts: list[str] = []
+            while True:
+                continued = line.endswith("\\")
+                parts.append(line.removesuffix("\\").strip())
+                if not continued:
+                    break
+                line_index += 1
+                line = lines[line_index].strip()
+            root_commands.append(" ".join(parts))
+        line_index += 1
+    commands_requiring_frozen_hash = {
+        "fit-final-baselines",
+        "generate-oof",
+        "run-hqt-reviewer",
+        "run-paper",
+    }
+    checked_commands = {
+        command.split(" hqrc ", maxsplit=1)[1].split(maxsplit=1)[0]
+        for command in root_commands
+        if command.split(" hqrc ", maxsplit=1)[1].split(maxsplit=1)[0]
+        in commands_requiring_frozen_hash
+    }
+    assert checked_commands == commands_requiring_frozen_hash
+    for command in root_commands:
+        command_name = command.split(" hqrc ", maxsplit=1)[1].split(maxsplit=1)[0]
+        if command_name in commands_requiring_frozen_hash:
+            assert command.count('--frozen-model-hash "$MODEL_SHA256"') == 1
     assert "--frozen-model-hash MODEL_SHA256" not in readme
