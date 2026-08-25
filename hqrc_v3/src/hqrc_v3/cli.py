@@ -37,6 +37,7 @@ from hqrc_v3.events import (
     validate_feature_event_alignment,
 )
 from hqrc_v3.features import attach_calendar_features, build_daily_forecast_matrix
+from hqrc_v3.legacy_hqt_causal import run_legacy_hqt_causal_2024
 from hqrc_v3.legacy_hqt_loeo import run_legacy_hqt_loeo
 from hqrc_v3.paper_pipeline import run_paper_loeo_pipeline
 from hqrc_v3.provenance import file_sha256
@@ -364,6 +365,34 @@ def run_hqt_loeo_handler(arguments: argparse.Namespace) -> object:
     return result
 
 
+def run_hqt_causal_2024_handler(arguments: argparse.Namespace) -> object:
+    """Run the accepted paper's AR-free causal 2024 reviewer experiment."""
+
+    result = run_legacy_hqt_causal_2024(
+        source_run_dir=Path(arguments.source_run_dir),
+        config_path=Path(arguments.config),
+        output_root=Path(arguments.output_root),
+        models=_pipeline_models(arguments.model),
+        feature_set=arguments.feature_set,
+        root_seed=arguments.root_seed,
+        profile=arguments.profile,
+        draws=arguments.draws,
+        tune=arguments.tune,
+        chains=arguments.chains,
+        cores=arguments.cores,
+        init=arguments.init,
+        target_accept=arguments.target_accept,
+        progress=print,
+    )
+    for item in result:
+        label = f"{item.context.model}/{item.context.feature_set}/seed-{item.context.seed}"
+        print(
+            f"[HQT] {label} causal-2024 COMPLETE fits={item.sampler_fit_count} "
+            f"reused={item.reused} output={item.output_dir}"
+        )
+    return result
+
+
 def run_paper_handler(arguments: argparse.Namespace) -> object:
     """Build/reuse the common baseline source, then finish HQRC contexts in order."""
 
@@ -660,9 +689,7 @@ def build_parser() -> argparse.ArgumentParser:
     hqt_loeo.add_argument("--config", required=True, help="experiment TOML bound to source")
     hqt_loeo.add_argument("--output-root", required=True, help="legacy HQT artifact root")
     hqt_loeo.add_argument("--model", choices=(*MODEL_NAMES, "all"), default="all")
-    hqt_loeo.add_argument(
-        "--feature-set", choices=("B0", "B1", "B1W", "all"), default="B1W"
-    )
+    hqt_loeo.add_argument("--feature-set", choices=("B0", "B1", "B1W", "all"), default="B1W")
     hqt_loeo.add_argument(
         "--held-out",
         nargs="+",
@@ -684,6 +711,34 @@ def build_parser() -> argparse.ArgumentParser:
         default="adapt_diag",
     )
     hqt_loeo.add_argument("--target-accept", type=float)
+
+    hqt_causal = subcommands.add_parser(
+        "run-hqt-causal-2024",
+        help="run the accepted paper's AR-free 2020-2023 to 2024 causal HQT evaluation",
+    )
+    hqt_causal.add_argument(
+        "--source-run-dir", required=True, help="completed B1W baseline/residual publication"
+    )
+    hqt_causal.add_argument("--config", required=True, help="experiment TOML bound to source")
+    hqt_causal.add_argument("--output-root", required=True, help="causal HQT artifact root")
+    hqt_causal.add_argument("--model", choices=(*MODEL_NAMES, "all"), default="all")
+    hqt_causal.add_argument("--feature-set", choices=("B1W",), default="B1W")
+    hqt_causal.add_argument("--profile", choices=("smoke", "paper"), default="paper")
+    hqt_causal.add_argument("--root-seed", type=int, default=20260813)
+    hqt_causal.add_argument("--draws", type=int)
+    hqt_causal.add_argument("--tune", type=int)
+    hqt_causal.add_argument("--chains", type=int)
+    hqt_causal.add_argument(
+        "--cores",
+        type=int,
+        help="parallel chain workers; defaults to min(chains, detected logical CPUs)",
+    )
+    hqt_causal.add_argument(
+        "--init",
+        choices=("adapt_diag", "jitter+adapt_diag"),
+        default="adapt_diag",
+    )
+    hqt_causal.add_argument("--target-accept", type=float)
 
     paper = subcommands.add_parser(
         "run-paper",
@@ -748,6 +803,7 @@ def _default_handlers() -> dict[str, StageHandler]:
         "benchmark-samplers": _unavailable_handler("benchmark-samplers"),
         "run-loeo-primary": run_loeo_primary_handler,
         "run-hqt-loeo": run_hqt_loeo_handler,
+        "run-hqt-causal-2024": run_hqt_causal_2024_handler,
         "run-paper": run_paper_handler,
         "report": report_handler,
     }
