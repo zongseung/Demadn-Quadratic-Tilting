@@ -6,6 +6,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+import hqrc_v3.evaluation.reviewer as reviewer
 from hqrc_v3.evaluation.reviewer import (
     ReviewerReportError,
     ReviewerReportInputs,
@@ -17,6 +18,7 @@ EVENT_IDS = tuple(
     f"{holiday}-{year}" for year in range(2020, 2025) for holiday in ("seollal", "chuseok")
 )
 METRICS = ("rmse", "mae", "mape", "smape", "r2")
+FORBIDDEN_METRIC_TOKENS = ("crps", "pinball", "coverage")
 
 
 def _metric_row(
@@ -204,6 +206,14 @@ def _reviewer_fixture(tmp_path: Path) -> ReviewerReportInputs:
     )
 
 
+def _tree_hashes(root: Path) -> dict[str, str]:
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
 def test_reviewer_report_separates_feature_and_hqt_gains(tmp_path: Path):
     result = build_reviewer_report(_reviewer_fixture(tmp_path), output_root=tmp_path / "paper")
     overall = pl.read_parquet(result.tables_dir / "overall_2024.parquet")
@@ -237,17 +247,17 @@ def test_reviewer_report_writes_exact_normalized_tables_and_manifest(tmp_path: P
         )
 
     event = pl.read_parquet(result.tables_dir / "loeo_event.parquet")
-    causal = pl.read_parquet(result.tables_dir / "causal_2024.parquet")
     assert event.filter(pl.col("correction") == "H2")[
         "rmse_improvement_pct"
     ].min() == pytest.approx(-5.0)
     assert set(event["correction"]) == {"H0", "H1", "H2"}
+    for name in expected:
+        table = pl.read_parquet(result.tables_dir / f"{name}.parquet")
+        assert not any(
+            token in column.lower() for column in table.columns for token in FORBIDDEN_METRIC_TOKENS
+        )
+    causal = pl.read_parquet(result.tables_dir / "causal_2024.parquet")
     assert set(causal["correction"]) == {"H0", "H1", "H2"}
-    assert not any(
-        token in column.lower()
-        for column in causal.columns
-        for token in ("crps", "pinball", "coverage")
-    )
 
     manifest = json.loads(result.manifest_path.read_text())
     assert manifest["inference"]["bootstrap_draws"] == 10_000
@@ -265,3 +275,101 @@ def test_reviewer_report_rejects_non_ten_event_inference(tmp_path: Path):
 
     with pytest.raises(ReviewerReportError, match="exactly 10 physical events"):
         build_reviewer_report(inputs, output_root=tmp_path / "paper")
+
+
+@pytest.mark.parametrize(
+    ("artifact", "identifier"),
+    (("event_metrics.parquet", "event_id"), ("hourly_predictions.parquet", "occurrence_id")),
+)
+def test_reviewer_report_rejects_swapped_causal_holiday_labels(
+    tmp_path: Path, artifact: str, identifier: str
+):
+    inputs = _reviewer_fixture(tmp_path)
+    path = inputs.causal_context_dirs[0] / artifact
+    frame = pl.read_parquet(path).with_columns(
+        pl.col("holiday_type")
+        .replace({"seollal": "chuseok", "chuseok": "seollal"})
+        .alias("holiday_type")
+    )
+    assert frame.select("holiday_type").n_unique() == 2
+    assert frame.select(identifier).n_unique() == 2
+    frame.write_parquet(path)
+
+    with pytest.raises(ReviewerReportError, match="holiday labels"):
+        build_reviewer_report(inputs, output_root=tmp_path / "paper")
+
+
+def test_reviewer_report_rejects_incomplete_causal_pooled_combinations(tmp_path: Path):
+    inputs = _reviewer_fixture(tmp_path)
+    path = inputs.causal_context_dirs[0] / "pooled_metrics.parquet"
+    pl.read_parquet(path).filter(
+        ~((pl.col("scope") == "chuseok") & (pl.col("correction") == "H2"))
+    ).write_parquet(path)
+
+    with pytest.raises(ReviewerReportError, match="three scopes and H0/H1/H2"):
+        build_reviewer_report(inputs, output_root=tmp_path / "paper")
+
+
+def test_scale_stability_has_frozen_schema_and_drops_probabilistic_extras(tmp_path: Path):
+    inputs = _reviewer_fixture(tmp_path)
+    path = inputs.loeo_context_dirs[0] / "scale_stability.parquet"
+    pl.read_parquet(path).with_columns(pl.lit(0.25).alias("crps")).write_parquet(path)
+
+    result = build_reviewer_report(inputs, output_root=tmp_path / "paper")
+
+    scale = pl.read_parquet(result.tables_dir / "scale_stability.parquet")
+    assert scale.columns == [
+        "model",
+        "feature_set",
+        "seed",
+        "sigma_fit_oof_2023_mw",
+        "sigma_2024_non_event_mw",
+        "scale_ratio",
+        "n_2024_non_event_hours",
+    ]
+    for path in result.tables_dir.glob("*.parquet"):
+        assert not any(
+            token in column.lower()
+            for column in pl.read_parquet(path).columns
+            for token in FORBIDDEN_METRIC_TOKENS
+        )
+
+
+def test_successful_republication_removes_stale_files(tmp_path: Path):
+    inputs = _reviewer_fixture(tmp_path)
+    output = tmp_path / "paper"
+    build_reviewer_report(inputs, output_root=output)
+    stale = output / "tables" / "stale.parquet"
+    stale.write_bytes(b"stale")
+
+    build_reviewer_report(inputs, output_root=output)
+
+    assert not stale.exists()
+    assert set(path.name for path in output.iterdir()) == {"tables", "figures", "manifest.json"}
+    assert not list(tmp_path.glob(".paper.staging-*"))
+    assert not list(tmp_path.glob(".paper.previous-*"))
+
+
+def test_failed_republication_preserves_the_previous_valid_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    inputs = _reviewer_fixture(tmp_path)
+    output = tmp_path / "paper"
+    build_reviewer_report(inputs, output_root=output)
+    before = _tree_hashes(output)
+    final = pl.read_parquet(inputs.final_predictions_path).with_columns(
+        pl.when(pl.col("feature_set") == "B1W")
+        .then(pl.col("predicted_mw") + 1.0)
+        .otherwise(pl.col("predicted_mw"))
+        .alias("predicted_mw")
+    )
+    final.write_parquet(inputs.final_predictions_path)
+
+    def fail_after_tables(*_args, **_kwargs):
+        raise RuntimeError("injected figure failure")
+
+    monkeypatch.setattr(reviewer, "_plot_causal_corrections", fail_after_tables)
+    with pytest.raises(RuntimeError, match="injected figure failure"):
+        build_reviewer_report(inputs, output_root=output)
+
+    assert _tree_hashes(output) == before

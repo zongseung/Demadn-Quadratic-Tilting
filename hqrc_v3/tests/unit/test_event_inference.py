@@ -35,7 +35,12 @@ def test_wilcoxon_supports_reference_greater_than_candidate():
     result = wilcoxon_event_test(reference, candidate, alternative="greater")
 
     assert result.n_events == 4
-    assert 0.0 <= result.p_value <= 1.0
+    assert result.statistic == pytest.approx(10.0)
+    assert result.p_value == pytest.approx(0.0625)
+
+    mirrored = wilcoxon_event_test(candidate, reference, alternative="less")
+    assert mirrored.statistic == pytest.approx(0.0)
+    assert mirrored.p_value == pytest.approx(result.p_value)
 
 
 def test_one_sided_wilcoxon_preserves_identical_vector_behavior():

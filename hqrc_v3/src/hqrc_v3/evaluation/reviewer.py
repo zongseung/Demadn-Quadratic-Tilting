@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -38,6 +39,15 @@ _TABLE_NAMES = (
     "scale_stability",
 )
 _FIGURE_NAMES = ("fig_per_event.png", "fig_correction_2024.png")
+_SCALE_COLUMNS = (
+    "model",
+    "feature_set",
+    "seed",
+    "sigma_fit_oof_2023_mw",
+    "sigma_2024_non_event_mw",
+    "scale_ratio",
+    "n_2024_non_event_hours",
+)
 
 
 class ReviewerReportError(ValueError):
@@ -136,19 +146,7 @@ def _require_finite_metrics(frame: pl.DataFrame, description: str) -> None:
 
 def _context_identity(context_dir: Path) -> tuple[str, str, int, pl.DataFrame]:
     scale = _read_parquet(context_dir / "scale_stability.parquet", "LOEO scale stability")
-    _require_columns(
-        scale,
-        (
-            "model",
-            "feature_set",
-            "seed",
-            "sigma_fit_oof_2023_mw",
-            "sigma_2024_non_event_mw",
-            "scale_ratio",
-            "n_2024_non_event_hours",
-        ),
-        "LOEO scale stability",
-    )
+    _require_columns(scale, _SCALE_COLUMNS, "LOEO scale stability")
     if scale.height != 1:
         raise ReviewerReportError("LOEO scale stability must identify exactly one context")
     model = scale["model"].item()
@@ -174,7 +172,20 @@ def _context_identity(context_dir: Path) -> tuple[str, str, int, pl.DataFrame]:
         or not scale["n_2024_non_event_hours"].gt(0).all()
     ):
         raise ReviewerReportError("LOEO scale stability has invalid non-event hour count")
-    return model, feature_set, seed, scale
+    return model, feature_set, seed, scale.select(_SCALE_COLUMNS)
+
+
+def _require_holiday_mapping(
+    frame: pl.DataFrame, *, identifier_column: str, description: str
+) -> None:
+    matches = frame.select(
+        (
+            pl.col("holiday_type")
+            == pl.col(identifier_column).str.split_exact("-", 1).struct.field("field_0")
+        ).all()
+    ).item()
+    if not matches:
+        raise ReviewerReportError(f"{description} holiday labels differ from occurrence ids")
 
 
 def _with_context(
@@ -478,10 +489,28 @@ def _causal_tables(
                 raise ReviewerReportError(f"{description} context differs from event metrics")
         if set(event["event_id"]) != _EXPECTED_CAUSAL_EVENTS:
             raise ReviewerReportError("causal event metrics require both 2024 physical events")
+        _require_holiday_mapping(
+            event, identifier_column="event_id", description="causal event metrics"
+        )
+        _require_holiday_mapping(
+            hourly,
+            identifier_column="occurrence_id",
+            description="causal hourly predictions",
+        )
         event_main = event.filter(pl.col("correction").is_in(_MAIN_CORRECTIONS))
         pooled_main = pooled.filter(pl.col("correction").is_in(_MAIN_CORRECTIONS))
         if event_main.height != 2 * len(_MAIN_CORRECTIONS):
             raise ReviewerReportError("causal event metrics have incomplete H0/H1/H2 rows")
+        expected_pooled = {
+            (scope, correction)
+            for scope in ("all", "seollal", "chuseok")
+            for correction in _MAIN_CORRECTIONS
+        }
+        if (
+            pooled_main.height != len(expected_pooled)
+            or set(pooled_main.select("scope", "correction").iter_rows()) != expected_pooled
+        ):
+            raise ReviewerReportError("causal pooled metrics require three scopes and H0/H1/H2")
         if set(hourly["occurrence_id"]) != _EXPECTED_CAUSAL_EVENTS:
             raise ReviewerReportError("causal hourly predictions require both 2024 events")
         if hourly.select("model", "occurrence_id", "target_timestamp").is_duplicated().any():
@@ -617,6 +646,78 @@ def _input_records(inputs: ReviewerReportInputs) -> list[dict[str, str]]:
     return records
 
 
+def _validate_staged_report(staging: Path) -> None:
+    expected_tables = {f"{name}.{suffix}" for name in _TABLE_NAMES for suffix in ("parquet", "csv")}
+    expected_outputs = {
+        *(f"tables/{name}" for name in expected_tables),
+        *(f"figures/{name}" for name in _FIGURE_NAMES),
+    }
+    if {path.name for path in staging.iterdir()} != {"tables", "figures", "manifest.json"}:
+        raise ReviewerReportError("staged reviewer report root namespace differs")
+    tables_dir = staging / "tables"
+    figures_dir = staging / "figures"
+    if (
+        not tables_dir.is_dir()
+        or {path.name for path in tables_dir.iterdir()} != expected_tables
+        or any(not path.is_file() or path.is_symlink() for path in tables_dir.iterdir())
+    ):
+        raise ReviewerReportError("staged reviewer table namespace differs")
+    if (
+        not figures_dir.is_dir()
+        or {path.name for path in figures_dir.iterdir()} != set(_FIGURE_NAMES)
+        or any(not path.is_file() or path.is_symlink() for path in figures_dir.iterdir())
+    ):
+        raise ReviewerReportError("staged reviewer figure namespace differs")
+    manifest_path = staging / "manifest.json"
+    try:
+        raw = manifest_path.read_bytes()
+        manifest = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ReviewerReportError("staged reviewer manifest is unreadable") from error
+    if not isinstance(manifest, dict) or raw != _canonical_json(manifest):
+        raise ReviewerReportError("staged reviewer manifest is not canonical")
+    outputs = manifest.get("outputs")
+    if not isinstance(outputs, dict) or set(outputs) != expected_outputs:
+        raise ReviewerReportError("staged reviewer manifest output namespace differs")
+    for relative, digest in outputs.items():
+        path = staging / relative
+        if not path.is_file() or file_sha256(path) != digest:
+            raise ReviewerReportError("staged reviewer output hash differs")
+
+
+def _publish_staged_report(staging: Path, output: Path) -> None:
+    if not output.exists():
+        os.replace(staging, output)
+        return
+    if output.is_symlink() or not output.is_dir():
+        raise ReviewerReportError("published reviewer report root is unsafe")
+    backup_parent = Path(tempfile.mkdtemp(prefix=f".{output.name}.previous-", dir=output.parent))
+    backup = backup_parent / "report"
+    backup_contains_previous = False
+    publication_complete = False
+    try:
+        os.replace(output, backup)
+        backup_contains_previous = True
+        try:
+            os.replace(staging, output)
+            publication_complete = True
+        except BaseException:
+            try:
+                os.replace(backup, output)
+                backup_contains_previous = False
+            except BaseException as rollback_error:
+                raise ReviewerReportError(
+                    f"reviewer publication rollback failed; previous report retained at {backup}"
+                ) from rollback_error
+            raise
+    finally:
+        if publication_complete and backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+            backup_contains_previous = False
+        if not backup_contains_previous:
+            shutil.rmtree(backup_parent, ignore_errors=True)
+
+
 def build_reviewer_report(
     inputs: ReviewerReportInputs, *, output_root: Path
 ) -> ReviewerReportResult:
@@ -631,10 +732,7 @@ def build_reviewer_report(
     ):
         raise ReviewerReportError("reviewer root seed must be a non-negative integer")
     output = Path(output_root).expanduser().resolve()
-    tables_dir = output / "tables"
-    figures_dir = output / "figures"
-    tables_dir.mkdir(parents=True, exist_ok=True)
-    figures_dir.mkdir(parents=True, exist_ok=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
 
     final = _read_parquet(inputs.final_predictions_path, "final-2024 predictions")
     overall = _overall_table(final)
@@ -655,39 +753,51 @@ def build_reviewer_report(
         "causal_2024": causal,
         "scale_stability": scale,
     }
-    for name in _TABLE_NAMES:
-        _write_table(tables[name], tables_dir, name)
-    _plot_per_event(loeo_event, figures_dir / _FIGURE_NAMES[0])
-    _plot_causal_corrections(causal_hourly, figures_dir / _FIGURE_NAMES[1])
+    staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.staging-", dir=output.parent))
+    try:
+        staging_tables = staging / "tables"
+        staging_figures = staging / "figures"
+        staging_tables.mkdir()
+        staging_figures.mkdir()
+        for name in _TABLE_NAMES:
+            _write_table(tables[name], staging_tables, name)
+        _plot_per_event(loeo_event, staging_figures / _FIGURE_NAMES[0])
+        _plot_causal_corrections(causal_hourly, staging_figures / _FIGURE_NAMES[1])
 
-    output_paths = [
-        *(
-            tables_dir / f"{name}.{suffix}"
-            for name in _TABLE_NAMES
-            for suffix in ("parquet", "csv")
-        ),
-        *(figures_dir / name for name in _FIGURE_NAMES),
-    ]
-    manifest = {
-        "schema_version": 1,
-        "root_seed": inputs.root_seed,
-        "inputs": _input_records(inputs),
-        "inference": {
-            "comparison": "B1W-H0_to_B1W-H2",
-            "event_count_per_context": 10,
-            "bootstrap_draws": 10_000,
-            "bootstrap_seeds": bootstrap_seeds,
-            "resampled_units": "event",
-            "wilcoxon_alternative": "greater",
-        },
-        "outputs": {
-            str(path.relative_to(output)): file_sha256(path)
-            for path in sorted(output_paths, key=lambda item: str(item.relative_to(output)))
-        },
-    }
-    manifest_path = output / "manifest.json"
-    _write_atomic(manifest_path, _canonical_json(manifest))
-    return ReviewerReportResult(output, tables_dir, figures_dir, manifest_path)
+        output_paths = [
+            *(
+                staging_tables / f"{name}.{suffix}"
+                for name in _TABLE_NAMES
+                for suffix in ("parquet", "csv")
+            ),
+            *(staging_figures / name for name in _FIGURE_NAMES),
+        ]
+        manifest = {
+            "schema_version": 1,
+            "root_seed": inputs.root_seed,
+            "inputs": _input_records(inputs),
+            "inference": {
+                "comparison": "B1W-H0_to_B1W-H2",
+                "event_count_per_context": 10,
+                "bootstrap_draws": 10_000,
+                "bootstrap_seeds": bootstrap_seeds,
+                "resampled_units": "event",
+                "wilcoxon_alternative": "greater",
+            },
+            "outputs": {
+                str(path.relative_to(staging)): file_sha256(path)
+                for path in sorted(output_paths, key=lambda item: str(item.relative_to(staging)))
+            },
+        }
+        _write_atomic(staging / "manifest.json", _canonical_json(manifest))
+        _validate_staged_report(staging)
+        _publish_staged_report(staging, output)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+    return ReviewerReportResult(
+        output, output / "tables", output / "figures", output / "manifest.json"
+    )
 
 
 __all__ = [
