@@ -50,6 +50,9 @@ _PRIVATE_PYRO_SITES = frozenset(
         "between_corr_cholesky_1",
     }
 )
+_STRUCTURAL_DIAGNOSTIC_VARIABLES = frozenset(
+    {"between_cholesky", "between_cov_0_corr", "between_cov_1_corr"}
+)
 
 
 @dataclass(frozen=True)
@@ -100,7 +103,12 @@ def validate_inference_data(idata: az.InferenceData, *, paper_profile: bool) -> 
 
     if not isinstance(idata, az.InferenceData) or not hasattr(idata, "posterior"):
         raise SamplingError("sampler did not return ArviZ InferenceData with posterior draws")
-    summary = az.summary(idata, kind="diagnostics")
+    diagnostic_variables = [
+        name
+        for name in idata.posterior.data_vars
+        if name not in _STRUCTURAL_DIAGNOSTIC_VARIABLES
+    ]
+    summary = az.summary(idata, kind="diagnostics", var_names=diagnostic_variables)
     if not hasattr(idata, "sample_stats") or "diverging" not in idata.sample_stats:
         if paper_profile:
             raise SamplingError("paper_profile requires sample_stats.diverging diagnostics")

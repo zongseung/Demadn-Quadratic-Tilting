@@ -317,6 +317,37 @@ def test_malformed_ess_fails_paper_gate_without_authorizing_rescue(monkeypatch, 
     assert loeo_publication_module.retryable_diagnostics(raised.value) is None
 
 
+def test_structural_deterministics_do_not_invalidate_finite_sampling_diagnostics():
+    rng = np.random.default_rng(20260825)
+    chains, draws = 4, 1_000
+    cholesky = np.zeros((chains, draws, 2, 2))
+    cholesky[..., 0, 0] = np.exp(rng.normal(size=(chains, draws)))
+    cholesky[..., 1, 0] = rng.normal(size=(chains, draws))
+    cholesky[..., 1, 1] = np.exp(rng.normal(size=(chains, draws)))
+    correlation = np.zeros_like(cholesky)
+    correlation[..., 0, 0] = 1.0
+    correlation[..., 1, 1] = 1.0
+    correlation[..., 0, 1] = correlation[..., 1, 0] = np.tanh(
+        rng.normal(size=(chains, draws)) / 3.0
+    )
+    idata = az.from_dict(
+        posterior={
+            "theta": rng.normal(size=(chains, draws)),
+            "between_cholesky": cholesky,
+            "between_cov_0_corr": correlation,
+            "between_cov_1_corr": correlation,
+        },
+        sample_stats={"diverging": np.zeros((chains, draws), dtype=np.int8)},
+    )
+
+    diagnostics = validate_inference_data(idata, paper_profile=True)
+
+    assert diagnostics.max_rhat <= 1.01
+    assert diagnostics.min_bulk_ess >= 400
+    assert diagnostics.min_tail_ess >= 400
+    assert diagnostics.divergences == 0
+
+
 @pytest.mark.parametrize("cores", [2, 3, 5])
 def test_pyro_rejects_unsupported_core_topology_before_model_build(cores):
     with pytest.raises(ValueError, match="cores=1 or cores=4"):
