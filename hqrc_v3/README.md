@@ -71,6 +71,37 @@ runtime and test lock.
 
 ## One-command manuscript runner
 
+### Accepted-paper reviewer experiment (AR-free HQT)
+
+`run-hqt-loeo` is a separate compatibility path for the accepted conference
+paper. It uses the original iid-Gaussian quadratic partial-pooling model: no
+AR coefficient, pandemic covariate, or hour-of-day profile is fitted. H0 is the
+held-out baseline, H1 is the same-holiday raw-MW training residual mean, and H2
+is the original HQT. A cosine-tapered H2 is emitted only as a boundary
+sensitivity result. The command also writes pooled, Seollal, Chuseok, per-event,
+and residual-scale-stability tables.
+
+The reviewer comparison must include both B0 and holiday-aware B1. B1 already
+contains public-holiday, Seollal, Chuseok, substitute/temporary-holiday, sequence
+position, and event-distance variables known at the forecast origin. Completed
+baseline OOF and final-2024 streams are reused; H1/H2 are always refitted from
+the matching B0 or B1 residual stream and never copied across feature sets.
+
+```bash
+uv run --project hqrc_v3 --locked hqrc run-hqt-loeo \
+  --source-run-dir artifacts/hqrc-v3-paper-local \
+  --config hqrc_v3/configs/experiment.toml \
+  --output-root artifacts/hqt-reviewer-loeo \
+  --model all --feature-set all \
+  --profile paper --draws 1000 --tune 1000 --chains 4 \
+  --root-seed 20260813 --target-accept 0.99
+```
+
+Omit `--cores` to detect logical CPUs and use up to four parallel chain workers.
+The default scope is all ten held-out occurrences. `--held-out seollal-2020`
+may be used for a timing benchmark; it is recorded as a one-event scope and is
+not a paper aggregate. Fold checkpoints are hash-bound and automatically reused.
+
 `run-paper` is the portable operator entry point.  It first completes the shared
 baseline source in its fixed order (all five models, B0 then B1, OOF then final
 2024 forecast, then standardized residuals). It then completes HQRC contexts in

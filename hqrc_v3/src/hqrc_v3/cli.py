@@ -33,6 +33,7 @@ from hqrc_v3.diagnostics.ar import (
 )
 from hqrc_v3.events import load_event_registry, load_holiday_calendar
 from hqrc_v3.features import attach_calendar_features, build_daily_forecast_matrix
+from hqrc_v3.legacy_hqt_loeo import run_legacy_hqt_loeo
 from hqrc_v3.paper_pipeline import run_paper_loeo_pipeline
 from hqrc_v3.provenance import file_sha256
 from hqrc_v3.residual_stage import (
@@ -321,6 +322,35 @@ def run_loeo_primary_handler(arguments: argparse.Namespace) -> object:
     return result
 
 
+def run_hqt_loeo_handler(arguments: argparse.Namespace) -> object:
+    """Run the accepted paper's AR-free H0/H1/H2 reviewer experiment."""
+
+    result = run_legacy_hqt_loeo(
+        source_run_dir=Path(arguments.source_run_dir),
+        config_path=Path(arguments.config),
+        output_root=Path(arguments.output_root),
+        models=_pipeline_models(arguments.model),
+        feature_sets=_pipeline_feature_sets(arguments.feature_set),
+        held_out_occurrence_ids=arguments.held_out,
+        root_seed=arguments.root_seed,
+        profile=arguments.profile,
+        draws=arguments.draws,
+        tune=arguments.tune,
+        chains=arguments.chains,
+        cores=arguments.cores,
+        init=arguments.init,
+        target_accept=arguments.target_accept,
+        progress=print,
+    )
+    for item in result:
+        label = f"{item.context.model}/{item.context.feature_set}/seed-{item.context.seed}"
+        print(
+            f"[HQT] {label} COMPLETE fits={item.sampler_fit_count} "
+            f"reused={item.reused_fold_count} output={item.output_dir}"
+        )
+    return result
+
+
 def run_paper_handler(arguments: argparse.Namespace) -> object:
     """Build/reuse the common baseline source, then finish HQRC contexts in order."""
 
@@ -603,6 +633,39 @@ def build_parser() -> argparse.ArgumentParser:
     loeo_primary.add_argument("--profile", choices=("smoke", "paper"), default="paper")
     _add_loeo_pipeline_options(loeo_primary)
 
+    hqt_loeo = subcommands.add_parser(
+        "run-hqt-loeo",
+        help="run the accepted paper's iid-Gaussian H0/H1/H2 ten-event LOEO",
+    )
+    hqt_loeo.add_argument(
+        "--source-run-dir", required=True, help="completed baseline/residual publication"
+    )
+    hqt_loeo.add_argument("--config", required=True, help="experiment TOML bound to source")
+    hqt_loeo.add_argument("--output-root", required=True, help="legacy HQT artifact root")
+    hqt_loeo.add_argument("--model", choices=(*MODEL_NAMES, "all"), default="all")
+    hqt_loeo.add_argument("--feature-set", choices=("B0", "B1", "all"), default="all")
+    hqt_loeo.add_argument(
+        "--held-out",
+        nargs="+",
+        help="optional occurrence subset for a benchmark; default is all ten events",
+    )
+    hqt_loeo.add_argument("--profile", choices=("smoke", "paper"), default="paper")
+    hqt_loeo.add_argument("--root-seed", type=int, default=20260813)
+    hqt_loeo.add_argument("--draws", type=int)
+    hqt_loeo.add_argument("--tune", type=int)
+    hqt_loeo.add_argument("--chains", type=int)
+    hqt_loeo.add_argument(
+        "--cores",
+        type=int,
+        help="parallel chain workers; defaults to min(chains, detected logical CPUs)",
+    )
+    hqt_loeo.add_argument(
+        "--init",
+        choices=("adapt_diag", "jitter+adapt_diag"),
+        default="adapt_diag",
+    )
+    hqt_loeo.add_argument("--target-accept", type=float)
+
     paper = subcommands.add_parser(
         "run-paper",
         help="build all baseline sources then process HQRC models sequentially",
@@ -665,6 +728,7 @@ def _default_handlers() -> dict[str, StageHandler]:
         "run-ablations": _unavailable_handler("run-ablations"),
         "benchmark-samplers": _unavailable_handler("benchmark-samplers"),
         "run-loeo-primary": run_loeo_primary_handler,
+        "run-hqt-loeo": run_hqt_loeo_handler,
         "run-paper": run_paper_handler,
         "report": report_handler,
     }
