@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import arviz as az
 import numpy as np
@@ -19,13 +21,14 @@ from hqrc_v3.bayes.model import HQRCData
 from hqrc_v3.bayes.samplers import SamplingDiagnostics
 from hqrc_v3.cli import build_parser
 from hqrc_v3.diagnostics.ar import EventResidualContext
-from hqrc_v3.diagnostics.loeo import LOEOFold
+from hqrc_v3.diagnostics.loeo import LOEOFold, LOEOHeldOut, LOEOPublication
 from hqrc_v3.legacy_hqt_loeo import (
     LegacyHQTError,
     build_legacy_hqt_data,
     build_legacy_hqt_data_from_frame,
     cosine_boundary_taper,
     event_type_mean_shift_mw,
+    run_legacy_hqt_loeo,
 )
 
 
@@ -215,3 +218,140 @@ def test_cli_exposes_ar_free_hqt_scope_without_ar_approval() -> None:
     assert arguments.held_out == ["seollal-2020"]
     assert not hasattr(arguments, "approved_ar")
     assert not hasattr(arguments, "approve_derived_ar")
+
+
+def test_legacy_hqt_loeo_writes_products_then_reuses_physical_fold(
+    tmp_path: Path, monkeypatch
+) -> None:
+    context = EventResidualContext(
+        "xgboost", "B1", 7, ("oof-2020", "oof-2021", "oof-2022", "oof-2023")
+    )
+    fold = _physical_fold(tmp_path)
+    start = datetime(2024, 9, 14)
+    tau = np.arange(72, dtype=float) / 24.0
+    held_out = LOEOHeldOut(
+        occurrence_id="chuseok-2024",
+        path=tmp_path / "held-out.parquet",
+        universe_sha256="universe-sha",
+        frame=pl.DataFrame(
+            {
+                "causal": [False] * tau.size,
+                "holiday_type": ["chuseok"] * tau.size,
+                "occurrence_id": ["chuseok-2024"] * tau.size,
+                "observed_mw": 100.0 + np.arange(tau.size),
+                "predicted_mw": 99.0 + np.arange(tau.size),
+                "sigma_n_mw": [100.0] * tau.size,
+                "target_timestamp": [start + timedelta(hours=hour) for hour in range(tau.size)],
+                "tau_days": tau,
+            }
+        ),
+        context=context,
+        causal=False,
+    )
+    publication = LOEOPublication(
+        output_dir=tmp_path / "publication",
+        generation_dir=tmp_path / "publication" / "generation",
+        manifest_path=tmp_path / "publication" / "manifest.json",
+        universe_path=tmp_path / "publication" / "universe.parquet",
+        universe_sha256="universe-sha",
+        occurrence_ids=("chuseok-2024",),
+        fold_paths={"chuseok-2024": tmp_path / "publication" / "fold.parquet"},
+        fold_sha256={"chuseok-2024": "fold-sha"},
+        context=context,
+        causal=False,
+    )
+    baseline_manifest = tmp_path / "baseline_manifest.json"
+    baseline_manifest.write_text("{}")
+    source = SimpleNamespace(
+        available_contexts=(context,),
+        baseline_manifest_path=baseline_manifest,
+        residual_sha256="residual-sha",
+    )
+    sampled: list[HQRCData] = []
+
+    def fake_sample(data: HQRCData, **_kwargs) -> az.InferenceData:
+        sampled.append(data)
+        idata = az.from_dict(
+            posterior={
+                "mu": np.zeros((1, 2, 2, 3)),
+                "between_cholesky": np.broadcast_to(np.eye(3), (1, 2, 2, 3, 3)),
+            }
+        )
+        idata.attrs["legacy_hqt_model_json"] = json.dumps(LEGACY_HQT_MODEL_SPEC, sort_keys=True)
+        return idata
+
+    monkeypatch.setattr("hqrc_v3.legacy_hqt_loeo.validate_correction_source", lambda **_kw: source)
+    monkeypatch.setattr(
+        "hqrc_v3.legacy_hqt_loeo.publish_loeo_universe", lambda *_args, **_kw: publication
+    )
+    monkeypatch.setattr(
+        "hqrc_v3.legacy_hqt_loeo.load_loeo_universe", lambda *_args, **_kw: publication
+    )
+    monkeypatch.setattr("hqrc_v3.legacy_hqt_loeo.load_loeo_fold", lambda *_args, **_kw: fold)
+    monkeypatch.setattr("hqrc_v3.legacy_hqt_loeo.load_loeo_event", lambda *_args, **_kw: held_out)
+    monkeypatch.setattr("hqrc_v3.legacy_hqt_loeo.sample_legacy_hqt", fake_sample)
+    monkeypatch.setattr("hqrc_v3.legacy_hqt_loeo.validate_inference_data", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        "hqrc_v3.legacy_hqt_loeo._scale_stability",
+        lambda *_args: pl.DataFrame({"scale_ratio": [1.0]}),
+    )
+
+    first = run_legacy_hqt_loeo(
+        source_run_dir=tmp_path / "source",
+        config_path=tmp_path / "experiment.toml",
+        output_root=tmp_path / "output",
+        models=("xgboost",),
+        feature_sets=("B1",),
+        held_out_occurrence_ids=None,
+        root_seed=17,
+        profile="smoke",
+        draws=2,
+        tune=2,
+        chains=1,
+        cores=1,
+    )
+    fold_dir = first[0].output_dir / "folds" / "chuseok-2024"
+
+    assert len(sampled) == 1
+    assert len(sampled[0].occurrence_ids) == 9
+    assert "chuseok-2024" not in sampled[0].occurrence_ids
+    assert first[0].sampler_fit_count == 1
+    assert first[0].reused_fold_count == 0
+    assert {path.name for path in fold_dir.iterdir()} == {
+        "COMPLETE",
+        "hourly_predictions.parquet",
+        "input_identity.json",
+        "manifest.json",
+        "metrics.parquet",
+        "posterior.nc",
+    }
+    assert pl.read_parquet(fold_dir / "metrics.parquet")["correction"].to_list() == [
+        "H0",
+        "H1",
+        "H2",
+        "H2-taper",
+    ]
+    assert (first[0].output_dir / "event_metrics.parquet").is_file()
+    assert (first[0].output_dir / "pooled_metrics.parquet").is_file()
+    assert (first[0].output_dir / "event_improvements.parquet").is_file()
+    assert (first[0].output_dir / "improvement_summary.parquet").is_file()
+    assert (first[0].output_dir / "scale_stability.parquet").is_file()
+
+    second = run_legacy_hqt_loeo(
+        source_run_dir=tmp_path / "source",
+        config_path=tmp_path / "experiment.toml",
+        output_root=tmp_path / "output",
+        models=("xgboost",),
+        feature_sets=("B1",),
+        held_out_occurrence_ids=None,
+        root_seed=17,
+        profile="smoke",
+        draws=2,
+        tune=2,
+        chains=1,
+        cores=1,
+    )
+
+    assert len(sampled) == 1
+    assert second[0].sampler_fit_count == 0
+    assert second[0].reused_fold_count == 1
