@@ -1,21 +1,22 @@
 from __future__ import annotations
 
 import json
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
-import hqrc_v3.correction_source as source_module
 import numpy as np
 import polars as pl
 import pytest
+
+import hqrc_v3.correction_source as source_module
 from hqrc_v3.correction_source import (
     CorrectionSourceError,
     validate_correction_source,
 )
 from hqrc_v3.diagnostics.ar import EventResidualContext
-from hqrc_v3.events import EventOccurrence
+from hqrc_v3.events import EventOccurrence, EventRegistryError
 from hqrc_v3.provenance import file_sha256
 
 CONTEXT = EventResidualContext(
@@ -26,7 +27,12 @@ CONTEXT = EventResidualContext(
 )
 
 
-def _prediction_frame(*, split_id: str, observed: float = 100.0) -> pl.DataFrame:
+def _prediction_frame(
+    *,
+    split_id: str,
+    observed: float = 100.0,
+    context: EventResidualContext = CONTEXT,
+) -> pl.DataFrame:
     year = 2024 if split_id == "final-2024" else int(split_id.removeprefix("oof-"))
     origin = datetime(year, 1, 1)
     return pl.DataFrame(
@@ -36,9 +42,9 @@ def _prediction_frame(*, split_id: str, observed: float = 100.0) -> pl.DataFrame
             "horizon": list(range(1, 25)),
             "observed_mw": [observed] * 24,
             "predicted_mw": [90.0] * 24,
-            "model": [CONTEXT.model] * 24,
-            "feature_set": [CONTEXT.feature_set] * 24,
-            "seed": [CONTEXT.seed] * 24,
+            "model": [context.model] * 24,
+            "feature_set": [context.feature_set] * 24,
+            "seed": [context.seed] * 24,
             "split_id": [split_id] * 24,
         }
     )
@@ -50,7 +56,15 @@ def _canonical_write(path: Path, value: object) -> None:
     )
 
 
-def _install_source_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def _install_source_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    feature_set: str = "B1",
+):
+    context = EventResidualContext(
+        CONTEXT.model, feature_set, CONTEXT.seed, CONTEXT.split_ids
+    )
     run = tmp_path / "run"
     inputs = run / "inputs"
     predictions = run / "predictions"
@@ -77,20 +91,25 @@ def _install_source_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     final_point = predictions / "final_2024.parquet"
     final_members = predictions / "final_2024_members.parquet"
     oof_frame = pl.concat(
-        [_prediction_frame(split_id=split_id) for split_id in CONTEXT.split_ids]
+        [
+            _prediction_frame(split_id=split_id, context=context)
+            for split_id in context.split_ids
+        ]
     )
     oof_frame.write_parquet(oof_point)
     pl.DataFrame(schema=oof_frame.schema).write_parquet(oof_members)
-    _prediction_frame(split_id="final-2024").write_parquet(final_point)
-    pl.DataFrame(schema=_prediction_frame(split_id="final-2024").schema).write_parquet(
+    _prediction_frame(split_id="final-2024", context=context).write_parquet(final_point)
+    pl.DataFrame(
+        schema=_prediction_frame(split_id="final-2024", context=context).schema
+    ).write_parquet(
         final_members
     )
     residual_path = inputs / "standardized_residuals.parquet"
     residual_frame = pl.DataFrame(
         {
-            "model": [CONTEXT.model],
-            "feature_set": [CONTEXT.feature_set],
-            "seed": [CONTEXT.seed],
+            "model": [context.model],
+            "feature_set": [context.feature_set],
+            "seed": [context.seed],
             "split_id": ["oof-2023"],
             "standardized_residual": [1.0],
         }
@@ -126,10 +145,10 @@ def _install_source_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         },
         "contexts": [
             {
-                "model": CONTEXT.model,
-                "feature_set": CONTEXT.feature_set,
-                "seed": CONTEXT.seed,
-                "split_ids": list(CONTEXT.split_ids),
+                "model": context.model,
+                "feature_set": context.feature_set,
+                "seed": context.seed,
+                "split_ids": list(context.split_ids),
                 "occurrence_ids": ["seollal-2023"],
                 "rows": 1,
                 "fold_scales": [],
@@ -145,9 +164,9 @@ def _install_source_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     baseline_manifest = {
         "profile": "smoke",
-        "models": [CONTEXT.model],
-        "feature_sets": [CONTEXT.feature_set],
-        "classical_seed": CONTEXT.seed,
+        "models": [context.model],
+        "feature_sets": [context.feature_set],
+        "classical_seed": context.seed,
         "execution_overrides": {"boosting_rounds": 3},
         "stages": {
             "oof": {
@@ -257,6 +276,8 @@ def _install_source_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         final_members=final_members,
         final_point=final_point,
         runner_state=runner_state,
+        context=context,
+        event=event,
     )
 
 
@@ -285,6 +306,42 @@ def test_validated_source_is_immutable_and_loads_canonical_context_streams(
     assert source.load_oof_point_context(CONTEXT).equals(pl.read_parquet(fixture.oof_point))
     assert source.load_final_point_context(CONTEXT).equals(pl.read_parquet(fixture.final_point))
     assert len(fixture.runner_state.calls) == 1
+
+
+def test_validated_source_accepts_b1w_context_without_aliasing_b1(
+    tmp_path, monkeypatch
+) -> None:
+    fixture = _install_source_fixture(tmp_path, monkeypatch, feature_set="B1W")
+
+    source = validate_correction_source(
+        run_dir=fixture.run,
+        config_path=fixture.sources["experiment_config"],
+        profile="smoke",
+    )
+
+    assert source.available_contexts == (fixture.context,)
+    assert fixture.runner_state.calls[0]["feature_sets"] == ("B1W",)
+    with pytest.raises(CorrectionSourceError, match="requested context"):
+        source.load_oof_point_context(CONTEXT)
+
+
+def test_validated_source_rejects_feature_correction_registry_misalignment(
+    tmp_path, monkeypatch
+) -> None:
+    fixture = _install_source_fixture(tmp_path, monkeypatch, feature_set="B1W")
+    changed = replace(
+        fixture.event,
+        official_start=fixture.event.official_start + timedelta(days=1),
+    )
+    monkeypatch.setattr(source_module, "load_holiday_calendar", lambda _path: (changed,))
+
+    with pytest.raises(EventRegistryError, match="feature/correction window registry"):
+        validate_correction_source(
+            run_dir=fixture.run,
+            config_path=fixture.sources["experiment_config"],
+            profile="smoke",
+        )
+    assert fixture.runner_state.calls == []
 
 
 @pytest.mark.parametrize(

@@ -7,8 +7,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pytest
+
 from hqrc_v3.contracts import ForecastMatrix
-from hqrc_v3.features import feature_columns
+from hqrc_v3.features import feature_columns, history_columns
 from hqrc_v3.oof import cache_key, generate_cached_final, generate_oof_stream
 from hqrc_v3.provenance import ArtifactMismatch
 from hqrc_v3.residuals import PredictionCache
@@ -31,21 +32,39 @@ POPULATION = {
 HASHES = {"config": "c", "data": "d", "events": "e"}
 
 
-def _matrix() -> ForecastMatrix:
+def _matrix(feature_set: str = "B0") -> ForecastMatrix:
     origins = np.array(
         [np.datetime64(f"{year}-01-01", "ns") for year in range(2019, 2025)]
     )
     target_times = origins[:, None] + np.arange(24).astype("timedelta64[h]")
-    future = feature_columns("B0")
+    future = feature_columns(feature_set)  # type: ignore[arg-type]
+    history = history_columns(feature_set)  # type: ignore[arg-type]
     return ForecastMatrix(
         origins=origins,
         target_times=target_times,
-        history=np.zeros((len(origins), 168, 1), dtype=float),
+        history=np.zeros((len(origins), 168, len(history)), dtype=float),
         future=np.zeros((len(origins), 24, len(future)), dtype=float),
         target=np.full((len(origins), 24), 50_000.0),
-        history_columns=("load_lag",),
+        history_columns=history,
         future_columns=future,
     )
+
+
+def test_oof_accepts_b1w_as_a_distinct_prediction_context(tmp_path) -> None:
+    factory = PopulationFactory()
+
+    result = generate_oof_stream(
+        _matrix("B1W"),
+        factory,
+        "B1W",
+        PredictionCache(tmp_path),
+        HASHES,
+        7,
+        folds=(expanding_oof_folds()[0],),
+    )
+
+    assert factory.fit_calls == 1
+    assert result.combined_frame["feature_set"].unique().to_list() == ["B1W"]
 
 
 @dataclass(frozen=True)

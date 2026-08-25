@@ -21,6 +21,7 @@ import polars as pl
 from hqrc_v3.baselines.config import MODEL_NAMES, PAPER_SEEDS, load_paper_baselines
 from hqrc_v3.baselines.paper import (
     ENSEMBLE_SEED,
+    PAPER_FEATURE_SUITES,
     PAPER_HASH_KEYS,
     validate_oof_publication_against_source_matrices,
 )
@@ -37,8 +38,14 @@ from hqrc_v3.data import (
     load_temporary_holiday_availability,
     read_hourly_data,
 )
-from hqrc_v3.events import EventOccurrence, load_event_registry, load_holiday_calendar
+from hqrc_v3.events import (
+    EventOccurrence,
+    load_event_registry,
+    load_holiday_calendar,
+    validate_feature_event_alignment,
+)
 from hqrc_v3.features import (
+    B1W_WINDOW_VERSION,
     attach_calendar_features,
     build_daily_forecast_matrix,
     feature_columns,
@@ -114,7 +121,8 @@ _INPUT_KEYS = {
     "temporary_holiday_availability",
 }
 _NEURAL_MODELS = frozenset(("seq2seq_lstm", "transformer"))
-_FEATURE_SETS = ("B0", "B1")
+_FEATURE_SETS = ("B0", "B1", "B1W")
+_AR_FEATURE_SETS = frozenset(("B0", "B1"))
 
 
 @dataclass(frozen=True)
@@ -597,8 +605,9 @@ def _load_baseline_source(
 
     load_config(Path(config_path))
     baseline_config = load_paper_baselines(Path(model_config_path))
-    load_event_registry(Path(event_registry_path))
+    events = load_event_registry(Path(event_registry_path))
     calendar = load_holiday_calendar(Path(holiday_calendar_path))
+    validate_feature_event_alignment(calendar, events)
     temporary_availability = load_temporary_holiday_availability(
         Path(temporary_holiday_availability_path)
     )
@@ -619,21 +628,25 @@ def _load_baseline_source(
     ]:
         raise ArtifactMismatch("baseline model/feature-set order is not canonical")
     if profile == "paper" and (
-        tuple(models) != MODEL_NAMES or tuple(feature_sets) != _FEATURE_SETS
+        tuple(models) != MODEL_NAMES or tuple(feature_sets) not in PAPER_FEATURE_SUITES
     ):
-        raise ArtifactMismatch("paper residual preparation requires all five models and B0/B1")
+        raise ArtifactMismatch(
+            "paper residual preparation requires all five models and an exact paper feature suite"
+        )
 
     if manifest.get("neural_seeds") != list(PAPER_SEEDS):
         raise ArtifactMismatch("baseline neural seed contract differs")
     if manifest.get("ensemble_seed") != ENSEMBLE_SEED:
         raise ArtifactMismatch("baseline ensemble seed differs")
-    expected_schemas = {
-        feature_set: {
+    expected_schemas = {}
+    for feature_set in feature_sets:
+        schema = {
             "history": list(history_columns(feature_set)),
             "future": list(feature_columns(feature_set)),
         }
-        for feature_set in feature_sets
-    }
+        if feature_set == "B1W":
+            schema["window_definition"] = [B1W_WINDOW_VERSION]
+        expected_schemas[feature_set] = schema
     if manifest.get("feature_schemas") != expected_schemas:
         raise ArtifactMismatch("baseline feature schemas differ")
     if manifest.get("preprocessing") != baseline_config.preprocessing.to_manifest():
@@ -1231,7 +1244,7 @@ def select_diagnostic_residual_context(
     """Select one manifest-declared context and prove its registered event coverage."""
 
     _validate_standardized_frame(frame)
-    if model not in MODEL_NAMES or feature_set not in _FEATURE_SETS:
+    if model not in MODEL_NAMES or feature_set not in _AR_FEATURE_SETS:
         raise ArtifactMismatch("diagnostic context selector is invalid")
     if isinstance(through, bool) or not isinstance(through, int):
         raise ArtifactMismatch("diagnostic through year must be an integer")

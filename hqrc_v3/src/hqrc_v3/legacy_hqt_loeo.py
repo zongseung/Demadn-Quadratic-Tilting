@@ -628,7 +628,7 @@ def _select_contexts(
     requested_features = tuple(feature_sets)
     if any(model not in MODEL_NAMES for model in requested_models):
         raise LegacyHQTError("legacy HQT model scope differs")
-    if any(feature not in {"B0", "B1"} for feature in requested_features):
+    if any(feature not in {"B0", "B1", "B1W"} for feature in requested_features):
         raise LegacyHQTError("legacy HQT feature scope differs")
     available = {
         (context.model, context.feature_set): context for context in source.available_contexts
@@ -638,7 +638,7 @@ def _select_contexts(
             available[(model, feature)]
             for model in MODEL_NAMES
             if model in requested_models
-            for feature in ("B0", "B1")
+            for feature in ("B0", "B1", "B1W")
             if feature in requested_features
         )
     except KeyError as error:

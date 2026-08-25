@@ -40,7 +40,7 @@ from hqrc_v3.contracts import (
     validate_forecast_feature_columns,
     validate_prediction_frame,
 )
-from hqrc_v3.features import feature_columns, history_columns
+from hqrc_v3.features import B1W_WINDOW_VERSION, feature_columns, history_columns
 from hqrc_v3.oof import (
     FeatureSet,
     chronological_validation_tail,
@@ -65,7 +65,12 @@ PAPER_HASH_KEYS = (
     "holiday_calendar_sha256",
     "temporary_holiday_availability_sha256",
 )
-_FEATURE_SETS: tuple[FeatureSet, ...] = ("B0", "B1")
+LEGACY_PAPER_FEATURE_SUITE: tuple[FeatureSet, ...] = ("B0", "B1")
+REVIEWER_PAPER_FEATURE_SUITE: tuple[FeatureSet, ...] = ("B0", "B1W")
+PAPER_FEATURE_SUITES = frozenset(
+    (LEGACY_PAPER_FEATURE_SUITE, REVIEWER_PAPER_FEATURE_SUITE)
+)
+_FEATURE_SETS: tuple[FeatureSet, ...] = ("B0", "B1", "B1W")
 _NEURAL_MODELS = frozenset(("seq2seq_lstm", "transformer"))
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _TRANSACTION_NAME = ".baseline-transaction.json"
@@ -197,7 +202,9 @@ def _require_stage_selection(
     if profile not in {"paper", "smoke"}:
         raise DataContractError("baseline profile must be exactly 'paper' or 'smoke'")
     selected_models = config.models if models is None else models
-    selected_features = _FEATURE_SETS if feature_sets is None else feature_sets
+    selected_features = (
+        LEGACY_PAPER_FEATURE_SUITE if feature_sets is None else feature_sets
+    )
     if (
         not isinstance(selected_models, tuple)
         or not selected_models
@@ -211,11 +218,15 @@ def _require_stage_selection(
         or len(set(selected_features)) != len(selected_features)
         or any(feature_set not in _FEATURE_SETS for feature_set in selected_features)
     ):
-        raise DataContractError("selected feature sets must be a unique B0/B1 subset")
+        raise DataContractError(
+            "selected feature sets must be a unique B0/B1/B1W subset"
+        )
     if profile == "paper" and (
-        selected_models != config.models or selected_features != _FEATURE_SETS
+        selected_models != config.models or selected_features not in PAPER_FEATURE_SUITES
     ):
-        raise DataContractError("paper publication requires all five models and both B0/B1")
+        raise DataContractError(
+            "paper publication requires all five models and an exact paper feature suite"
+        )
     return selected_models, selected_features
 
 
@@ -228,10 +239,13 @@ def _feature_schema(matrix: ForecastMatrix, feature_set: FeatureSet) -> dict[str
         or matrix.future_columns != feature_columns(feature_set)
     ):
         raise DataContractError(f"{feature_set} matrix does not match its frozen feature schema")
-    return {
+    schema = {
         "history": list(matrix.history_columns),
         "future": list(matrix.future_columns),
     }
+    if feature_set == "B1W":
+        schema["window_definition"] = [B1W_WINDOW_VERSION]
+    return schema
 
 
 def _matrix_contracts(
@@ -257,7 +271,7 @@ def _matrix_contracts(
             or not np.array_equal(matrix.target, reference_target)
         ):
             raise DataContractError(
-                "B0 and B1 matrix coverage keys or observed values differ"
+                "paper feature matrices have different coverage keys or observed values"
             )
         normalized[feature_set] = matrix
     return normalized, schemas

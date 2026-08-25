@@ -13,7 +13,6 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Literal
 
 import numpy as np
 import polars as pl
@@ -25,13 +24,12 @@ from hqrc_v3.baselines.preprocessing import (
 )
 from hqrc_v3.baselines.protocol import BaselineFactory, FittedBaseline
 from hqrc_v3.contracts import DataContractError, ForecastMatrix, validate_prediction_frame
-from hqrc_v3.features import feature_columns
+from hqrc_v3.features import FeatureSet, feature_columns
 from hqrc_v3.provenance import ArtifactMismatch
 from hqrc_v3.residuals import PredictionCache
 from hqrc_v3.splits import AnnualFold, expanding_oof_folds, final_fold, select_fold_samples
 
-FeatureSet = Literal["B0", "B1"]
-_FEATURE_SETS = frozenset(("B0", "B1"))
+_FEATURE_SETS = frozenset(("B0", "B1", "B1W"))
 
 
 def chronological_validation_tail(
@@ -79,7 +77,7 @@ def chronological_validation_tail(
 
 def _require_feature_set(feature_set: object) -> FeatureSet:
     if feature_set not in _FEATURE_SETS:
-        raise DataContractError("feature_set must be exactly 'B0' or 'B1'")
+        raise DataContractError("feature_set must be exactly 'B0', 'B1', or 'B1W'")
     return feature_set  # type: ignore[return-value]
 
 

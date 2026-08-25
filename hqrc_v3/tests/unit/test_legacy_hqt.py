@@ -24,6 +24,7 @@ from hqrc_v3.diagnostics.ar import EventResidualContext
 from hqrc_v3.diagnostics.loeo import LOEOFold, LOEOHeldOut, LOEOPublication
 from hqrc_v3.legacy_hqt_loeo import (
     LegacyHQTError,
+    _select_contexts,
     build_legacy_hqt_data,
     build_legacy_hqt_data_from_frame,
     cosine_boundary_taper,
@@ -218,6 +219,37 @@ def test_cli_exposes_ar_free_hqt_scope_without_ar_approval() -> None:
     assert arguments.held_out == ["seollal-2020"]
     assert not hasattr(arguments, "approved_ar")
     assert not hasattr(arguments, "approve_derived_ar")
+
+
+def test_cli_defaults_reviewer_hqt_to_b1w() -> None:
+    arguments = build_parser().parse_args(
+        [
+            "run-hqt-loeo",
+            "--source-run-dir",
+            "source",
+            "--config",
+            "experiment.toml",
+            "--output-root",
+            "results",
+        ]
+    )
+
+    assert arguments.feature_set == "B1W"
+
+
+def test_legacy_hqt_selects_b1w_as_a_distinct_context() -> None:
+    split_ids = tuple(f"oof-{year}" for year in range(2020, 2024))
+    b1 = EventResidualContext("xgboost", "B1", 7, split_ids)
+    b1w = EventResidualContext("xgboost", "B1W", 7, split_ids)
+    source = SimpleNamespace(available_contexts=(b1, b1w))
+
+    selected = _select_contexts(
+        source,  # type: ignore[arg-type]
+        models=("xgboost",),
+        feature_sets=("B1W",),
+    )
+
+    assert selected == (b1w,)
 
 
 def test_legacy_hqt_loeo_writes_products_then_reuses_physical_fold(

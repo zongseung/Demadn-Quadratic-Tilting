@@ -14,7 +14,11 @@ import numpy as np
 import polars as pl
 
 from hqrc_v3.baselines.config import MODEL_NAMES, load_paper_baselines
-from hqrc_v3.baselines.paper import PAPER_HASH_KEYS, run_paper_final_stage
+from hqrc_v3.baselines.paper import (
+    PAPER_FEATURE_SUITES,
+    PAPER_HASH_KEYS,
+    run_paper_final_stage,
+)
 from hqrc_v3.config import load_config
 from hqrc_v3.contracts import DataContractError, validate_prediction_frame
 from hqrc_v3.data import (
@@ -28,7 +32,12 @@ from hqrc_v3.data import (
     read_hourly_data,
 )
 from hqrc_v3.diagnostics.ar import EventResidualContext
-from hqrc_v3.events import EventOccurrence, load_event_registry, load_holiday_calendar
+from hqrc_v3.events import (
+    EventOccurrence,
+    load_event_registry,
+    load_holiday_calendar,
+    validate_feature_event_alignment,
+)
 from hqrc_v3.features import attach_calendar_features, build_daily_forecast_matrix
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
 from hqrc_v3.residual_stage import (
@@ -71,6 +80,7 @@ _PREDICTION_NAMESPACE = frozenset(
         "final_2024_members.parquet",
     }
 )
+_FEATURE_SETS = frozenset(("B0", "B1", "B1W"))
 
 
 class CorrectionSourceError(ValueError):
@@ -509,6 +519,7 @@ def validate_correction_source(
     load_config(sources["experiment_config"])
     events = load_event_registry(sources["event_registry"])
     calendar = load_holiday_calendar(sources["holiday_calendar"])
+    validate_feature_event_alignment(calendar, events)
     availability = load_temporary_holiday_availability(
         sources["temporary_holiday_availability"]
     )
@@ -542,13 +553,15 @@ def validate_correction_source(
         or len(models) != len(set(models))
         or len(feature_sets) != len(set(feature_sets))
         or any(model not in MODEL_NAMES for model in models)
-        or any(feature not in {"B0", "B1"} for feature in feature_sets)
+        or any(feature not in _FEATURE_SETS for feature in feature_sets)
     ):
         raise CorrectionSourceError("baseline manifest model coverage is invalid")
     if source_profile == "paper" and (
-        tuple(models) != MODEL_NAMES or feature_sets != ["B0", "B1"]
+        tuple(models) != MODEL_NAMES or tuple(feature_sets) not in PAPER_FEATURE_SUITES
     ):
-        raise CorrectionSourceError("paper correction requires all baseline contexts")
+        raise CorrectionSourceError(
+            "paper correction requires all models and an exact paper feature suite"
+        )
 
     artifacts, _ = _preflight_baseline_publication(run, baseline_manifest)
 

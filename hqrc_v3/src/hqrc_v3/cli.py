@@ -31,7 +31,11 @@ from hqrc_v3.diagnostics.ar import (
     diagnose_event_residuals,
     write_ar_diagnostics,
 )
-from hqrc_v3.events import load_event_registry, load_holiday_calendar
+from hqrc_v3.events import (
+    load_event_registry,
+    load_holiday_calendar,
+    validate_feature_event_alignment,
+)
 from hqrc_v3.features import attach_calendar_features, build_daily_forecast_matrix
 from hqrc_v3.legacy_hqt_loeo import run_legacy_hqt_loeo
 from hqrc_v3.paper_pipeline import run_paper_loeo_pipeline
@@ -127,8 +131,9 @@ def _paper_stage_inputs(arguments: argparse.Namespace) -> dict[str, object]:
         or config_directory / "temporary_holiday_availability.csv"
     )
     load_config(experiment_path)
-    load_event_registry(event_path)
+    events = load_event_registry(event_path)
     calendar = load_holiday_calendar(holiday_path)
+    validate_feature_event_alignment(calendar, events)
     temporary_availability = load_temporary_holiday_availability(availability_path)
     baseline_config = load_paper_baselines(
         model_path,
@@ -153,7 +158,7 @@ def _paper_stage_inputs(arguments: argparse.Namespace) -> dict[str, object]:
     )
     audited = audit_hourly_data(read_hourly_data(data_path), **paper_bounds)
     featured = attach_calendar_features(audited, calendar)
-    selected_features = ("B0", "B1") if arguments.feature_set == "all" else (arguments.feature_set,)
+    selected_features = _baseline_feature_sets(arguments.feature_set)
     matrices = {
         feature_set: build_daily_forecast_matrix(featured, feature_set=feature_set)
         for feature_set in selected_features
@@ -272,6 +277,14 @@ def report_handler(arguments: argparse.Namespace) -> object:
 
 def _pipeline_models(value: str) -> tuple[str, ...]:
     return MODEL_NAMES if value == "all" else (value,)
+
+
+def _baseline_feature_sets(value: str) -> tuple[str, ...]:
+    if value == "all":
+        return ("B0", "B1")
+    if value == "reviewer":
+        return ("B0", "B1W")
+    return (value,)
 
 
 def _pipeline_feature_sets(value: str) -> tuple[str, ...]:
@@ -406,7 +419,11 @@ def _add_frozen_model_inputs(parser: argparse.ArgumentParser) -> None:
         "--frozen-model-hash", required=True, help="hash of the frozen model config"
     )
     parser.add_argument("--model", choices=(*MODEL_NAMES, "all"), default="all")
-    parser.add_argument("--feature-set", choices=("B0", "B1", "all"), default="all")
+    parser.add_argument(
+        "--feature-set",
+        choices=("B0", "B1", "B1W", "all", "reviewer"),
+        default="all",
+    )
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--profile", choices=("paper", "smoke"), default="paper")
     parser.add_argument(
@@ -643,7 +660,9 @@ def build_parser() -> argparse.ArgumentParser:
     hqt_loeo.add_argument("--config", required=True, help="experiment TOML bound to source")
     hqt_loeo.add_argument("--output-root", required=True, help="legacy HQT artifact root")
     hqt_loeo.add_argument("--model", choices=(*MODEL_NAMES, "all"), default="all")
-    hqt_loeo.add_argument("--feature-set", choices=("B0", "B1", "all"), default="all")
+    hqt_loeo.add_argument(
+        "--feature-set", choices=("B0", "B1", "B1W", "all"), default="B1W"
+    )
     hqt_loeo.add_argument(
         "--held-out",
         nargs="+",

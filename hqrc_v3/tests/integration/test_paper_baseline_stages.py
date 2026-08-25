@@ -9,10 +9,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import hqrc_v3.baselines.paper as paper
 import numpy as np
 import polars as pl
 import pytest
+
+import hqrc_v3.baselines.paper as paper
+from hqrc_v3 import cli
 from hqrc_v3.baselines.config import MODEL_NAMES, PAPER_SEEDS, load_paper_baselines
 from hqrc_v3.baselines.paper import run_paper_final_stage, run_paper_oof_stage
 from hqrc_v3.contracts import DataContractError, ForecastMatrix
@@ -20,8 +22,6 @@ from hqrc_v3.features import feature_columns, history_columns
 from hqrc_v3.oof import cache_key
 from hqrc_v3.provenance import ArtifactMismatch, file_sha256
 from hqrc_v3.splits import expanding_oof_folds
-
-from hqrc_v3 import cli
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_CONFIG = PROJECT_ROOT / "configs/model_spaces.toml"
@@ -118,7 +118,9 @@ def _write_short_cli_source(tmp_path: Path) -> Path:
     return source
 
 
-def _baseline_cli_arguments(source: Path, tmp_path: Path) -> list[str]:
+def _baseline_cli_arguments(
+    source: Path, tmp_path: Path, *, feature_set: str = "all"
+) -> list[str]:
     return [
         "generate-oof",
         "--data",
@@ -134,7 +136,7 @@ def _baseline_cli_arguments(source: Path, tmp_path: Path) -> list[str]:
         "--cache-dir",
         str(tmp_path / "cache"),
         "--feature-set",
-        "all",
+        feature_set,
         "--model",
         "all",
         "--seed",
@@ -165,6 +167,7 @@ class RecordingFactory:
                 "train_rows": len(train.origins),
                 "validation_max": None if validation is None else validation.target_times.max(),
                 "validation_rows": 0 if validation is None else len(validation.origins),
+                "future_columns": train.future_columns,
             }
         )
         population = _actual_population_contract(self.name, train)
@@ -195,6 +198,88 @@ def _recording_builder() -> tuple[dict[str, RecordingFactory], Any]:
         return factories[model]
 
     return factories, build
+
+
+def test_paper_accepts_exact_reviewer_feature_suite(tmp_path: Path) -> None:
+    _, builder = _recording_builder()
+
+    result = run_paper_oof_stage(
+        matrices={"B0": _matrix("B0"), "B1W": _matrix("B1W")},
+        config=load_paper_baselines(MODEL_CONFIG),
+        run_dir=tmp_path / "reviewer",
+        cache_dir=tmp_path / "shared-cache",
+        artifact_hashes=HASHES,
+        classical_seed=7,
+        feature_sets=("B0", "B1W"),
+        profile="paper",
+        factory_builder=builder,
+    )
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["feature_sets"] == ["B0", "B1W"]
+    assert manifest["feature_schemas"]["B0"] == {
+        "history": list(history_columns("B0")),
+        "future": list(feature_columns("B0")),
+    }
+    assert manifest["feature_schemas"]["B1W"]["window_definition"] == [
+        "official-sequence-buffer-v1"
+    ]
+
+
+def test_paper_rejects_mixed_three_feature_suite(tmp_path: Path) -> None:
+    _, builder = _recording_builder()
+
+    with pytest.raises(DataContractError, match="paper feature suite"):
+        run_paper_oof_stage(
+            matrices={name: _matrix(name) for name in ("B0", "B1", "B1W")},
+            config=load_paper_baselines(MODEL_CONFIG),
+            run_dir=tmp_path,
+            cache_dir=tmp_path / "cache",
+            artifact_hashes=HASHES,
+            classical_seed=7,
+            feature_sets=("B0", "B1", "B1W"),
+            profile="paper",
+            factory_builder=builder,
+        )
+
+
+def test_reviewer_run_reuses_b0_from_distinct_legacy_run_directory(
+    tmp_path: Path,
+) -> None:
+    _, legacy_builder = _recording_builder()
+    run_paper_oof_stage(
+        matrices={"B0": _matrix("B0"), "B1": _matrix("B1")},
+        config=load_paper_baselines(MODEL_CONFIG),
+        run_dir=tmp_path / "legacy-run",
+        cache_dir=tmp_path / "shared-cache",
+        artifact_hashes=HASHES,
+        classical_seed=7,
+        feature_sets=("B0", "B1"),
+        profile="paper",
+        factory_builder=legacy_builder,
+    )
+    reviewer_factories, reviewer_builder = _recording_builder()
+
+    reviewer = run_paper_oof_stage(
+        matrices={"B0": _matrix("B0"), "B1W": _matrix("B1W")},
+        config=load_paper_baselines(MODEL_CONFIG),
+        run_dir=tmp_path / "reviewer-run",
+        cache_dir=tmp_path / "shared-cache",
+        artifact_hashes=HASHES,
+        classical_seed=7,
+        feature_sets=("B0", "B1W"),
+        profile="paper",
+        factory_builder=reviewer_builder,
+    )
+
+    assert reviewer.fit_count == 52
+    assert reviewer.cache_hit_count == 52
+    for model, factory in reviewer_factories.items():
+        expected_calls = 4 if model in {"xgboost", "lightgbm", "svr"} else 20
+        assert len(factory.calls) == expected_calls
+        assert {call["future_columns"] for call in factory.calls} == {
+            feature_columns("B1W")
+        }
 
 
 def _run_oof(run: Path, *, factory_builder: Any | None = None):
@@ -1132,6 +1217,32 @@ def test_concrete_cli_loads_both_feature_matrices_and_hash_bound_inputs(
     }
 
 
+def test_concrete_cli_maps_reviewer_to_b0_and_b1w(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _write_short_cli_source(tmp_path)
+    captured: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        cli,
+        "run_paper_oof_stage",
+        lambda **kwargs: captured.append(kwargs),
+    )
+
+    result = cli.main(
+        [
+            *_baseline_cli_arguments(source, tmp_path, feature_set="reviewer"),
+            "--profile",
+            "smoke",
+        ]
+    )
+
+    assert result == 0
+    assert captured[0]["feature_sets"] == ("B0", "B1W")
+    assert set(captured[0]["matrices"]) == {"B0", "B1W"}
+    assert captured[0]["matrices"]["B1W"].future_columns == feature_columns("B1W")
+
+
 def test_paper_cli_rejects_short_source_before_feature_construction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1204,5 +1315,5 @@ def test_readme_hqrc_commands_are_executable_from_the_repository_root() -> None:
         "MODEL_SHA256=\"$(openssl dgst -sha256 "
         "hqrc_v3/configs/model_spaces.toml | awk '{print $NF}')\""
     ) in readme
-    assert readme.count('--frozen-model-hash "$MODEL_SHA256"') == 3
+    assert readme.count('--frozen-model-hash "$MODEL_SHA256"') == 4
     assert "--frozen-model-hash MODEL_SHA256" not in readme

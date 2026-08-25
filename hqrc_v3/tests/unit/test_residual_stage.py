@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-import hqrc_v3.residual_stage as residual_stage
 import polars as pl
 import pytest
+
+import hqrc_v3.residual_stage as residual_stage
 from hqrc_v3.baselines.config import MODEL_NAMES, PAPER_SEEDS, load_paper_baselines
 from hqrc_v3.baselines.paper import derive_oof_source_truth, prediction_coverage_record
 from hqrc_v3.data import (
@@ -14,8 +16,14 @@ from hqrc_v3.data import (
     load_temporary_holiday_availability,
     read_hourly_data,
 )
-from hqrc_v3.events import EventOccurrence, load_holiday_calendar
+from hqrc_v3.events import (
+    EventOccurrence,
+    EventRegistryError,
+    load_event_registry,
+    load_holiday_calendar,
+)
 from hqrc_v3.features import (
+    B1W_WINDOW_VERSION,
     attach_calendar_features,
     build_daily_forecast_matrix,
     feature_columns,
@@ -164,6 +172,33 @@ def test_scale_is_separate_for_every_model_feature_seed_and_fold_context():
     }
 
 
+def test_standardized_residuals_preserve_b1w_context_identity() -> None:
+    event = EventOccurrence(
+        "seollal-2020",
+        "seollal",
+        date(2020, 1, 25),
+        date(2020, 1, 25),
+        date(2020, 1, 25),
+        0,
+    )
+    event_days = [event.window_start + timedelta(days=offset) for offset in range(3)]
+    non_event_day = event.window_end + timedelta(days=2)
+    predictions = _daily_predictions(
+        [*event_days, non_event_day],
+        feature_set="B1W",
+        split_id="oof-2020",
+        residual_by_day={
+            **{day: 10.0 for day in event_days},
+            non_event_day: 2.0,
+        },
+    )
+
+    result = build_standardized_residuals(predictions, (event,))
+
+    assert result.frame["feature_set"].unique().to_list() == ["B1W"]
+    assert result.scales[0].feature_set == "B1W"
+
+
 def _full_year_prediction_frame(
     *, year: int, model: str = "lightgbm", feature_set: str = "B1", seed: int = 7
 ) -> pl.DataFrame:
@@ -248,7 +283,9 @@ def _prepare(
     )
 
 
-def _source_truth(run: Path, config: Path, model: str) -> dict[str, object]:
+def _source_truth(
+    run: Path, config: Path, model: str, *, feature_set: str = "B1"
+) -> dict[str, object]:
     sources = _source_arguments(run, config, config.parent / "events.csv")
     availability = load_temporary_holiday_availability(
         sources["temporary_holiday_availability_path"]
@@ -263,22 +300,24 @@ def _source_truth(run: Path, config: Path, model: str) -> dict[str, object]:
     featured = attach_calendar_features(
         audited, load_holiday_calendar(sources["holiday_calendar_path"])
     )
-    matrix = build_daily_forecast_matrix(featured, feature_set="B1")
+    matrix = build_daily_forecast_matrix(featured, feature_set=feature_set)  # type: ignore[arg-type]
     return derive_oof_source_truth(
-        matrices={"B1": matrix},
+        matrices={feature_set: matrix},
         config=load_paper_baselines(sources["model_config_path"]),
         models=(model,),
-        feature_sets=("B1",),
+        feature_sets=(feature_set,),  # type: ignore[arg-type]
         split_ids=("oof-2020",),
         eval_years=(2020,),
     )
 
 
-def _write_smoke_baseline_publication(run: Path, config: Path, events: Path) -> None:
+def _write_smoke_baseline_publication(
+    run: Path, config: Path, events: Path, *, feature_set: str = "B1"
+) -> None:
     predictions = run / "predictions"
     predictions.mkdir(parents=True)
     point_path = predictions / "oof.parquet"
-    point_frame = _full_year_prediction_frame(year=2020)
+    point_frame = _full_year_prediction_frame(year=2020, feature_set=feature_set)
     point_frame.write_parquet(point_path)
     member_path = predictions / "oof_members.parquet"
     pl.DataFrame(schema=point_frame.schema).select(point_frame.columns).write_parquet(
@@ -286,7 +325,13 @@ def _write_smoke_baseline_publication(run: Path, config: Path, events: Path) -> 
     )
     sources = _source_arguments(run, config, events)
     baseline_config = load_paper_baselines(sources["model_config_path"])
-    truth = _source_truth(run, config, "lightgbm")
+    truth = _source_truth(run, config, "lightgbm", feature_set=feature_set)
+    feature_schema = {
+        "history": list(history_columns(feature_set)),  # type: ignore[arg-type]
+        "future": list(feature_columns(feature_set)),  # type: ignore[arg-type]
+    }
+    if feature_set == "B1W":
+        feature_schema["window_definition"] = [B1W_WINDOW_VERSION]
     manifest = {
         "schema_version": 2,
         "profile": "smoke",
@@ -301,16 +346,11 @@ def _write_smoke_baseline_publication(run: Path, config: Path, events: Path) -> 
             ),
         },
         "models": ["lightgbm"],
-        "feature_sets": ["B1"],
+        "feature_sets": [feature_set],
         "classical_seed": 7,
         "neural_seeds": list(PAPER_SEEDS),
         "ensemble_seed": 0,
-        "feature_schemas": {
-            "B1": {
-                "history": list(history_columns("B1")),
-                "future": list(feature_columns("B1")),
-            }
-        },
+        "feature_schemas": {feature_set: feature_schema},
         "preprocessing": baseline_config.preprocessing.to_manifest(),
         "execution_overrides": {"boosting_rounds": 3},
         "stages": {
@@ -319,7 +359,9 @@ def _write_smoke_baseline_publication(run: Path, config: Path, events: Path) -> 
                 "expected_coverage": truth["expected_coverage"],
                 "preprocessing_populations": truth["preprocessing_populations"],
                 "split_ids": ["oof-2020"],
-                "streams": [{"model": "lightgbm", "feature_set": "B1", "seeds": [7]}],
+                "streams": [
+                    {"model": "lightgbm", "feature_set": feature_set, "seeds": [7]}
+                ],
                 "artifacts": {
                     "members": {
                         "path": "predictions/oof_members.parquet",
@@ -384,6 +426,45 @@ def _write_neural_smoke_baseline_publication(run: Path, config: Path, events: Pa
         stage["artifacts"]["members"]["sha256"] = file_sha256(member_path)
 
     _rewrite_manifest(manifest_path, update)
+
+
+def test_prepare_artifact_accepts_b1w_residual_publication(tmp_path: Path) -> None:
+    project = Path(__file__).resolve().parents[2]
+    config = project / "configs/experiment.toml"
+    events = project / "configs/events.csv"
+    run = tmp_path / "run"
+    _write_smoke_baseline_publication(run, config, events, feature_set="B1W")
+
+    result = _prepare(run, config, events)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+
+    assert result.frame["feature_set"].unique().to_list() == ["B1W"]
+    assert manifest["contexts"][0]["feature_set"] == "B1W"
+
+
+def test_prepare_artifact_rejects_feature_correction_registry_misalignment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = Path(__file__).resolve().parents[2]
+    config = project / "configs/experiment.toml"
+    events_path = project / "configs/events.csv"
+    calendar_path = project / "configs/holiday_calendar.csv"
+    run = tmp_path / "run"
+    _write_smoke_baseline_publication(run, config, events_path)
+    calendar = load_holiday_calendar(calendar_path)
+    correction = {event.occurrence_id: event for event in load_event_registry(events_path)}
+    changed = tuple(
+        replace(event, official_start=event.official_start + timedelta(days=1))
+        if event.occurrence_id == "seollal-2020"
+        else event
+        for event in calendar
+    )
+    changed_event = next(event for event in changed if event.occurrence_id == "seollal-2020")
+    assert changed_event.official_start != correction["seollal-2020"].official_start
+    monkeypatch.setattr(residual_stage, "load_holiday_calendar", lambda _path: changed)
+
+    with pytest.raises(EventRegistryError, match="feature/correction window registry"):
+        _prepare(run, config, events_path)
 
 
 def test_prepare_artifact_is_hash_bound_atomic_and_reusable(tmp_path: Path):
