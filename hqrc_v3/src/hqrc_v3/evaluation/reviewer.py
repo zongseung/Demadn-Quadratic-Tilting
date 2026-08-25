@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import shutil
+import sys
 import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -178,11 +180,15 @@ def _context_identity(context_dir: Path) -> tuple[str, str, int, pl.DataFrame]:
 def _require_holiday_mapping(
     frame: pl.DataFrame, *, identifier_column: str, description: str
 ) -> None:
+    if frame["holiday_type"].null_count() or frame[identifier_column].null_count():
+        raise ReviewerReportError(f"{description} holiday labels contain nulls")
     matches = frame.select(
         (
             pl.col("holiday_type")
             == pl.col(identifier_column).str.split_exact("-", 1).struct.field("field_0")
-        ).all()
+        )
+        .fill_null(False)
+        .all()
     ).item()
     if not matches:
         raise ReviewerReportError(f"{description} holiday labels differ from occurrence ids")
@@ -685,37 +691,68 @@ def _validate_staged_report(staging: Path) -> None:
             raise ReviewerReportError("staged reviewer output hash differs")
 
 
+def _atomic_exchange_directories(left: Path, right: Path) -> None:
+    if left.parent != right.parent:
+        raise ReviewerReportError("atomic reviewer report exchange requires sibling directories")
+    libc = ctypes.CDLL(None, use_errno=True)
+    operation: Any
+    directory_fd: int
+    if sys.platform == "darwin" and hasattr(libc, "renameatx_np"):
+        operation = libc.renameatx_np
+        directory_fd = -2  # AT_FDCWD on Darwin.
+    elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        operation = libc.renameat2
+        directory_fd = -100  # AT_FDCWD on Linux.
+    else:
+        raise ReviewerReportError(
+            "atomic reviewer report directory exchange is unsupported on this platform"
+        )
+    operation.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    operation.restype = ctypes.c_int
+    result = operation(
+        directory_fd,
+        os.fsencode(left),
+        directory_fd,
+        os.fsencode(right),
+        2,  # RENAME_SWAP on Darwin and RENAME_EXCHANGE on Linux.
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise ReviewerReportError(
+            f"atomic reviewer report directory exchange failed: {os.strerror(error_number)}"
+        )
+
+
 def _publish_staged_report(staging: Path, output: Path) -> None:
+    if output.is_symlink():
+        raise ReviewerReportError("published reviewer report root must not be a symlink")
     if not output.exists():
         os.replace(staging, output)
         return
-    if output.is_symlink() or not output.is_dir():
+    if not output.is_dir():
         raise ReviewerReportError("published reviewer report root is unsafe")
-    backup_parent = Path(tempfile.mkdtemp(prefix=f".{output.name}.previous-", dir=output.parent))
-    backup = backup_parent / "report"
-    backup_contains_previous = False
-    publication_complete = False
-    try:
-        os.replace(output, backup)
-        backup_contains_previous = True
-        try:
-            os.replace(staging, output)
-            publication_complete = True
-        except BaseException:
-            try:
-                os.replace(backup, output)
-                backup_contains_previous = False
-            except BaseException as rollback_error:
-                raise ReviewerReportError(
-                    f"reviewer publication rollback failed; previous report retained at {backup}"
-                ) from rollback_error
-            raise
-    finally:
-        if publication_complete and backup.exists():
-            shutil.rmtree(backup, ignore_errors=True)
-            backup_contains_previous = False
-        if not backup_contains_previous:
-            shutil.rmtree(backup_parent, ignore_errors=True)
+    _atomic_exchange_directories(staging, output)
+
+
+def _reviewer_output_path(output_root: Path) -> Path:
+    candidate = Path(output_root).expanduser()
+    if candidate.name in {"", ".", ".."}:
+        raise ReviewerReportError("reviewer output root must have a concrete final component")
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    if candidate.is_symlink():
+        raise ReviewerReportError("reviewer output root must not be a symlink")
+    parent = candidate.parent.resolve()
+    output = parent / candidate.name
+    if output.is_symlink():
+        raise ReviewerReportError("reviewer output root must not be a symlink")
+    return output
 
 
 def build_reviewer_report(
@@ -731,7 +768,7 @@ def build_reviewer_report(
         or inputs.root_seed < 0
     ):
         raise ReviewerReportError("reviewer root seed must be a non-negative integer")
-    output = Path(output_root).expanduser().resolve()
+    output = _reviewer_output_path(output_root)
     output.parent.mkdir(parents=True, exist_ok=True)
 
     final = _read_parquet(inputs.final_predictions_path, "final-2024 predictions")

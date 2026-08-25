@@ -299,6 +299,28 @@ def test_reviewer_report_rejects_swapped_causal_holiday_labels(
         build_reviewer_report(inputs, output_root=tmp_path / "paper")
 
 
+@pytest.mark.parametrize("artifact", ("event_metrics.parquet", "hourly_predictions.parquet"))
+def test_reviewer_report_rejects_null_causal_holiday_labels(tmp_path: Path, artifact: str):
+    inputs = _reviewer_fixture(tmp_path)
+    path = inputs.causal_context_dirs[0] / artifact
+    frame = (
+        pl.read_parquet(path)
+        .with_row_index()
+        .with_columns(
+            pl.when(pl.col("index") == 0)
+            .then(pl.lit(None, dtype=pl.String))
+            .otherwise(pl.col("holiday_type"))
+            .alias("holiday_type")
+        )
+        .drop("index")
+    )
+    assert frame["holiday_type"].null_count() == 1
+    frame.write_parquet(path)
+
+    with pytest.raises(ReviewerReportError, match="holiday labels"):
+        build_reviewer_report(inputs, output_root=tmp_path / "paper")
+
+
 def test_reviewer_report_rejects_incomplete_causal_pooled_combinations(tmp_path: Path):
     inputs = _reviewer_fixture(tmp_path)
     path = inputs.causal_context_dirs[0] / "pooled_metrics.parquet"
@@ -373,3 +395,91 @@ def test_failed_republication_preserves_the_previous_valid_report(
         build_reviewer_report(inputs, output_root=output)
 
     assert _tree_hashes(output) == before
+
+
+def test_atomic_switch_failure_preserves_old_report_at_published_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    inputs = _reviewer_fixture(tmp_path)
+    output = tmp_path / "paper"
+    build_reviewer_report(inputs, output_root=output)
+    before = _tree_hashes(output)
+    final = pl.read_parquet(inputs.final_predictions_path).with_columns(
+        pl.when(pl.col("feature_set") == "B1W")
+        .then(pl.col("predicted_mw") + 2.0)
+        .otherwise(pl.col("predicted_mw"))
+        .alias("predicted_mw")
+    )
+    final.write_parquet(inputs.final_predictions_path)
+
+    def fail_before_exchange(_staging: Path, published: Path):
+        assert published.is_dir()
+        assert (published / "manifest.json").is_file()
+        raise RuntimeError("injected atomic switch failure")
+
+    monkeypatch.setattr(
+        reviewer, "_atomic_exchange_directories", fail_before_exchange, raising=False
+    )
+    with pytest.raises(RuntimeError, match="injected atomic switch failure"):
+        build_reviewer_report(inputs, output_root=output)
+
+    assert output.is_dir()
+    assert _tree_hashes(output) == before
+
+
+def test_atomic_switch_never_exposes_an_absent_published_tree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    inputs = _reviewer_fixture(tmp_path)
+    output = tmp_path / "paper"
+    build_reviewer_report(inputs, output_root=output)
+    stale = output / "stale.txt"
+    stale.write_text("old")
+    original = getattr(reviewer, "_atomic_exchange_directories", None)
+    observations: list[tuple[bool, bool]] = []
+
+    def observed_exchange(staging: Path, published: Path):
+        observations.append((published.is_dir(), (published / "manifest.json").is_file()))
+        assert original is not None
+        original(staging, published)
+        observations.append((published.is_dir(), (published / "manifest.json").is_file()))
+
+    monkeypatch.setattr(reviewer, "_atomic_exchange_directories", observed_exchange, raising=False)
+    build_reviewer_report(inputs, output_root=output)
+
+    assert observations == [(True, True), (True, True)]
+    assert not stale.exists()
+
+
+def test_atomic_switch_fails_closed_on_an_unsupported_platform(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    (left / "left.txt").write_text("left")
+    (right / "right.txt").write_text("right")
+    monkeypatch.setattr(reviewer.sys, "platform", "unsupported")
+
+    with pytest.raises(ReviewerReportError, match="unsupported"):
+        reviewer._atomic_exchange_directories(left, right)
+
+    assert (left / "left.txt").read_text() == "left"
+    assert (right / "right.txt").read_text() == "right"
+
+
+def test_reviewer_report_rejects_unrelated_output_symlink(tmp_path: Path):
+    inputs = _reviewer_fixture(tmp_path)
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    sentinel = unrelated / "sentinel.txt"
+    sentinel.write_text("preserve me")
+    output = tmp_path / "paper"
+    output.symlink_to(unrelated, target_is_directory=True)
+
+    with pytest.raises(ReviewerReportError, match="symlink"):
+        build_reviewer_report(inputs, output_root=output)
+
+    assert output.is_symlink()
+    assert sentinel.read_text() == "preserve me"
