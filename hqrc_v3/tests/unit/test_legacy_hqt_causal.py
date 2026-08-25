@@ -324,6 +324,89 @@ def test_incomplete_context_resumes_bound_posterior_without_claiming_full_reuse(
     assert (resumed.output_dir / "COMPLETE").is_file()
 
 
+def test_posterior_checkpoint_manifest_exists_before_product_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: FakeSource
+) -> None:
+    _install_runner_fakes(monkeypatch, source)
+
+    def interrupt_products(*_args, **_kwargs):
+        raise RuntimeError("interrupted after posterior")
+
+    monkeypatch.setattr(module, "_build_products", interrupt_products)
+
+    with pytest.raises(RuntimeError, match="interrupted after posterior"):
+        _run(tmp_path)
+
+    output = tmp_path / "result/xgboost/B1W"
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert set(manifest["files"]) == {"input_identity.json", "posterior.nc"}
+    assert manifest["files"]["input_identity.json"] == file_sha256(output / "input_identity.json")
+    assert manifest["files"]["posterior.nc"] == file_sha256(output / "posterior.nc")
+
+
+def test_incomplete_context_rejects_manifestless_tampered_posterior(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: FakeSource
+) -> None:
+    _, sampled = _install_runner_fakes(monkeypatch, source)
+    first = _run(tmp_path)[0]
+    (first.output_dir / "COMPLETE").unlink()
+    (first.output_dir / "manifest.json").unlink()
+    with (first.output_dir / "posterior.nc").open("ab") as destination:
+        destination.write(b"tampered")
+
+    with pytest.raises(LegacyHQTCausalError, match="posterior manifest"):
+        _run(tmp_path)
+
+    assert len(sampled) == 1
+
+
+def test_incomplete_context_rejects_missing_identity_beside_posterior(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: FakeSource
+) -> None:
+    _, sampled = _install_runner_fakes(monkeypatch, source)
+    first = _run(tmp_path)[0]
+    (first.output_dir / "COMPLETE").unlink()
+    (first.output_dir / "input_identity.json").unlink()
+
+    with pytest.raises(LegacyHQTCausalError, match="identity is missing"):
+        _run(tmp_path)
+
+    assert len(sampled) == 1
+
+
+def test_incomplete_context_rejects_posterior_symlink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: FakeSource
+) -> None:
+    _, sampled = _install_runner_fakes(monkeypatch, source)
+    first = _run(tmp_path)[0]
+    (first.output_dir / "COMPLETE").unlink()
+    posterior = first.output_dir / "posterior.nc"
+    copied = tmp_path / "copied-posterior.nc"
+    copied.write_bytes(posterior.read_bytes())
+    posterior.unlink()
+    posterior.symlink_to(copied)
+
+    with pytest.raises(LegacyHQTCausalError, match="posterior.*unsafe"):
+        _run(tmp_path)
+
+    assert len(sampled) == 1
+
+
+def test_incomplete_context_rejects_full_manifest_product_digest_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: FakeSource
+) -> None:
+    _, sampled = _install_runner_fakes(monkeypatch, source)
+    first = _run(tmp_path)[0]
+    (first.output_dir / "COMPLETE").unlink()
+    with (first.output_dir / "hourly_predictions.parquet").open("ab") as destination:
+        destination.write(b"tampered")
+
+    with pytest.raises(LegacyHQTCausalError, match="incomplete causal HQT artifact digest"):
+        _run(tmp_path)
+
+    assert len(sampled) == 1
+
+
 def test_incomplete_context_rejects_unknown_checkpoint_entries(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: FakeSource
 ) -> None:
@@ -412,6 +495,37 @@ def test_paper_causal_sampler_never_weakens_the_minimum_contract(
 
     with pytest.raises(LegacyHQTCausalError, match="paper causal HQT requires"):
         run_legacy_hqt_causal_2024(**options)  # type: ignore[arg-type]
+
+
+def test_paper_causal_sampler_allows_more_than_four_chains(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: FakeSource
+) -> None:
+    monkeypatch.setattr(module, "validate_correction_source", lambda **_kwargs: source)
+    reached: list[dict[str, object]] = []
+
+    def fake_sample(_data: HQRCData, **kwargs) -> az.InferenceData:
+        reached.append(kwargs)
+        return _fake_posterior()
+
+    monkeypatch.setattr(module, "sample_legacy_hqt", fake_sample)
+
+    result = run_legacy_hqt_causal_2024(
+        source_run_dir=tmp_path / "source",
+        config_path=EXPERIMENT_CONFIG,
+        output_root=tmp_path / "result",
+        models=("xgboost",),
+        feature_set="B1W",
+        root_seed=20260813,
+        profile="paper",
+        draws=1_000,
+        tune=1_000,
+        chains=5,
+        cores=5,
+        target_accept=0.99,
+    )
+
+    assert result[0].sampler_fit_count == 1
+    assert reached[0]["chains"] == 5
 
 
 def test_cli_exposes_causal_b1w_runner_without_ar_options() -> None:

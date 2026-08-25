@@ -54,6 +54,7 @@ _ARTIFACT_FILES = (
     "event_metrics.parquet",
     "pooled_metrics.parquet",
 )
+_PARTIAL_ARTIFACT_FILES = ("input_identity.json", "posterior.nc")
 _COMPLETE_NAMESPACE = frozenset((*_ARTIFACT_FILES, "manifest.json", "COMPLETE"))
 
 
@@ -334,11 +335,11 @@ def _sampler_contract(
         if (
             resolved_draws < 1_000
             or resolved_tune < 1_000
-            or resolved_chains != 4
+            or resolved_chains < 4
             or resolved_target != 0.99
         ):
             raise LegacyHQTCausalError(
-                "paper causal HQT requires 4 chains, at least 1000 tune/draws, "
+                "paper causal HQT requires at least 4 chains, at least 1000 tune/draws, "
                 "and target_accept=0.99"
             )
     elif profile == "smoke":
@@ -615,17 +616,37 @@ def _load_resumable_posterior(
     paper_profile: bool,
 ) -> az.InferenceData | None:
     posterior_path = output_dir / "posterior.nc"
-    if not posterior_path.exists():
+    manifest_path = output_dir / "manifest.json"
+    posterior_exists = os.path.lexists(posterior_path)
+    manifest_exists = os.path.lexists(manifest_path)
+    if not posterior_exists:
+        if manifest_exists:
+            raise LegacyHQTCausalError("incomplete causal HQT manifest exists without a posterior")
+        entries = {entry.name for entry in output_dir.iterdir()}
+        if entries != {"input_identity.json"}:
+            raise LegacyHQTCausalError("incomplete causal HQT checkpoint state differs")
         return None
+    _require_real_file(posterior_path, "incomplete causal HQT posterior")
     identity_path = output_dir / "input_identity.json"
     if _read_json(identity_path, "incomplete causal HQT identity") != dict(identity):
         raise LegacyHQTCausalError("incomplete causal HQT identity differs")
-    manifest_path = output_dir / "manifest.json"
-    if manifest_path.exists():
-        manifest = _read_json(manifest_path, "incomplete causal HQT manifest")
-        files = manifest.get("files")
-        if not isinstance(files, dict) or files.get("posterior.nc") != file_sha256(posterior_path):
-            raise LegacyHQTCausalError("incomplete causal HQT posterior digest differs")
+    if not manifest_exists:
+        raise LegacyHQTCausalError("incomplete causal HQT posterior manifest is missing")
+    manifest = _read_json(manifest_path, "incomplete causal HQT manifest")
+    files = manifest.get("files")
+    manifest_files = frozenset(files) if isinstance(files, dict) else frozenset()
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("identity_sha256") != _json_sha256(identity)
+        or not isinstance(files, dict)
+        or manifest_files not in {frozenset(_PARTIAL_ARTIFACT_FILES), frozenset(_ARTIFACT_FILES)}
+    ):
+        raise LegacyHQTCausalError("incomplete causal HQT posterior manifest differs")
+    for name in manifest_files:
+        path = output_dir / name
+        _require_real_file(path, f"incomplete causal HQT artifact {name}")
+        if files.get(name) != file_sha256(path):
+            raise LegacyHQTCausalError(f"incomplete causal HQT artifact digest differs: {name}")
     try:
         idata = az.from_netcdf(posterior_path)
     except (OSError, ValueError) as error:
@@ -661,6 +682,7 @@ def _run_context(
     )
     if output_dir.exists() and _load_complete_context(output_dir, identity):
         return LegacyHQTCausalContextResult(context, output_dir, 0, True)
+    entries: set[str] = set()
     if output_dir.exists():
         try:
             mode = output_dir.lstat().st_mode
@@ -670,10 +692,16 @@ def _run_context(
         allowed = _COMPLETE_NAMESPACE - {"COMPLETE"}
         if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode) or not entries <= allowed:
             raise LegacyHQTCausalError("incomplete causal HQT namespace differs")
+        for entry in output_dir.iterdir():
+            _require_real_file(entry, f"incomplete causal HQT checkpoint {entry.name}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     identity_path = output_dir / "input_identity.json"
-    if identity_path.exists():
+    if entries and "input_identity.json" not in entries:
+        raise LegacyHQTCausalError(
+            "incomplete causal HQT identity is missing beside checkpoint state"
+        )
+    if "input_identity.json" in entries:
         if _read_json(identity_path, "incomplete causal HQT identity") != identity:
             raise LegacyHQTCausalError("incomplete causal HQT identity differs")
     else:
@@ -700,6 +728,12 @@ def _run_context(
         )
         idata.attrs["legacy_hqt_causal_identity_sha256"] = identity_digest
         _write_netcdf_atomic(idata, output_dir / "posterior.nc")
+        partial_manifest = {
+            "files": {name: file_sha256(output_dir / name) for name in _PARTIAL_ARTIFACT_FILES},
+            "identity_sha256": identity_digest,
+            "schema_version": 1,
+        }
+        _write_atomic(output_dir / "manifest.json", _canonical_json(partial_manifest))
     assert idata is not None
     hourly, event_metrics, pooled_metrics, prediction_seeds = _build_products(
         training,

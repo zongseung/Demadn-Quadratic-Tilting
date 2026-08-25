@@ -125,10 +125,11 @@ def sample_legacy_hqt(
     ):
         raise ValueError("target_accept must be finite and strictly between zero and one")
     if paper_profile and (
-        chains != 4 or draws < 1_000 or tune < 1_000 or float(target_accept) != 0.99
+        chains < 4 or draws < 1_000 or tune < 1_000 or float(target_accept) != 0.99
     ):
         raise ValueError(
-            "paper_profile requires 4 chains, at least 1000 tune/draws, and target_accept=0.99"
+            "paper_profile requires at least 4 chains, at least 1000 tune/draws, "
+            "and target_accept=0.99"
         )
 
     import pymc as pm

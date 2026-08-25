@@ -139,6 +139,36 @@ def test_legacy_hqt_sampler_never_accepts_or_serializes_ar_calibration(monkeypat
     assert json.loads(idata.attrs["legacy_hqt_model_json"])["hour_profile"] is False
 
 
+def test_legacy_hqt_paper_profile_allows_more_than_four_chains(monkeypatch) -> None:
+    captured = {}
+
+    def fake_sample(**kwargs):
+        captured.update(kwargs)
+        return az.from_dict(
+            posterior={"event_log_likelihood": np.zeros((5, 6, 4))},
+            sample_stats={"diverging": np.zeros((5, 6), dtype=np.int8)},
+        )
+
+    monkeypatch.setattr(pm, "sample", fake_sample)
+    monkeypatch.setattr(
+        "hqrc_v3.bayes.legacy_hqt.validate_inference_data",
+        lambda *_args, **_kwargs: SamplingDiagnostics(1.0, 500.0, 500.0, 0),
+    )
+
+    sample_legacy_hqt(
+        _tiny_data(),
+        draws=1_000,
+        tune=1_000,
+        chains=5,
+        cores=1,
+        seed=31,
+        target_accept=0.99,
+        paper_profile=True,
+    )
+
+    assert captured["chains"] == 5
+
+
 def test_new_event_draws_are_seeded_and_follow_quadratic_design() -> None:
     mu = np.zeros((1, 3, 2, 3))
     mu[:, :, 0, :] = np.array([1.0, 2.0, 3.0])
