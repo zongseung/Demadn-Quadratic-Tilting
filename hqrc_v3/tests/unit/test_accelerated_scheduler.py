@@ -22,6 +22,7 @@ from hqrc_v3.accelerated_scheduler import (
 )
 
 PAPER_MODELS = ("lightgbm", "svr", "seq2seq_lstm", "transformer")
+ALL_MODELS = ("xgboost", *PAPER_MODELS)
 
 
 def _request(tmp_path: Path, **overrides) -> AcceleratedRequest:
@@ -51,12 +52,12 @@ def _command_option(command: tuple[str, ...], option: str) -> str:
     return command[command.index(option) + 1]
 
 
-def test_fixed_two_cuda_queues_exclude_xgboost():
-    assert model_queues((0, 1)) == (
-        ("cuda:0", ("lightgbm", "seq2seq_lstm")),
-        ("cuda:1", ("svr", "transformer")),
+def test_cuda_queues_distribute_requested_models_round_robin():
+    assert model_queues((0, 1), ("xgboost", "svr", "transformer")) == (
+        ("cuda:0", ("xgboost", "transformer")),
+        ("cuda:1", ("svr",)),
     )
-    assert all("xgboost" not in models for _, models in model_queues((0, 1)))
+    assert model_queues((3,), ALL_MODELS) == (("cuda:3", ALL_MODELS),)
     with pytest.raises(AcceleratedRunError, match="two unique"):
         model_queues((0, 0))
 
@@ -125,6 +126,38 @@ def test_cpu_scheduler_runs_all_models_concurrently_with_even_thread_budgets(tmp
         }
 
 
+def test_cuda_scheduler_runs_selected_xgboost_model(tmp_path, monkeypatch):
+    request = _request(
+        tmp_path,
+        models=("xgboost",),
+        feature_sets=("B0",),
+        devices=(0,),
+        accelerator="cuda",
+    )
+    _validated(monkeypatch)
+    monkeypatch.setattr(
+        scheduler,
+        "_preflight_accelerator",
+        lambda *_args, **_kwargs: scheduler._ResolvedAccelerator(
+            "cuda", "cuda:0", None, "probe", None
+        ),
+    )
+    jobs = []
+
+    def run_job(job):
+        jobs.append(job)
+        return scheduler._JobOutcome(job, 0)
+
+    monkeypatch.setattr(scheduler, "_run_job", run_job)
+
+    result = run_accelerated_loeo(request)
+
+    assert result.completed_models == ("xgboost",)
+    assert [job.model for job in jobs] == ["xgboost"]
+    assert _command_option(jobs[0].command, "--feature-set") == "B0"
+    assert _command_option(jobs[0].command, "--device") == "cuda:0"
+
+
 @pytest.mark.parametrize("devices", ((1, 0), (2, 3)))
 def test_two_cuda_devices_require_physical_zero_then_one_before_validation_or_logs(
     tmp_path, monkeypatch, devices
@@ -146,23 +179,19 @@ def test_two_cuda_devices_require_physical_zero_then_one_before_validation_or_lo
     assert not request.output_root.exists()
 
 
-@pytest.mark.parametrize(
-    ("overrides", "match"),
-    [
-        ({"models": ("xgboost", *PAPER_MODELS)}, "XGBoost"),
-        ({"models": PAPER_MODELS[:-1]}, "paper models"),
-        ({"feature_sets": ("B1", "B0")}, "paper feature sets"),
-        ({"variants": ("H1", "H3")}, "paper variants"),
-    ],
-)
-def test_paper_scope_is_exact_and_rejected_before_logs(tmp_path, overrides, match):
-    request = _request(tmp_path, **overrides)
-    with pytest.raises(AcceleratedRunError, match=match):
-        run_accelerated_loeo(request)
-    assert not request.output_root.exists()
+def test_paper_accepts_selected_model_feature_and_variant_subsets(tmp_path):
+    scheduler._validate_request(
+        _request(
+            tmp_path,
+            models=("xgboost",),
+            feature_sets=("B0",),
+            variants=("H1", "H2", "H3"),
+            devices=(0,),
+        )
+    )
 
 
-def test_smoke_accepts_only_ordered_non_xgboost_subsets(tmp_path):
+def test_smoke_accepts_only_ordered_subsets(tmp_path):
     good = _request(
         tmp_path,
         profile="smoke",
@@ -175,9 +204,22 @@ def test_smoke_accepts_only_ordered_non_xgboost_subsets(tmp_path):
         target_accept=0.9,
     )
     scheduler._validate_request(good)
+    scheduler._validate_request(
+        _request(
+            tmp_path / "xgb",
+            profile="smoke",
+            models=("xgboost",),
+            feature_sets=("B0",),
+            variants=("H1",),
+            draws=4,
+            tune=4,
+            chains=4,
+            target_accept=0.9,
+        )
+    )
     for bad in (
         _request(tmp_path / "a", profile="smoke", models=("transformer", "svr")),
-        _request(tmp_path / "b", profile="smoke", models=("xgboost",)),
+        _request(tmp_path / "b", profile="smoke", models=("svr", "svr")),
         _request(tmp_path / "c", profile="smoke", variants=("H3", "H1")),
     ):
         with pytest.raises(AcceleratedRunError):

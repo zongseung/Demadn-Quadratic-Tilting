@@ -719,6 +719,7 @@ def test_pyro_fit_reload_validates_runtime_device_metadata_without_rewriting_evi
             "seed": derive_loeo_seed(913, "H3-fold-sampler:seollal-2024"),
             "init": "adapt_diag",
             "target_accept": 0.9,
+            "full_mass": False,
             "backend": "pyro",
             "device": "cuda:0",
             "paper_profile": False,

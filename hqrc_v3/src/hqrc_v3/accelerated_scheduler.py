@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from hqrc_v3.baselines.config import MODEL_NAMES
+
 PAPER_MODELS = ("lightgbm", "svr", "seq2seq_lstm", "transformer")
 PAPER_FEATURE_SETS = ("B0", "B1")
 PAPER_VARIANTS = ("H1", "H2", "H3")
@@ -92,8 +94,10 @@ class _JobOutcome:
     returncode: int
 
 
-def model_queues(devices: tuple[int, ...]) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    """Return one sequential queue or the fixed two-device manuscript queues."""
+def model_queues(
+    devices: tuple[int, ...], models: tuple[str, ...] = PAPER_MODELS
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Distribute the requested models across one or two CUDA devices."""
 
     if (
         len(devices) not in {1, 2}
@@ -105,14 +109,14 @@ def model_queues(devices: tuple[int, ...]) -> tuple[tuple[str, tuple[str, ...]],
     ):
         raise AcceleratedRunError("CUDA scheduling requires one or two unique non-negative devices")
     if len(devices) == 1:
-        return ((f"cuda:{devices[0]}", PAPER_MODELS),)
+        return ((f"cuda:{devices[0]}", models),)
     if devices != (0, 1):
         raise AcceleratedRunError(
             "two-device scheduling requires exactly physical devices 0 then 1"
         )
-    return (
-        ("cuda:0", ("lightgbm", "seq2seq_lstm")),
-        ("cuda:1", ("svr", "transformer")),
+    return tuple(
+        (f"cuda:{device}", models[index::len(devices)])
+        for index, device in enumerate(devices)
     )
 
 
@@ -156,20 +160,13 @@ def _exact_target(value: object, expected: float) -> bool:
 def _validate_request(request: AcceleratedRequest) -> None:
     if not isinstance(request, AcceleratedRequest):
         raise TypeError("request must be an AcceleratedRequest")
-    if "xgboost" in request.models:
-        raise AcceleratedRunError("XGBoost is excluded from the accelerated paper scope")
-    model_queues(request.devices)
-    if request.profile == "paper":
-        if request.models != PAPER_MODELS:
-            raise AcceleratedRunError("paper models must match the exact accelerated scope")
-        if request.feature_sets != PAPER_FEATURE_SETS:
-            raise AcceleratedRunError("paper feature sets must be exactly B0 then B1")
-        if request.variants != PAPER_VARIANTS:
-            raise AcceleratedRunError("paper variants must be exactly H1, H2, H3")
-    elif request.profile == "smoke":
-        _ordered_subset(request.models, PAPER_MODELS, "smoke models")
-        _ordered_subset(request.feature_sets, PAPER_FEATURE_SETS, "smoke feature sets")
-        _ordered_subset(request.variants, PAPER_VARIANTS, "smoke variants")
+    model_queues(request.devices, request.models)
+    if request.profile not in {"paper", "smoke"}:
+        raise AcceleratedRunError("profile must be paper or smoke")
+    _ordered_subset(request.models, MODEL_NAMES, f"{request.profile} models")
+    _ordered_subset(request.feature_sets, PAPER_FEATURE_SETS, f"{request.profile} feature sets")
+    _ordered_subset(request.variants, PAPER_VARIANTS, f"{request.profile} variants")
+    if request.profile == "smoke":
         if (
             not _exact_int(request.draws, minimum=1)
             or not _exact_int(request.tune, minimum=1)
@@ -183,8 +180,6 @@ def _validate_request(request: AcceleratedRequest) -> None:
                 "smoke Pyro requires positive draws/tune, chains=4, "
                 "optional cores=1 or cores=4, and target_accept=0.9"
             )
-    else:
-        raise AcceleratedRunError("profile must be paper or smoke")
     if request.profile == "paper" and (
         request.draws is not None
         and not _exact_int(request.draws, minimum=1000)
@@ -476,7 +471,7 @@ def _result(
     outcomes: list[_JobOutcome], request: AcceleratedRequest, resolved: _ResolvedAccelerator
 ) -> AcceleratedResult:
     by_model = {outcome.job.model: outcome for outcome in outcomes}
-    ordered = tuple(by_model[model] for model in PAPER_MODELS if model in by_model)
+    ordered = tuple(by_model[model] for model in request.models if model in by_model)
     return AcceleratedResult(
         completed_models=tuple(item.job.model for item in ordered if item.returncode == 0),
         failed_models=tuple(item.job.model for item in ordered if item.returncode != 0),
@@ -502,10 +497,10 @@ def run_accelerated_loeo(request: AcceleratedRequest) -> AcceleratedResult:
         queue_specs = tuple(
             (
                 int(device.removeprefix("cuda:")),
-                tuple(model for model in models if model in request.models),
+                models,
                 None,
             )
-            for device, models in model_queues(request.devices)
+            for device, models in model_queues(request.devices, request.models)
         )
     elif resolved.kind == "cpu":
         queue_specs = tuple(

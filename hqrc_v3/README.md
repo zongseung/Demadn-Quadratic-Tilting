@@ -71,11 +71,12 @@ runtime and test lock.
 
 ## Native H1--H3 accelerator runbook
 
-The accelerated paper scope is exactly the four non-XGBoost models
-`lightgbm`, `svr`, `seq2seq_lstm`, and `transformer`, both `B0` and `B1`,
-`H1`, `H2`, and `H3`, and all ten LOEO folds. XGBoost is excluded from
-accelerated scheduling and publication. On two CUDA devices, physical GPU 0
-runs `lightgbm` then `seq2seq_lstm`, while physical GPU 1 runs `svr` then
+The accelerated paper defaults are `lightgbm`, `svr`, `seq2seq_lstm`, and
+`transformer`, both `B0` and `B1`, `H1`, `H2`, and `H3`, and all ten LOEO
+folds. `--models`, `--feature-sets`, and `--variants` accept non-empty ordered
+subsets, including `xgboost`. Requested models are distributed round-robin
+across one or two CUDA devices. With the defaults, physical GPU 0 runs
+`lightgbm` then `seq2seq_lstm`, while physical GPU 1 runs `svr` then
 `transformer`. The two model workers run concurrently, but every model fit
 runs its four NUTS chains sequentially inside its worker.
 
@@ -164,7 +165,7 @@ scripts\run_hqrc_windows.ps1 resume -Accelerator cpu `
 
 ### Linux Bash
 
-Linux uses the same fixed CUDA queues and physical device order:
+Linux uses the same requested-model round-robin CUDA queues and physical device order:
 
 ```bash
 SOURCE_ROOT="$(if [ -f artifacts.zip ]; then pwd -P; else cd ../.. && pwd -P; fi)"
